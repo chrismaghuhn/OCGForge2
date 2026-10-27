@@ -25,7 +25,7 @@ from torch import nn
 from . import cards, features
 from .cards import UNK, CardFeatures
 
-ARCHITECTURE = "ocgforge-set-transformer-candidate-scorer@1"
+ARCHITECTURE = "ocgforge-set-transformer-candidate-scorer@2"  # @2: event memory
 
 
 @dataclass(frozen=True)
@@ -87,6 +87,10 @@ class Model(nn.Module):
         self.global_numeric = nn.Linear(len(features.GLOBAL_NUMERIC), d)
         self.phase = nn.Embedding(len(features.PHASES), d, padding_idx=0)
         self.decision = nn.Embedding(len(features.DECISIONS), d, padding_idx=0)
+        self.event_kind = nn.Embedding(len(features.EVENT_KINDS), d, padding_idx=0)
+        self.event_from = nn.Embedding(len(features.ZONES), d, padding_idx=0)
+        self.event_to = nn.Embedding(len(features.ZONES), d, padding_idx=0)
+        self.event_numeric = nn.Linear(len(features.EVENT_NUMERIC), d)
         layer = nn.TransformerEncoderLayer(d_model=d, nhead=config.heads, dim_feedforward=config.ff,
                                            dropout=config.dropout, batch_first=True, norm_first=True)
         self.encoder = nn.TransformerEncoder(layer, num_layers=config.layers, enable_nested_tensor=False)
@@ -111,7 +115,7 @@ class Model(nn.Module):
         )
         if self.config.text_embedding_dim > 0:
             x = x + self.text_embedding(self.card_textemb[flat])
-        return x.reshape(*shape, -1)
+        return x.reshape(*shape, self.config.d_model)  # explicit width: shape may contain a 0
 
     def card_embedding(self, cards_: torch.Tensor) -> torch.Tensor:
         """card_static plus a learned per-card embedding, which is "unknown" for cards never seen in
@@ -121,6 +125,29 @@ class Model(nn.Module):
             hide = (torch.rand(cards_.shape, device=cards_.device) < self.config.name_dropout) & (cards_ > UNK)
             shown = shown.masked_fill(hide, UNK)
         return self.name(shown) + self.card_static(cards_)
+
+    def event_tokens(self, batch: dict[str, torch.Tensor], tokens: torch.Tensor) -> torch.Tensor:
+        """Recent public events as [B, E, d]: what happened, to which card (if it was public), by
+        whom, from where to where, how long ago, plus the input of the field card token the event
+        provably happened to (so "set a card" is tied to that face-down card).
+
+        Events describe their card by its facts only (card_static), not the learned per-card
+        embedding: otherwise a name hidden by name dropout on a token could come back through an
+        event about the same card."""
+        card = batch["event_card"]
+        x = (
+            self.event_kind(batch["event_kind"])
+            + torch.where((card > 0).unsqueeze(-1), self.card_static(card), torch.zeros(1, device=card.device))
+            + self.side(batch["event_side"])
+            + self.event_from(batch["event_from"])
+            + self.event_to(batch["event_to"])
+            + self.event_numeric(batch["event_numeric"])
+        )
+        link = batch["event_token"]
+        if tokens.shape[1] > 0 and link.shape[1] > 0:
+            linked = torch.gather(tokens, 1, link.clamp(min=0).unsqueeze(-1).expand(-1, -1, tokens.size(-1)))
+            x = x + linked * (link >= 0).unsqueeze(-1)
+        return x
 
     def forward(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns candidate scores [B, C] (-inf on padding) and values [B]."""
@@ -134,10 +161,13 @@ class Model(nn.Module):
         global_token = (
             self.global_numeric(batch["global_numeric"]) + self.phase(batch["phase"]) + self.decision(batch["decision"])
         ).unsqueeze(1)
-        sequence = torch.cat([global_token, tokens], dim=1)
-        padding = torch.cat([torch.zeros(b, 1, dtype=torch.bool, device=tokens.device), batch["token_pad"]], dim=1)
+        events = self.event_tokens(batch, tokens)
+        sequence = torch.cat([global_token, tokens, events], dim=1)
+        padding = torch.cat([torch.zeros(b, 1, dtype=torch.bool, device=tokens.device), batch["token_pad"],
+                             batch["event_pad"]], dim=1)
         encoded = self.encoder(sequence, src_key_padding_mask=padding)
-        context, card_tokens = encoded[:, 0], encoded[:, 1:]
+        t = tokens.shape[1]
+        context, card_tokens = encoded[:, 0], encoded[:, 1:1 + t]
 
         def gather(indices: torch.Tensor) -> torch.Tensor:
             safe = indices.clamp(min=0)

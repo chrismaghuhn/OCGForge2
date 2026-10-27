@@ -83,3 +83,11 @@ def test_text_embeddings_are_required_when_enabled(card_features):
 
     with pytest.raises(ValueError, match="text_embeddings"):
         Model(card_features, ModelConfig(d_model=16, heads=2, layers=1, ff=32, text_embedding_dim=8))
+
+
+def test_batch_without_any_events(card_features):
+    rng = np.random.default_rng(4)
+    model = Model(card_features, SMALL).eval()
+    samples = [random_decision(rng, card_features.size, tokens=3, candidates=2, events=0) for _ in range(2)]
+    scores, _ = model(features.collate(samples))
+    assert torch.isfinite(scores).all()

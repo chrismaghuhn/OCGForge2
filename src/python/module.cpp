@@ -47,6 +47,14 @@ nb::dict to_dict(const EncodedDecision& d) {
     out["candidate_zone"] = to_numpy(d.candidate_zone, {candidates});
     out["candidate_targets"] = to_numpy(d.candidate_targets, {candidates, ygo::encode::kMaxTargets});
     out["candidate_numeric"] = to_numpy(d.candidate_numeric, {candidates, ygo::encode::candidate_numeric_names().size()});
+    const auto events = d.event_kind.size();
+    out["event_kind"] = to_numpy(d.event_kind, {events});
+    out["event_card"] = to_numpy(d.event_card, {events});
+    out["event_side"] = to_numpy(d.event_side, {events});
+    out["event_from"] = to_numpy(d.event_from, {events});
+    out["event_to"] = to_numpy(d.event_to, {events});
+    out["event_token"] = to_numpy(d.event_token, {events});
+    out["event_numeric"] = to_numpy(d.event_numeric, {events, ygo::encode::event_numeric_names().size()});
     return out;
 }
 
@@ -128,5 +136,8 @@ NB_MODULE(_core, m) {
     m.def("token_numeric_names", &ygo::encode::token_numeric_names);
     m.def("global_numeric_names", &ygo::encode::global_numeric_names);
     m.def("candidate_numeric_names", &ygo::encode::candidate_numeric_names);
+    m.def("event_kind_names", &ygo::encode::event_kind_names);
+    m.def("event_numeric_names", &ygo::encode::event_numeric_names);
     m.attr("MAX_TARGETS") = ygo::encode::kMaxTargets;
+    m.attr("MAX_EVENTS") = ygo::encode::kMaxEvents;
 }

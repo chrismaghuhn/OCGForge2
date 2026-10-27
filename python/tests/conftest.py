@@ -37,7 +37,7 @@ def card_features() -> CardFeatures:
 
 
 def random_decision(rng: np.random.Generator, n_cards: int, tokens: int | None = None,
-                    candidates: int | None = None) -> dict:
+                    candidates: int | None = None, events: int | None = None) -> dict:
     t = int(rng.integers(0, 12)) if tokens is None else tokens
     c = int(rng.integers(1, 8)) if candidates is None else candidates
     return {
@@ -55,4 +55,17 @@ def random_decision(rng: np.random.Generator, n_cards: int, tokens: int | None =
         "candidate_targets": rng.integers(-1, max(t, 1), (c, features.MAX_TARGETS)) if t
         else np.full((c, features.MAX_TARGETS), -1),
         "candidate_numeric": rng.random((c, len(features.CANDIDATE_NUMERIC)), dtype=np.float32),
+        **random_events(rng, n_cards, t, int(rng.integers(0, 10)) if events is None else events),
+    }
+
+
+def random_events(rng: np.random.Generator, n_cards: int, tokens: int, e: int) -> dict:
+    return {
+        "event_kind": rng.integers(1, len(features.EVENT_KINDS), e),
+        "event_card": rng.integers(0, n_cards, e),
+        "event_side": rng.integers(0, 3, e),
+        "event_from": rng.integers(0, len(features.ZONES), e),
+        "event_to": rng.integers(0, len(features.ZONES), e),
+        "event_token": rng.integers(-1, tokens, e) if tokens else np.full(e, -1),
+        "event_numeric": rng.random((e, len(features.EVENT_NUMERIC)), dtype=np.float32),
     }
