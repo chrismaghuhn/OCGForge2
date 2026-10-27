@@ -239,9 +239,10 @@ DecisionRequest decode_idle(const std::vector<std::uint8_t>& frame) {
         const auto controller = reader.u8();
         const auto location = reader.u8();
         const auto sequence = reader.u32();
-        (void)reader.u64();
+        const auto description = reader.u64();
         (void)reader.u8();
         add_idle_card(request, 5, index, code, controller, location, sequence);
+        request.candidates.back().choice_value = description;
     }
 
     if (reader.u8() != 0) {
@@ -293,9 +294,10 @@ DecisionRequest decode_battle(const std::vector<std::uint8_t>& frame) {
         const auto controller = reader.u8();
         const auto location = reader.u8();
         const auto sequence = reader.u32();
-        (void)reader.u64();
+        const auto description = reader.u64();
         (void)reader.u8();
         add_battle_card(request, 0, index, code, controller, location, sequence);
+        request.candidates.back().choice_value = description;
     }
 
     const auto attackable = reader.u32();
@@ -433,10 +435,11 @@ DecisionRequest decode_chain(const std::vector<std::uint8_t>& frame) {
         const auto location = reader.u8();
         const auto sequence = reader.u32();
         (void)reader.u32();
-        (void)reader.u64();
+        const auto description = reader.u64();
         (void)reader.u8();
         ActionCandidate candidate;
         candidate.action_kind = ActionKind::Chain;
+        candidate.choice_value = description;
         candidate.semantic_key = card_key("chain", 0, index, code, controller, location, sequence);
         candidate.choice_index = index;
         candidate.source_card = code;

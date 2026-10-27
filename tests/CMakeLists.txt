@@ -11,6 +11,7 @@ add_executable(ocgforge_tests
     core/deck_test.cpp
     protocol/select_unselect_test.cpp
     duel/duel_test.cpp
+    encode/encoder_test.cpp
 )
 target_include_directories(ocgforge_tests PRIVATE .)
 target_link_libraries(ocgforge_tests PRIVATE ygo Catch2::Catch2WithMain)

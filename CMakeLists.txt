@@ -5,8 +5,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)  # the static libraries also go into the Python module
 
 option(OCGFORGE_BUILD_TESTS "Build the test suite" ON)
+option(OCGFORGE_BUILD_PYTHON "Build the ocgforge._core Python module" OFF)
 
 # --- Pinned third-party inputs ------------------------------------------------
 # Fetches ocgcore, CardScripts and BabelCDB into .cache/ (see third_party/deps.json),
@@ -56,10 +58,30 @@ add_library(ygo STATIC
     src/observation/serialization.cpp
     src/observation/zone_projection.cpp
     src/duel/duel.cpp
+    src/encode/encoder.cpp
+    src/encode/vector_env.cpp
 )
 target_include_directories(ygo PUBLIC include PRIVATE src/core src/observation)
 target_link_libraries(ygo PUBLIC ocgcore)
 target_compile_options(ygo PRIVATE -Wall -Wextra -Wpedantic)
+find_package(Threads REQUIRED)
+target_link_libraries(ygo PUBLIC Threads::Threads)
+
+if(OCGFORGE_BUILD_PYTHON)
+    # Build against the interpreter that will import it, e.g. -DPython_EXECUTABLE=.venv/bin/python
+    find_package(Python 3.11 REQUIRED COMPONENTS Interpreter Development.Module)
+    include(FetchContent)
+    FetchContent_Declare(nanobind
+        GIT_REPOSITORY https://github.com/wjakob/nanobind.git
+        GIT_TAG v2.13.0
+        GIT_SHALLOW TRUE
+    )
+    FetchContent_MakeAvailable(nanobind)
+    nanobind_add_module(_core src/python/module.cpp)
+    target_link_libraries(_core PRIVATE ygo)
+    # Next to the Python sources, so an editable install imports it directly.
+    set_target_properties(_core PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/python/src/ocgforge")
+endif()
 
 if(OCGFORGE_BUILD_TESTS)
     enable_testing()

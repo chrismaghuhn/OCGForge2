@@ -150,7 +150,11 @@ class Model(nn.Module):
         targets = gather(batch["candidate_targets"].reshape(b, c * features.MAX_TARGETS))
         targets = targets.reshape(b, c, features.MAX_TARGETS, -1).sum(2)
         targets = targets / (batch["candidate_targets"] >= 0).sum(-1, keepdim=True).clamp(min=1)
-        candidate = self.kind(batch["candidate_kind"]) + source + targets + self.candidate_numeric(batch["candidate_numeric"])
+        # Without a source token the candidate's own card (if any) stands in for it.
+        own_card = torch.where((batch["candidate_card"] > 0).unsqueeze(-1), self.card_embedding(batch["candidate_card"]),
+                               torch.zeros_like(source))
+        candidate = (self.kind(batch["candidate_kind"]) + source + own_card + self.zone(batch["candidate_zone"])
+                     + targets + self.candidate_numeric(batch["candidate_numeric"]))
         ctx = context.unsqueeze(1).expand_as(candidate)
         scores = self.score(torch.cat([candidate, ctx, candidate * ctx], dim=-1)).squeeze(-1)
         scores = scores.masked_fill(batch["candidate_pad"], float("-inf"))
