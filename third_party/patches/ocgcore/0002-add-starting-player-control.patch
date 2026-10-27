@@ -1,0 +1,86 @@
+diff --git a/duel.cpp b/duel.cpp
+index d58294b..89b6a28 100644
+--- a/duel.cpp
++++ b/duel.cpp
+@@ -40,6 +40,12 @@ duel::~duel() {
+ 	for(auto& pgroup : groups)
+ 		delete pgroup;
+ }
++int duel::set_starting_player(uint8_t player) noexcept {
++	if(started_ || player > 1)
++		return 0;
++	starting_player_ = player;
++	return 1;
++}
+ #if defined(__GNUC__) || defined(__clang_analyzer__)
+ #pragma GCC diagnostic push
+ #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+diff --git a/duel.h b/duel.h
+index 35926aa..6d342b4 100644
+--- a/duel.h
++++ b/duel.h
+@@ -76,6 +76,9 @@ public:
+ 	explicit duel(const OCG_DuelOptions& options, bool& valid_lua_lib);
+ 	~duel();
+ 	void clear();
++	int set_starting_player(uint8_t player) noexcept;
++	void mark_started() noexcept { started_ = true; }
++	uint8_t starting_player() const noexcept { return starting_player_; }
+ 	
+ 	card* new_card(uint32_t code);
+ 	template<typename... Args>
+@@ -120,6 +123,8 @@ private:
+ 	void* read_script_payload;
+ 	void* handle_message_payload;
+ 	void* read_card_done_payload;
++	uint8_t starting_player_{ 0 };
++	bool started_{ false };
+ };
+ 
+ #endif /* DUEL_H_ */
+diff --git a/ocgapi.cpp b/ocgapi.cpp
+index 8345b46..fa1cdb9 100644
+--- a/ocgapi.cpp
++++ b/ocgapi.cpp
+@@ -105,9 +105,16 @@ void OCG_DuelNewCard(OCG_Duel ocg_duel, const OCG_NewCardInfo* info_ptr) {
+ 
+ void OCG_StartDuel(OCG_Duel ocg_duel) {
+ 	auto* pduel = static_cast<duel*>(ocg_duel);
++	pduel->mark_started();
+ 	pduel->game_field->emplace_process<Processors::Startup>();
+ }
+ 
++int OCG_DuelSetStartingPlayer(OCG_Duel ocg_duel, uint8_t player) {
++	if(ocg_duel == nullptr)
++		return 0;
++	return static_cast<duel*>(ocg_duel)->set_starting_player(player);
++}
++
+ int OCG_DuelProcess(OCG_Duel ocg_duel) {
+ 	auto* pduel = static_cast<duel*>(ocg_duel);
+ 	pduel->buff.clear();
+diff --git a/ocgapi.h b/ocgapi.h
+index b95a2cf..912bdb0 100644
+--- a/ocgapi.h
++++ b/ocgapi.h
+@@ -32,6 +32,7 @@ OCGAPI int OCG_CreateDuel(OCG_Duel* out_ocg_duel, const OCG_DuelOptions* options
+ OCGAPI void OCG_DestroyDuel(OCG_Duel ocg_duel);
+ OCGAPI void OCG_DuelNewCard(OCG_Duel ocg_duel, const OCG_NewCardInfo* info_ptr);
+ OCGAPI void OCG_StartDuel(OCG_Duel ocg_duel);
++OCGAPI int OCG_DuelSetStartingPlayer(OCG_Duel ocg_duel, uint8_t player);
+ 
+ /*** DUEL PROCESSING AND QUERYING ***/
+ OCGAPI int OCG_DuelProcess(OCG_Duel ocg_duel);
+diff --git a/processor.cpp b/processor.cpp
+index d2c6c09..07279f8 100644
+--- a/processor.cpp
++++ b/processor.cpp
+@@ -5039,7 +5039,7 @@ bool field::process(Processors::Startup& arg) {
+ 
+ 			}
+ 		}
+-		emplace_process<Processors::Turn>(0);
++		emplace_process<Processors::Turn>(pduel->starting_player());
+ 		return TRUE;
+ 	}
+ 	}

@@ -1,0 +1,14 @@
+diff --git a/ocgapi.cpp b/ocgapi.cpp
+index 26dc09c..8345b46 100644
+--- a/ocgapi.cpp
++++ b/ocgapi.cpp
+@@ -185,7 +185,8 @@ void* OCG_DuelQuery(OCG_Duel ocg_duel, uint32_t* length, const OCG_QueryInfo* in
+ 	pduel->query_buffer.clear();
+ 	card* pcard = nullptr;
+ 	if(info.loc & LOCATION_OVERLAY) {
+-		auto olcard = pduel->game_field->get_field_card(info.con, (info.loc & LOCATION_OVERLAY), info.seq);
++		const auto parent_location = info.loc & ~LOCATION_OVERLAY;
++		auto olcard = pduel->game_field->get_field_card(info.con, parent_location, info.seq);
+ 		if(olcard && olcard->xyz_materials.size() > info.overlay_seq) {
+ 			pcard = olcard->xyz_materials[info.overlay_seq];
+ 		}

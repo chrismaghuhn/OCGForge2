@@ -1,0 +1,21 @@
+include(FetchContent)
+FetchContent_Declare(Catch2
+    GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+    GIT_TAG v3.7.1
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(Catch2)
+include(Catch)
+
+add_executable(ocgforge_tests
+    core/deck_test.cpp
+    protocol/select_unselect_test.cpp
+    duel/duel_test.cpp
+)
+target_include_directories(ocgforge_tests PRIVATE .)
+target_link_libraries(ocgforge_tests PRIVATE ygo Catch2::Catch2WithMain)
+target_compile_definitions(ocgforge_tests PRIVATE
+    OCGFORGE_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    OCGFORGE_CACHE_DIR="${OCGFORGE_CACHE}"
+)
+catch_discover_tests(ocgforge_tests)
