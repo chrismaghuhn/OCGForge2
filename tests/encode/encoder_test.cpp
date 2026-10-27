@@ -133,3 +133,48 @@ TEST_CASE("vector env restarts finished duels and is deterministic") {
     };
     CHECK(play(1) == play(3));  // same duels whatever the thread count
 }
+
+// The `selected` flag of a multi-card selection, checked against the picks actually
+// made (tracked by observation locator), not against the encoder's own marking.
+TEST_CASE("cards picked in an ongoing selection are marked selected and nothing else") {
+    const auto selected_column = static_cast<std::size_t>(
+        std::find(token_numeric_names().begin(), token_numeric_names().end(), "selected") -
+        token_numeric_names().begin());
+    const auto columns = token_numeric_names().size();
+    std::size_t checked_with_picks = 0;
+    for (std::uint64_t seed = 1; seed <= 6; ++seed) {
+        ygo::duel::Duel duel(test::duel_config(seed));
+        std::mt19937_64 rng(seed);
+        std::string selection;              // engine message of the ongoing selection
+        std::set<std::string> picked;       // locators of cards picked in it
+        while (!duel.finished()) {
+            const auto& observation = *duel.observation();
+            const auto& request = duel.request();
+            const auto encoded = encode(observation, request, {});
+            // One selection = one engine message; the continuation id changes with every pick.
+            const auto id = request.continuation
+                                ? request.continuation->raw_message_hash + "@" + std::to_string(request.engine_step_index)
+                                : std::string();
+            if (id != selection) {
+                picked.clear();
+                selection = id;
+            }
+            if (request.continuation) {
+                for (std::size_t t = 0; t < observation.entities.size(); ++t) {
+                    const bool marked = encoded.token_numeric[t * columns + selected_column] == 1.0f;
+                    CAPTURE(seed, observation.entities[t].locator.value);
+                    REQUIRE(marked == (picked.count(observation.entities[t].locator.value) == 1));
+                }
+                checked_with_picks += picked.empty() ? 0 : 1;
+            }
+            const auto choice = rng() % request.candidates.size();
+            const auto& candidate = request.candidates[choice];
+            const auto source = encoded.candidate_source[choice];
+            if (request.continuation && candidate.action_kind == ygo::protocol::ActionKind::Pick && source >= 0) {
+                picked.insert(observation.entities[static_cast<std::size_t>(source)].locator.value);
+            }
+            duel.act(candidate.semantic_key);
+        }
+    }
+    CHECK(checked_with_picks > 0);  // the situation actually came up
+}
