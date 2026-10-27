@@ -30,6 +30,7 @@ from .model import Model
 class PPOConfig:
     epochs: int = 3
     batch_size: int = 512
+    micro_batch: int = 128  # forward/backward chunk of a batch (gradients accumulate), bounds GPU memory
     lr: float = 1.5e-4
     clip: float = 0.2
     gamma: float = 1.0
@@ -39,6 +40,9 @@ class PPOConfig:
     kl_coef: float = 0.1  # KL to a fixed reference policy; 0 = off
     target_kl: float = 0.03  # stop the update once the policy moved this far from the rollout policy
     max_grad_norm: float = 0.5
+    # bf16 autocast on CUDA, ~3x faster updates; rollouts must use it too (ModelPolicy(bf16=True)),
+    # so the stored logprobs differ from the update's only by noise (~0.02 in log space).
+    bf16: bool = False
 
 
 def gae(values: Sequence[float], final_reward: float, gamma: float, lam: float,
@@ -89,7 +93,8 @@ def collate_steps(steps: Sequence[dict], device: torch.device | str = "cpu") -> 
 
 
 def ppo_loss(model: Model, batch: dict[str, torch.Tensor], config: PPOConfig) -> tuple[torch.Tensor, dict[str, float]]:
-    scores, value = model(batch)
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=config.bf16 and batch["chosen"].is_cuda):
+        scores, value = model(batch)
     logprobs = torch.log_softmax(scores.float(), dim=-1)
     valid = torch.isfinite(logprobs)
     probs = logprobs.exp()
@@ -150,10 +155,16 @@ def ppo_update(model: Model, optimizer: torch.optim.Optimizer, steps: Sequence[d
         order = list(range(len(steps)))
         rng.shuffle(order)
         for start in range(0, len(order), config.batch_size):
-            batch = collate_steps([steps[i] for i in order[start:start + config.batch_size]], device)
-            loss, stats = ppo_loss(model, batch, config)
+            chosen = order[start:start + config.batch_size]
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            stats: dict[str, float] = defaultdict(float)
+            for micro in range(0, len(chosen), config.micro_batch):
+                part = chosen[micro:micro + config.micro_batch]
+                share = len(part) / len(chosen)
+                loss, part_stats = ppo_loss(model, collate_steps([steps[i] for i in part], device), config)
+                (loss * share).backward()
+                for key, value in part_stats.items():
+                    stats[key] += value * share
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
             optimizer.step()
             for key, value in stats.items():

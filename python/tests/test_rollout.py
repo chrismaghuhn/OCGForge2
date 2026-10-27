@@ -74,3 +74,37 @@ def test_match_maps_seats_and_winners():
     results = rollout.match(env, rollout.RandomPolicy(1), rollout.RandomPolicy(2), duels=4, name_a="A", name_b="B")
     by_env_winner = sorted(r["winner"] for r in results)
     assert by_env_winner.count("a") == by_env_winner.count("b") == len(results) // 2
+
+
+def test_league_prefers_opponents_the_learner_struggles_against():
+    from ocgforge.rollout import League
+
+    league = League(share=0.5, size=2, seed=0)
+    assert league.pick() is None
+    league.add("weak", object())
+    league.add("strong", object())
+    for _ in range(20):
+        league.result("weak", 1.0)
+        league.result("strong", 0.0)
+    picks = [league.pick() for _ in range(200)]
+    assert picks.count("strong") > 150
+    league.add("newest", object())  # size 2: the oldest leaves
+    assert set(league.policies) == {"strong", "newest"} and "weak" not in league.scores()
+
+
+def test_card_usage_counts_offered_and_chosen_card_actions():
+    from ocgforge import features
+    from ocgforge.rollout import CardUsage
+
+    kind = features.CANDIDATE_KINDS.index
+    batch = {  # two decisions; token 0 is card 5, token 1 is card 6
+        "token_card": np.array([[5, 6], [5, 6]]),
+        "candidate_kind": np.array([[kind("activate"), kind("summon"), kind("to_end_phase")],
+                                    [kind("activate"), kind("activate"), 0]]),
+        "candidate_source": np.array([[0, 1, -1], [0, -1, -1]]),
+        "candidate_card": np.array([[0, 0, 0], [0, 7, 0]]),  # card 7 only from the deck, no token
+    }
+    usage = CardUsage(10)
+    usage.add(batch, [0, 1], [1, 2])  # summon card 6; then the padding slot is not a card action
+    assert usage.offered[[5, 6, 7]].tolist() == [2, 1, 1]
+    assert usage.chosen.tolist() == [0, 0, 0, 0, 0, 0, 1, 0, 0, 0]

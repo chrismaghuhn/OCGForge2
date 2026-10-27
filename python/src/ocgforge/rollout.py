@@ -53,8 +53,10 @@ class RandomPolicy:
 class ModelPolicy:
     """Samples from the model's softmax (or plays the argmax with sample=False), in eval mode."""
 
-    def __init__(self, model: Model, device: torch.device | str = "cpu", sample: bool = True, seed: int = 0):
-        self.model, self.device, self.sample = model, device, sample
+    def __init__(self, model: Model, device: torch.device | str = "cpu", sample: bool = True, seed: int = 0,
+                 bf16: bool = False):
+        """`bf16`: autocast on CUDA, to match a PPOConfig(bf16=True) update."""
+        self.model, self.device, self.sample, self.bf16 = model, device, sample, bf16
         self.generator = torch.Generator().manual_seed(seed)
 
     def __call__(self, decisions: Sequence[dict]) -> tuple[list[int], list[float], list[float]]:
@@ -66,7 +68,9 @@ class ModelPolicy:
     @torch.no_grad()
     def _choose(self, inputs: dict) -> tuple[list[int], list[float], list[float]]:
         self.model.eval()
-        scores, values = self.model(inputs)
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.bf16 and str(self.device).startswith("cuda")):
+            scores, values = self.model(inputs)
+        values = values.float()
         logprobs = torch.log_softmax(scores.float(), dim=-1).cpu()
         if self.sample:
             choices = torch.multinomial(logprobs.exp(), 1, generator=self.generator).squeeze(1)
@@ -81,7 +85,8 @@ class RolloutStats:
     duels: int = 0
     errors: int = 0
     decisions: int = 0
-    wins: list[int] = field(default_factory=lambda: [0, 0, 0])  # player 0, player 1, draw
+    wins: list[int] = field(default_factory=lambda: [0, 0, 0])  # player 0, player 1, draw (self-play duels)
+    league_duels: int = 0
     error_messages: list[str] = field(default_factory=list)
 
 
@@ -132,6 +137,85 @@ def collect(env, policy: Policy, duels: int) -> tuple[list[tuple[list[dict], flo
     return trajectories, stats
 
 
+class League:
+    """Frozen earlier models the learner plays against in a share of the envs (the rest is plain
+    self-play), so it keeps beating what it already beat instead of chasing its latest self. Who
+    comes up next is prioritized fictitious self-play: opponents the learner scores worse against
+    come up more often, with weight (1 - score)^2 on a smoothed score."""
+
+    def __init__(self, share: float, size: int, seed: int = 0):
+        self.share, self.size = share, size
+        self.policies: dict[str, Policy] = {}
+        self.record: dict[str, list[float]] = {}  # name -> [games, learner points]
+        self.rng = np.random.default_rng(seed)
+
+    def add(self, name: str, policy: Policy) -> None:
+        self.policies[name] = policy
+        self.record.setdefault(name, [0, 0.0])
+        while len(self.policies) > self.size:
+            oldest = next(iter(self.policies))
+            del self.policies[oldest], self.record[oldest]
+
+    def pick(self) -> str | None:
+        if not self.policies:
+            return None
+        names = list(self.policies)
+        scores = np.array([(self.record[n][1] + 1) / (self.record[n][0] + 2) for n in names])
+        weights = (1 - scores) ** 2 + 1e-3
+        return names[self.rng.choice(len(names), p=weights / weights.sum())]
+
+    def result(self, name: str, learner_score: float) -> None:
+        if name in self.record:
+            self.record[name][0] += 1
+            self.record[name][1] += learner_score
+
+    def scores(self) -> dict[str, float]:
+        return {n: round(points / games, 3) for n, (games, points) in self.record.items() if games}
+
+
+CARD_ACTIONS = ("summon", "special_summon", "set_monster", "set_spell_trap", "activate", "chain_activate", "attack")
+_CARD_ACTION_IDS = np.array([features.CANDIDATE_KINDS.index(k) for k in CARD_ACTIONS])
+
+
+class CardUsage:
+    """How often each card was offered as an action (summon, set, activate, attack) and how often the
+    learner took it: which cards the policy plays and which it leaves alone."""
+
+    def __init__(self, cards: int):
+        self.offered = np.zeros(cards, np.int64)  # decisions in which the card had an action
+        self.chosen = np.zeros(cards, np.int64)
+
+    def add(self, batch: dict, rows: list[int], choices: list[int]) -> None:
+        if not rows:
+            return
+        kind = batch["candidate_kind"][rows]
+        source = batch["candidate_source"][rows]
+        tokens = batch["token_card"][rows]
+        card = np.where(source >= 0, np.take_along_axis(tokens, np.maximum(source, 0), 1), batch["candidate_card"][rows])
+        action = np.isin(kind, _CARD_ACTION_IDS) & (card > 1)
+        for r in range(len(rows)):  # count a card once per decision
+            np.add.at(self.offered, np.unique(card[r][action[r]]), 1)
+        picked = np.asarray(choices)
+        taken = action[np.arange(len(rows)), picked]
+        np.add.at(self.chosen, card[np.arange(len(rows)), picked][taken], 1)
+
+    def reset(self) -> None:
+        self.offered[:] = 0
+        self.chosen[:] = 0
+
+
+def _rows(batch: dict, rows: list[int]) -> dict:
+    """The given rows of a recv_batch batch."""
+    count = len(batch["token_count"])
+    return {k: v[rows] if isinstance(v, np.ndarray) and v.ndim and len(v) == count else v for k, v in batch.items()}
+
+
+def _play(policy: Policy, batch: dict) -> tuple[list[int], list[float], list[float]]:
+    if hasattr(policy, "on_batch"):
+        return policy.on_batch(batch)
+    return policy([features.row(batch, n) for n in range(len(batch["token_count"]))])
+
+
 class AsyncCollector:
     """Self-play with env.recv_batch/send in segments: each seat of each env keeps at most `segment`
     decisions; a full segment is handed out with the value of that seat's next decision as its
@@ -139,23 +223,30 @@ class AsyncCollector:
     `batch_size` envs are ready first, so neither the engine nor the policy waits for the slowest
     duel. Duels keep running between collect calls; at the end of a call every open segment is
     handed out too, bootstrapped from its seat's latest decision, so at most that one decision per
-    seat (played by the policy before the update) carries over. Use an env driven only this way."""
+    seat (played by the policy before the update) carries over. Use an env driven only this way.
 
-    def __init__(self, env, batch_size: int, segment: int = 128):
-        self.env, self.batch_size, self.segment = env, batch_size, segment
+    With a `league`, the first `league.share` of the envs play a league opponent (picked when a duel
+    starts) on seat `env % 2` and keep only the learner's decisions; until the league has models,
+    they play self-play too."""
+
+    def __init__(self, env, batch_size: int, segment: int = 128, league: League | None = None,
+                 card_usage: CardUsage | None = None):
+        self.env, self.batch_size, self.segment, self.league = env, batch_size, segment, league
+        self.card_usage = card_usage
         self.pending: dict[tuple[int, int], list[dict]] = {}
+        self.league_envs = round(len(env) * league.share) if league else 0
+        self.opponent: dict[int, str] = {}  # env -> league opponent of its current duel
 
-    def collect(self, policy: Policy, steps: int, max_errors: int | None = None
-                ) -> tuple[list[tuple[list[dict], float, float | None]], RolloutStats]:
-        """Plays until at least `steps` decisions are in segments. Returns the segments as
-        (decisions, result, bootstrap) for ppo.build_steps. Failed duels (including ones that hit the
-        decision limit) drop their unfinished segments; more than `max_errors` failed duels (default:
-        10 per env) without a single kept decision raise, since nothing would ever be collected."""
-        max_errors = 10 * len(self.env) if max_errors is None else max_errors
+    def league_policies(self) -> dict[str, Policy]:
+        return self.league.policies if self.league else {}
+
+    def collect(self, policy: Policy, steps: int) -> tuple[list[tuple[list[dict], float, float | None]], RolloutStats]:
+        """Plays `steps` decisions (at least) and returns them as segments (decisions, result,
+        bootstrap) for ppo.build_steps, minus the latest decision of each seat, which carries over.
+        Failed duels (including ones that hit the decision limit) drop their unfinished segments."""
         segments: list[tuple[list[dict], float, float | None]] = []
         stats = RolloutStats()
-        kept = 0
-        while kept < steps:
+        while stats.decisions < steps:
             ids, batch, done, winners, errors = self.env.recv_batch(self.batch_size)
             ids = ids.tolist()
             if not ids:  # every env is still handed out, e.g. by an earlier interrupted call
@@ -164,30 +255,49 @@ class AsyncCollector:
                 if not finished:
                     continue
                 seats = [self.pending.pop((i, p), []) for p in (0, 1)]
+                opponent = self.opponent.pop(i, None)
                 if error:
                     stats.errors += 1
                     stats.error_messages.append(error)
-                    if kept == 0 and stats.errors > max_errors:
-                        raise RuntimeError(f"{stats.errors} duels failed before any decision was kept; last: {error}")
                     continue
-                stats.duels += 1
-                stats.wins[min(winner, 2)] += 1
-                for player, seat in enumerate(seats):
+                if opponent is not None:
+                    learner = 1 - i % 2
+                    self.league.result(opponent, (_result_for(learner, winner) + 1) / 2)
+                    stats.league_duels += 1
+                    continue_with = [learner]
+                else:
+                    stats.duels += 1
+                    stats.wins[min(winner, 2)] += 1
+                    continue_with = [0, 1]
+                for player in continue_with:
+                    seat = seats[player]
                     if seat:
                         segments.append((seat, _result_for(player, winner), None))
-                        kept += len(seat)
-            if hasattr(policy, "on_batch"):
-                choices, logprobs, values = policy.on_batch(batch)
-            else:
-                choices, logprobs, values = policy([features.row(batch, n) for n in range(len(ids))])
+            for i, first in zip(ids, (batch["duel_decision"] == 0).tolist()):
+                if first and i < self.league_envs and i not in self.opponent and (name := self.league.pick()):
+                    self.opponent[i] = name
+            players = batch["player"].tolist()
+            # An opponent dropped from the league mid-duel hands its seat to the learner.
+            actor = [name if players[n] == i % 2 and (name := self.opponent.get(i)) in self.league_policies() else None
+                     for n, i in enumerate(ids)]
+            choices, logprobs, values = [0] * len(ids), [0.0] * len(ids), [0.0] * len(ids)
+            for name in set(actor):
+                rows = [n for n, a in enumerate(actor) if a == name]
+                part = batch if len(rows) == len(ids) else _rows(batch, rows)
+                for n, c, lp, v in zip(rows, *_play(policy if name is None else self.league.policies[name], part)):
+                    choices[n], logprobs[n], values[n] = c, lp, v
+            if self.card_usage is not None:
+                learner_rows = [n for n, a in enumerate(actor) if a is None]
+                self.card_usage.add(batch, learner_rows, [choices[n] for n in learner_rows])
             for n, (i, choice, logprob, value) in enumerate(zip(ids, choices, logprobs, values)):
+                if actor[n] is not None:
+                    continue  # the league opponent's move: not trained on
                 decision = features.row(batch, n, copy=True)  # compact: a view would keep the whole batch alive
                 decision.update(chosen=choice, logprob=logprob, value=value)
                 key = (i, decision["player"])
                 seat = self.pending.setdefault(key, [])
                 if len(seat) == self.segment:
                     segments.append((seat, 0.0, float(value)))
-                    kept += len(seat)
                     seat = self.pending[key] = []
                 seat.append(decision)
             self.env.send(ids, choices)

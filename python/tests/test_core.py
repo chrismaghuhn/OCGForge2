@@ -156,7 +156,7 @@ def test_async_segments_feed_a_ppo_update(card_features):
     assert all(len(seat) == 1 for seat in collector.pending.values())  # only the latest decision carries over
     more, more_stats = collector.collect(policy, steps=300)  # duels carry over between calls
     segments += more
-    assert sum(len(s) for s, _, _ in segments) >= 600
+    assert sum(len(s) for s, _, _ in segments) >= 600 - 2 * len(env)  # one decision per seat carries over
     assert all(1 <= len(s) <= 16 for s, _, _ in segments)
     cut = [(s, result) for s, result, bootstrap in segments if bootstrap is not None]
     assert cut and all(result == 0.0 for _, result in cut) and any(len(s) == 16 for s, _ in cut)
@@ -171,3 +171,17 @@ def test_async_segments_feed_a_ppo_update(card_features):
     steps = build_steps(segments, gamma=1.0, lam=0.95)
     history = ppo_update(model, torch.optim.AdamW(model.parameters(), lr=1e-4), steps, PPOConfig(epochs=1, batch_size=256))
     assert history and np.isfinite(history[0]["loss"])
+
+
+def test_league_envs_keep_only_the_learners_decisions(card_features):
+    env = rollout.vector_env(card_features, DECKS, num_envs=4, seed=8)
+    league = rollout.League(share=0.5, size=2)
+    league.add("random", rollout.RandomPolicy(1))
+    collector = rollout.AsyncCollector(env, batch_size=2, segment=16, league=league)
+    segments, stats = collector.collect(rollout.RandomPolicy(2), steps=400)
+    assert collector.opponent == {0: "random", 1: "random"}
+    for env_id, player in collector.pending:
+        if env_id < 2:
+            assert player == 1 - env_id % 2  # the opponent sits on seat env % 2
+    assert {seat for env_id, seat in collector.pending if env_id >= 2} == {0, 1}
+    assert sum(len(s) for s, _, _ in segments) < stats.decisions
