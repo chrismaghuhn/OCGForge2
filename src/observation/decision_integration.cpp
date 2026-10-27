@@ -115,6 +115,13 @@ void attach_decision_context(PlayerObservation& observation,
 }
 
 
+std::optional<ObservationLocator> find_card(const PlayerObservation& observation, std::uint32_t code,
+                                            std::uint8_t controller, std::uint32_t location,
+                                            std::uint32_t sequence,
+                                            std::optional<std::uint32_t> overlay_sequence) {
+    return resolve_card(observation, code, controller, location, sequence, overlay_sequence);
+}
+
 bool candidate_observation_consistent_impl(const PlayerObservation& observation,
                                            const ygo::protocol::ActionCandidate& candidate
                                            ) {

@@ -1,6 +1,7 @@
 """The model's input for one decision, and batching.
 
-One decision is a dict of numpy arrays (the C++ encoder will produce exactly this):
+One decision is a dict of numpy arrays, produced by the C++ encoder (src/encode/encoder.cpp, exposed
+as ocgforge._core); tests/test_core.py checks that both sides use the same names and order:
 
     token_card         [T]      card index (cards.CardFeatures), UNK for a hidden card
     token_zone         [T]      index into ZONES
@@ -11,6 +12,9 @@ One decision is a dict of numpy arrays (the C++ encoder will produce exactly thi
     decision           []       index into DECISIONS
     candidate_kind     [C]      index into CANDIDATE_KINDS
     candidate_source   [C]      token index of the card the candidate acts with, -1 = none
+    candidate_card     [C]      card index of that card when it has no token (own cards only, e.g. a
+                                deck search) or of the card offering an option; 0 = none
+    candidate_zone     [C]      index into ZONES of the candidate's card or place, 0 = none
     candidate_targets  [C, MAX_TARGETS]  token indices, -1 = none
     candidate_numeric  [C, len(CANDIDATE_NUMERIC)]
 
@@ -62,7 +66,6 @@ TOKEN_NUMERIC = (
     "disabled",
     "selected",  # already picked in an ongoing multi-card selection
     "chainIndex",  # position on the chain / 10, 0 = not chained
-    "turnsOnField",
 )
 
 _PLAYER = ("lp", "hand", "deck", "extra", "graveyard", "banished", "monsters", "spellTraps")
@@ -72,7 +75,6 @@ GLOBAL_NUMERIC = (
     "turn",
     "isOwnTurn",
     "chainSize",
-    "normalSummonUsed",
     "selectMin",  # multi-card selections
     "selectMax",
     "selectedCount",
@@ -85,13 +87,16 @@ CANDIDATE_NUMERIC = (
     "value",  # option / number / amount, scaled
     "faceUp",  # position candidates
     "attackPosition",
-    "zone",  # place candidates: column / 7
+    "zone",  # column / 7 of the candidate's card or place
+    "opponentSide",  # that card or place is the opponent's
+    "variant",  # n-th repeat of an otherwise identical candidate (e.g. one per summon procedure) / 4
 )
 
 _WIDTHS = {"token_numeric": (len(TOKEN_NUMERIC),), "candidate_targets": (MAX_TARGETS,),
            "candidate_numeric": (len(CANDIDATE_NUMERIC),)}
 _TOKEN_FIELDS = ("token_card", "token_zone", "token_side", "token_numeric")
-_CANDIDATE_FIELDS = ("candidate_kind", "candidate_source", "candidate_targets", "candidate_numeric")
+_CANDIDATE_FIELDS = ("candidate_kind", "candidate_source", "candidate_card", "candidate_zone", "candidate_targets",
+                     "candidate_numeric")
 _PAD_VALUES = {"token_side": 2, "candidate_source": -1, "candidate_targets": -1}
 
 

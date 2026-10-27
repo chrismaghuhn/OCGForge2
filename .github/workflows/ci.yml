@@ -48,13 +48,19 @@ jobs:
           path: .cache
           key: deps-${{ hashFiles('third_party/deps.json', 'third_party/patches/**') }}
 
-      - name: Fetch card database
-        run: python tools/setup_deps.py
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
 
-      - name: Install
+      - name: Install Python packages
         run: |
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install -e "python[test]"
+          python -m venv .venv
+          .venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
+          .venv/bin/pip install -e "python[test]"
+
+      - name: Build ocgforge._core
+        run: cmake --preset python && cmake --build --preset python --parallel
 
       - name: Test
-        run: pytest python
+        run: .venv/bin/python -m pytest python
+        env:
+          OCGFORGE_REQUIRE_CORE: "1"

@@ -108,8 +108,11 @@ ObservedCard project_card(const CardProjectionInput& input) {
     result.controller = input.controller;
     result.zone = input.zone;
     result.position = position_from_raw(input.query.position);
-    result.face_up = result.position == Position::FaceUpAttack || result.position == Position::FaceUpDefense;
-    result.face_down = result.position == Position::FaceDownAttack || result.position == Position::FaceDownDefense;
+    // Spells and traps report POS_FACEUP / POS_FACEDOWN (both bits), not one of the four
+    // monster positions, so test the bits rather than the decoded position.
+    const auto raw_position = input.query.position.value_or(0);
+    result.face_up = (raw_position & POS_FACEUP) != 0;
+    result.face_down = !result.face_up && (raw_position & POS_FACEDOWN) != 0;
     if (input.sequence_visible) {
         result.sequence = input.sequence;
     }

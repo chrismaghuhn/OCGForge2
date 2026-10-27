@@ -50,6 +50,8 @@ def random_decision(rng: np.random.Generator, n_cards: int, tokens: int | None =
         "decision": int(rng.integers(1, len(features.DECISIONS))),
         "candidate_kind": rng.integers(1, len(features.CANDIDATE_KINDS), c),
         "candidate_source": rng.integers(-1, max(t, 1), c) if t else np.full(c, -1),
+        "candidate_card": rng.integers(0, n_cards, c),
+        "candidate_zone": rng.integers(0, len(features.ZONES), c),
         "candidate_targets": rng.integers(-1, max(t, 1), (c, features.MAX_TARGETS)) if t
         else np.full((c, features.MAX_TARGETS), -1),
         "candidate_numeric": rng.random((c, len(features.CANDIDATE_NUMERIC)), dtype=np.float32),

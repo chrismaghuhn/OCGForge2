@@ -53,17 +53,33 @@ A duel that needs more than `max_decisions` choices, or that keeps asking the
 same question in the same state, throws `DuelError` with the last decisions in
 the message instead of hanging.
 
-## Python: model and training
+## Python: model, training and the batched environment
 
 `python/` is the `ocgforge` package: the policy/value model (a set transformer that scores every
-legal candidate, ported from Argentum P1), the PPO core, an Elo ladder and the card-text
-embeddings.
+legal candidate, ported from Argentum P1), the PPO core, an Elo ladder, card-text embeddings, and
+`ocgforge._core`, the C++ `VectorEnv` (many duels on a thread pool, encoded for the model).
 
 ```bash
 uv venv .venv && uv pip install --python .venv/bin/python torch --index-url https://download.pytorch.org/whl/cpu
 uv pip install --python .venv/bin/python -e "python[test]"
+cmake --preset python && cmake --build --preset python   # builds python/src/ocgforge/_core*.so
 .venv/bin/python -m pytest python
 ```
+
+Self-play and one PPO update:
+
+```python
+from ocgforge.model import Model
+from ocgforge.ppo import PPOConfig, build_steps, ppo_update
+from ocgforge.rollout import ModelPolicy, collect, vector_env
+
+env = vector_env(model.card_features, ["decks/swordsoul_tenyi.ydk", "decks/salamangreat.ydk"], num_envs=256)
+trajectories, stats = collect(env, ModelPolicy(model, device), duels=512)
+ppo_update(model, optimizer, build_steps(trajectories, gamma=1.0, lam=0.95), PPOConfig(), device)
+```
+
+`rollout.match(env, policy_a, policy_b, duels)` plays two policies against each other on both seats
+and returns results for `ladder.elo`.
 
 Card text embeddings (needs the `embed` extra; downloads BAAI/bge-small-en-v1.5 once):
 
@@ -71,8 +87,9 @@ Card text embeddings (needs the `embed` extra; downloads BAAI/bge-small-en-v1.5 
 .venv/bin/python -m ocgforge.embed_cards --cdb .cache/babelcdb/cards.cdb --out .cache/card_text_emb.npz
 ```
 
-The model's input format is described at the top of `python/src/ocgforge/features.py`. The C++
-side that produces it from a `Duel` does not exist yet.
+The model's input format is described at the top of `python/src/ocgforge/features.py`; the C++
+encoder (`src/encode/encoder.cpp`) produces it, and `python/tests/test_core.py` checks that both
+sides agree.
 
 ## Layout
 
@@ -82,6 +99,8 @@ side that produces it from a `Duel` does not exist yet.
 | `include/ygo/protocol`, `src/protocol` | engine messages → decision requests with complete candidate lists; responses |
 | `include/ygo/observation`, `src/observation` | per-player view of the duel without hidden information |
 | `include/ygo/duel`, `src/duel` | `Duel`: runs the engine between decisions, loop protection |
+| `include/ygo/encode`, `src/encode` | model input encoding, `VectorEnv` (batched duels on a thread pool) |
+| `src/python` | nanobind module `ocgforge._core` |
 | `tests/` | Catch2 tests, one executable |
 | `third_party/` | pinned dependency commits and our ocgcore patches |
 | `tools/setup_deps.py` | fetches/patches dependencies, extracts card data (run by CMake) |

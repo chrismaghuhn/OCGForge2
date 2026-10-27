@@ -33,6 +33,19 @@ player is allowed to know: own hand, face-up cards, public events, and so on.
 `Duel` additionally checks that every card a candidate refers to is visible to
 the deciding player.
 
+## Model input and the batched environment
+
+`encode::encode` turns one decision (the deciding player's observation plus the
+request) into the arrays described in `python/src/ocgforge/features.py`: one token
+per visible card, a global feature vector, and one row per candidate pointing at
+its source card's token. Card identities become model card indices through the
+checkpoint's `cards.json`; hidden cards are "unknown".
+
+`encode::VectorEnv` keeps N duels that always have a pending decision. `step`
+plays one candidate per duel on a thread pool and restarts finished or failed
+duels with a new seed and deck pair. `ocgforge._core` exposes it to Python with
+the GIL released during `step`.
+
 ## Determinism
 
 Same decks + same seed + same sequence of choices ⇒ same duel. The tests check
