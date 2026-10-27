@@ -1,0 +1,78 @@
+--- a/duel.h
++++ b/duel.h
+@@ -125,6 +125,14 @@
+ 	void* read_card_done_payload;
+ 	uint8_t starting_player_{ 0 };
+ 	bool started_{ false };
++public:
++	// Lua instruction budget per OCG_DuelProcess call (ticks of LUA_BUDGET_TICK
++	// instructions), so a script searching an exploding number of combinations
++	// fails the call instead of never returning.
++	static constexpr int LUA_BUDGET_TICK = 10000;
++	static constexpr uint64_t LUA_BUDGET_TICKS = 3000;
++	uint64_t lua_budget_ticks{ 0 };
++	bool lua_budget_exceeded{ false };
+ };
+ 
+ #endif /* DUEL_H_ */
+--- a/interpreter.cpp
++++ b/interpreter.cpp
+@@ -18,6 +18,17 @@
+ 
+ using namespace scriptlib;
+ 
++namespace {
++void lua_budget_hook(lua_State* L, lua_Debug*) {
++	duel* pduel;
++	std::memcpy(&pduel, lua_getextraspace(L), sizeof(duel*));
++	if(++pduel->lua_budget_ticks > duel::LUA_BUDGET_TICKS) {
++		pduel->lua_budget_exceeded = true;
++		luaL_error(L, "Lua instruction budget exceeded");
++	}
++}
++}
++
+ // This function will be used by a lua library built with api check
+ #ifdef __GNUC__
+ [[gnu::used]]
+@@ -69,6 +80,8 @@
+ 	no_action = 0;
+ 	call_depth = 0;
+ 	std::memcpy(lua_getextraspace(lua_state), &pd, sizeof(duel*));
++	// Coroutines created from this state inherit the hook.
++	lua_sethook(lua_state, lua_budget_hook, LUA_MASKCOUNT, duel::LUA_BUDGET_TICK);
+ 	// Open basic and used functionality
+ 	auto open_lib = [L=lua_state](const char* libname, lua_CFunction openf) {
+ 		ensure_luaL_stack(luaL_requiref, L, libname, openf, 1);
+--- a/ocgapi.cpp
++++ b/ocgapi.cpp
+@@ -109,6 +109,10 @@
+ 	pduel->game_field->emplace_process<Processors::Startup>();
+ }
+ 
++int OCG_DuelLuaBudgetExceeded(OCG_Duel ocg_duel) {
++	return static_cast<duel*>(ocg_duel)->lua_budget_exceeded ? 1 : 0;
++}
++
+ int OCG_DuelSetStartingPlayer(OCG_Duel ocg_duel, uint8_t player) {
+ 	if(ocg_duel == nullptr)
+ 		return 0;
+@@ -118,6 +122,7 @@
+ int OCG_DuelProcess(OCG_Duel ocg_duel) {
+ 	auto* pduel = static_cast<duel*>(ocg_duel);
+ 	pduel->buff.clear();
++	pduel->lua_budget_ticks = 0;
+ 	auto flag = OCG_DUEL_STATUS_END;
+ 	do {
+ 		flag = pduel->game_field->process();
+--- a/ocgapi.h
++++ b/ocgapi.h
+@@ -33,6 +33,8 @@
+ OCGAPI void OCG_DuelNewCard(OCG_Duel ocg_duel, const OCG_NewCardInfo* info_ptr);
+ OCGAPI void OCG_StartDuel(OCG_Duel ocg_duel);
+ OCGAPI int OCG_DuelSetStartingPlayer(OCG_Duel ocg_duel, uint8_t player);
++/* Nonzero once a Lua instruction budget of a process call was exceeded; the duel's state is then unreliable. */
++OCGAPI int OCG_DuelLuaBudgetExceeded(OCG_Duel ocg_duel);
+ 
+ /*** DUEL PROCESSING AND QUERYING ***/
+ OCGAPI int OCG_DuelProcess(OCG_Duel ocg_duel);

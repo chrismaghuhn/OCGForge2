@@ -1,19 +1,25 @@
 {
   "ocgcore": {
     "repository": "https://github.com/edo9300/ygopro-core.git",
-    "commit": "9a0c558c2d686542f7914a6d529fd7aa57746aed",
+    "commit": "baa3881d0bae48e9994f915f5c931be53c1ba8ef",
     "submodules": true,
     "patches": [
       "0001-fix-overlay-seq-parent-query.patch",
-      "0002-add-starting-player-control.patch"
+      "0002-add-starting-player-control.patch",
+      "0003-memoize-sum-greater-check.patch",
+      "0004-lua-instruction-budget.patch"
     ]
   },
   "cardscripts": {
     "repository": "https://github.com/ProjectIgnis/CardScripts.git",
-    "commit": "f337c87018ca723c1aded5143e616bb649555273"
+    "commit": "10912cc9398395a2652cb53106285670e49144a3"
   },
   "babelcdb": {
     "repository": "https://github.com/ProjectIgnis/BabelCDB.git",
-    "commit": "89ad6837b0766a52984d8c715a7d5d4f8447946b"
+    "commit": "2e6f985a5537d9b16ec7396787b5279d94af419d",
+    "databases": [
+      "cards.cdb",
+      "release-*.cdb"
+    ]
   }
 }

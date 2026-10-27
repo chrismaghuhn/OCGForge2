@@ -10,9 +10,11 @@ Card index 0 is padding and 1 is "unknown" (e.g. a face-down opponent card). Alt
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -72,6 +74,17 @@ def text_terms(text: str, name: str = "") -> list[str]:
     return words + [f"{a} {b}" for a, b in zip(words, words[1:])]
 
 
+def default_databases(cache: Path | None = None) -> list[Path]:
+    """The card databases third_party/deps.json pins, in priority order."""
+    root = Path(__file__).resolve().parents[3]
+    babelcdb = (cache or root / ".cache") / "babelcdb"
+    patterns = json.loads((root / "third_party" / "deps.json").read_text(encoding="utf-8"))["babelcdb"]["databases"]
+    paths = list(dict.fromkeys(path for pattern in patterns for path in sorted(babelcdb.glob(pattern))))
+    if not paths:
+        raise FileNotFoundError(f"no card database in {babelcdb}; run tools/setup_deps.py")
+    return paths
+
+
 def _bits(value: int, width: int) -> list[int]:
     return [bit for bit in range(width) if value >> bit & 1]
 
@@ -103,11 +116,21 @@ class CardTable:
     index_of: dict[int, int] = field(default_factory=dict)
 
     @classmethod
-    def from_cdb(cls, path: Path, include_tokens: bool = True) -> "CardTable":
+    def from_cdb(cls, paths: Path | Sequence[Path] | None = None, include_tokens: bool = True) -> "CardTable":
+        """Cards of one or more card databases (default: the pinned ones, see default_databases).
+        For a passcode in several databases the first one wins."""
+        if paths is None:
+            paths = default_databases()
+        elif isinstance(paths, (str, Path)):
+            paths = [paths]
         query = ("select d.id, d.alias, t.name, t.desc, d.type, d.attribute, d.race, d.level, d.atk, d.def, "
-                 "d.setcode from datas d join texts t on t.id = d.id order by d.id")
-        with sqlite3.connect(Path(path)) as connection:
-            rows = connection.execute(query).fetchall()
+                 "d.setcode from datas d join texts t on t.id = d.id")
+        found: dict[int, tuple] = {}
+        for path in paths:
+            with sqlite3.connect(Path(path)) as connection:
+                for row in connection.execute(query):
+                    found.setdefault(row[0], row)
+        rows = [found[code] for code in sorted(found)]
         table = cls(cards=[])
         artworks: list[tuple[int, int]] = []
         for code, alias, name, desc, card_type, attribute, race, level, atk, defense, setcode in rows:

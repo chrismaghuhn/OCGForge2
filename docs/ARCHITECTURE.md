@@ -58,6 +58,17 @@ this by replaying random duels.
 question in the same field state comes up again and again. Both throw
 `DuelError` with the last 20 decisions.
 
+Some card scripts search combinations of materials (Synchro, Ritual, ...)
+and, in unusual board states, never finish. Patch 0004 gives each
+`OCG_DuelProcess` call a Lua instruction budget (about 30M instructions, a
+few seconds); a call that exceeds it makes `CoreHost::process` throw, so that
+duel fails instead of blocking. In random self-play across all deck pairings
+this cuts off roughly 4% of duels.
+
+`VectorEnv::info(env)` shows the seed, decks and actions of an env's current
+duel (also while `step` runs), which is enough to replay a stuck duel with
+`Duel` alone. Duels that fail to start are counted in `start_failures`.
+
 ## Rules
 
 Fixed inputs live in `third_party/deps.json` (exact commits) and
@@ -67,5 +78,13 @@ Fixed inputs live in `third_party/deps.json` (exact commits) and
   parent of an Xyz material with the wrong location, so materials could not be
   queried.
 - `0002-add-starting-player-control.patch`: lets us choose who goes first.
+- `0003-memoize-sum-greater-check.patch`: the "at least N levels" material
+  check (Ritual Summons) tried every subset when there was no solution; it now
+  remembers partial results (same answers, polynomial time).
+- `0004-lua-instruction-budget.patch`: the per-call Lua instruction budget
+  above, with `OCG_DuelLuaBudgetExceeded`.
+
+`tools/setup_deps.py` applies the patches in order to a clean checkout and
+records their hashes in `.cache/ocgcore/.ocgforge-patches`.
 
 Duel mode is `DUEL_MODE_MR5` (Master Rule 2020).

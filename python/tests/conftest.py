@@ -9,14 +9,14 @@ from ocgforge import features
 from ocgforge.cards import Card, CardFeatures, CardTable
 
 REPO = Path(__file__).resolve().parents[2]
-CDB = REPO / ".cache" / "babelcdb" / "cards.cdb"
+CDB = REPO / ".cache" / "babelcdb" / "cards.cdb"  # present once tools/setup_deps.py has run
 
 
 @pytest.fixture(scope="session")
 def cdb_table() -> CardTable:
     if not CDB.exists():
         pytest.skip("card database not fetched (run cmake --preset debug or tools/setup_deps.py)")
-    return CardTable.from_cdb(CDB)
+    return CardTable.from_cdb()
 
 
 def make_table() -> CardTable:

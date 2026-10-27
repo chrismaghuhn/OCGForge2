@@ -51,6 +51,14 @@ CoreHost::CoreHost(CoreHostConfig config) : config_(std::move(config)) {
     );
     try {
         impl_->card_data.load(config_.card_data_tsv);
+        // Plain Normal Monsters and tokens have no script (Normal Pendulum Monsters do).
+        for (const auto code : config_.required_script_codes) {
+            const auto data = impl_->card_data.snapshot(code);
+            if (data && (((data->type & TYPE_NORMAL) != 0 && (data->type & TYPE_PENDULUM) == 0) ||
+                         (data->type & TYPE_TOKEN) != 0)) {
+                impl_->scripts.not_required(code);
+            }
+        }
         auto& options = impl_->options;
         for (std::size_t index = 0; index < config_.seed.words.size(); ++index) {
             options.seed[index] = config_.seed.words[index];
@@ -185,6 +193,11 @@ ProcessResult CoreHost::process() {
     ++process_call_count_;
     const int status = OCG_DuelProcess(impl_->duel);
     throw_if_callback_error("OCG_DuelProcess");
+    if (OCG_DuelLuaBudgetExceeded(impl_->duel) != 0) {
+        // A card script searched too many combinations and was cut off (our ocgcore
+        // patch 0004); the duel state can no longer be trusted.
+        throw CoreError(CoreErrorCode::Lifecycle, "OCG_DuelProcess", "Lua instruction budget exceeded");
+    }
     std::uint32_t length = 0;
     auto* raw = static_cast<const std::uint8_t*>(OCG_DuelGetMessage(impl_->duel, &length));
     ProcessResult result;

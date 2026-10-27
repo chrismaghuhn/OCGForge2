@@ -27,7 +27,7 @@ DECKS = [REPO / "decks" / "swordsoul_tenyi.ydk", REPO / "decks" / "salamangreat.
 def card_features() -> CardFeatures:
     if not CDB.exists():
         pytest.skip("card database not fetched")
-    return CardFeatures.build(CardTable.from_cdb(CDB))
+    return CardFeatures.build(CardTable.from_cdb())
 
 
 def test_cpp_and_python_agree_on_the_input_contract():
@@ -71,7 +71,13 @@ def test_random_play_gives_valid_safe_inputs(card_features):
                 if features.CANDIDATE_KINDS[kind] == "unselect_card" and source >= 0:
                     assert d["token_numeric"][source, selected] == 1.0
     assert face_up_spell_traps > 0
-    assert env.duel_errors == 0
+    assert env.duel_errors == 0 and env.start_failures == 0
+
+
+@pytest.mark.parametrize("deck", sorted((REPO / "decks").glob("**/*.ydk")), ids=lambda p: p.stem)
+def test_every_deck_can_start_a_duel(card_features, deck):
+    env = rollout.vector_env(card_features, [deck], num_envs=1, seed=13)
+    assert env.start_failures == 0, env.last_start_failure
 
 
 def test_same_seed_and_actions_give_the_same_inputs(card_features):

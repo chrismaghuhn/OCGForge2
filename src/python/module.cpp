@@ -102,8 +102,24 @@ NB_MODULE(_core, m) {
              "Play candidate actions[i] in env i. Returns (done, winner, errors) per env; winner 2 = draw, "
              "255 = the duel failed (errors[i] says why).")
         .def("decks", &VectorEnv::decks, "env"_a, "Deck indices of player 0 and 1 in the env's current duel.")
+        .def("info",
+             [](const VectorEnv& env, std::size_t i) {
+                 const auto info = env.info(i);
+                 nb::dict out;
+                 out["busy"] = info.busy;
+                 out["seed"] = info.seed;
+                 out["starting_player"] = info.starting_player;
+                 out["decks"] = nb::make_tuple(info.decks.first, info.decks.second);
+                 out["actions"] = info.actions;
+                 return out;
+             },
+             "env"_a, "For diagnosing hangs: seed, starting player, decks and actions of the env's duel; "
+             "safe to call from another thread while step runs.")
         .def_prop_ro("duels_finished", &VectorEnv::duels_finished)
-        .def_prop_ro("duel_errors", &VectorEnv::duel_errors);
+        .def_prop_ro("duel_errors", &VectorEnv::duel_errors)
+        .def_prop_ro("start_failures", &VectorEnv::start_failures,
+                     "Duels that failed to start and were replaced; nonzero usually means a deck problem.")
+        .def_prop_ro("last_start_failure", &VectorEnv::last_start_failure);
 
     m.def("decision_names", &ygo::encode::decision_names);
     m.def("zone_names", &ygo::encode::zone_names);

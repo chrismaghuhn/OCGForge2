@@ -7,6 +7,7 @@
 #include "support.hpp"
 #include "ygo/encode/encoder.hpp"
 #include "ygo/encode/vector_env.hpp"
+#include "ygo/observation/decision_integration.hpp"
 
 using namespace ygo::encode;
 
@@ -71,7 +72,10 @@ TEST_CASE("encoded decisions of a random duel are well formed and safe") {
         const auto columns = candidate_numeric_names().size();
         for (std::size_t a = 0; a < request.candidates.size(); ++a) {
             if (encoded.candidate_card[a] != 0 && request.candidates[a].action_kind != ygo::protocol::ActionKind::Option) {
-                REQUIRE(request.candidates[a].source_controller == request.player);
+                const auto& c = request.candidates[a];
+                REQUIRE((c.source_controller == request.player ||
+                         ygo::observation::revealed_this_turn(observation, c.source_card, c.source_controller,
+                                                              c.source_location)));
             }
             for (std::size_t b = a + 1; b < request.candidates.size(); ++b) {
                 const bool same_row =
@@ -129,6 +133,7 @@ TEST_CASE("vector env restarts finished duels and is deterministic") {
             }
         }
         CHECK(env.duel_errors() == 0);
+        CHECK(env.start_failures() == 0);
         return trace;
     };
     CHECK(play(1) == play(3));  // same duels whatever the thread count
