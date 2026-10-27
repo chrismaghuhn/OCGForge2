@@ -32,3 +32,29 @@ jobs:
         run: ctest --preset ${{ matrix.preset }}
         env:
           OCGFORGE_RANDOM_DUELS: ${{ matrix.preset == 'asan' && '5' || '25' }}
+
+  python:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pinned dependencies
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: deps-${{ hashFiles('third_party/deps.json', 'third_party/patches/**') }}
+
+      - name: Fetch card database
+        run: python tools/setup_deps.py
+
+      - name: Install
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e "python[test]"
+
+      - name: Test
+        run: pytest python
