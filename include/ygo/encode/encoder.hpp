@@ -40,6 +40,8 @@ struct EncodedDecision {
     std::vector<std::int64_t> event_to;           // zone index, 0 = none
     std::vector<std::int64_t> event_token;        // field card token the event happened to, only while provably the same card; -1 = none
     std::vector<float> event_numeric;             // [events x event_numeric_names().size()]
+
+    bool operator==(const EncodedDecision&) const = default;
 };
 
 // Passcode (including alternate artworks) -> model card index; anything else

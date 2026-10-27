@@ -103,7 +103,16 @@ VectorEnv::VectorEnv(VectorEnvConfig config, CardIndex card_index)
     }
 }
 
-VectorEnv::~VectorEnv() = default;
+VectorEnv::~VectorEnv() {
+    {
+        std::lock_guard lock(async_mutex_);
+        stop_workers_ = true;
+    }
+    jobs_ready_.notify_all();
+    for (auto& worker : workers_) {
+        worker.join();
+    }
+}
 
 // Starts a fresh duel in the slot and encodes its first decision. A duel that
 // fails before its first decision is retried with the next seed.
@@ -147,9 +156,23 @@ void VectorEnv::reset(Slot& slot) {
     }
 }
 
-const EncodedDecision& VectorEnv::decision(std::size_t env) const { return slots_.at(env)->decision; }
+void VectorEnv::require_handed_out(std::size_t env) const {
+    std::lock_guard lock(async_mutex_);
+    if (!workers_.empty() && (env >= state_.size() || state_[env] != EnvState::HandedOut)) {
+        throw std::logic_error("env " + std::to_string(env) + " is being played; in recv/send mode only envs "
+                               "handed out by recv can be read");
+    }
+}
 
-std::uint64_t VectorEnv::duel_decision(std::size_t env) const { return slots_.at(env)->duel->decision_count(); }
+const EncodedDecision& VectorEnv::decision(std::size_t env) const {
+    require_handed_out(env);
+    return slots_.at(env)->decision;
+}
+
+std::uint64_t VectorEnv::duel_decision(std::size_t env) const {
+    require_handed_out(env);
+    return slots_.at(env)->duel->decision_count();
+}
 
 std::string VectorEnv::last_start_failure() const {
     std::lock_guard lock(start_failure_mutex_);
@@ -162,9 +185,64 @@ EnvInfo VectorEnv::info(std::size_t env) const {
     return slot.info;
 }
 
-std::pair<std::size_t, std::size_t> VectorEnv::decks(std::size_t env) const { return slots_.at(env)->decks; }
+std::pair<std::size_t, std::size_t> VectorEnv::decks(std::size_t env) const {
+    require_handed_out(env);
+    return slots_.at(env)->decks;
+}
+
+void VectorEnv::check_action(std::size_t env, std::int64_t action) const {
+    const auto count = static_cast<std::int64_t>(slots_.at(env)->duel->request().candidates.size());
+    if (action < 0 || action >= count) {
+        throw std::out_of_range("action " + std::to_string(action) + " for env " + std::to_string(env) +
+                                " is not a candidate index below " + std::to_string(count));
+    }
+}
+
+Ready VectorEnv::play(std::size_t env, std::int64_t action) {
+    auto& slot = *slots_[env];
+    Ready result;
+    result.env = env;
+    try {
+        const auto& request = slot.duel->request();
+        const auto& key = request.candidates[static_cast<std::size_t>(action)].semantic_key;
+        {
+            std::lock_guard lock(slot.mutex);
+            slot.info.actions.push_back(key);
+            slot.info.busy = true;
+        }
+        struct NotBusy {
+            Slot& slot;
+            ~NotBusy() {
+                std::lock_guard lock(slot.mutex);
+                slot.info.busy = false;
+            }
+        } not_busy{slot};
+        slot.duel->act(key);
+        if (!slot.duel->finished()) {
+            slot.decision = encode(*slot.duel->observation(), slot.duel->request(), card_index_);
+            return result;
+        }
+        result.done = 1;
+        result.winner = slot.duel->result()->winner;
+    } catch (const std::exception& error) {
+        // DuelError (stuck, engine failure) or a decision the encoder cannot
+        // represent: this duel has no result, start another.
+        result.done = 1;
+        result.error = error.what();
+    }
+    ++duels_finished_;
+    duel_errors_ += result.error.empty() ? 0 : 1;
+    reset(slot);  // throws if no new duel can be started
+    return result;
+}
 
 StepResult VectorEnv::step(const std::vector<std::int64_t>& actions) {
+    {
+        std::lock_guard lock(async_mutex_);
+        if (!workers_.empty()) {
+            throw std::logic_error("VectorEnv::step cannot be mixed with recv/send");
+        }
+    }
     if (!broken_.empty()) {
         throw std::logic_error("VectorEnv is unusable after an earlier error: " + broken_);
     }
@@ -179,11 +257,7 @@ StepResult VectorEnv::step(const std::vector<std::int64_t>& actions) {
         throw std::invalid_argument("step needs one action per env");
     }
     for (std::size_t i = 0; i < actions.size(); ++i) {
-        const auto count = static_cast<std::int64_t>(slots_[i]->duel->request().candidates.size());
-        if (actions[i] < 0 || actions[i] >= count) {
-            throw std::out_of_range("action " + std::to_string(actions[i]) + " for env " + std::to_string(i) +
-                                    " is not a candidate index below " + std::to_string(count));
-        }
+        check_action(i, actions[i]);
     }
     StepResult result;
     result.done.assign(slots_.size(), 0);
@@ -191,37 +265,11 @@ StepResult VectorEnv::step(const std::vector<std::int64_t>& actions) {
     result.errors.assign(slots_.size(), "");
     std::vector<std::string> fatal(slots_.size());
     pool_.parallel_for(slots_.size(), [&](std::size_t i) {
-        auto& slot = *slots_[i];
         try {
-            try {
-                const auto& request = slot.duel->request();
-                const auto& key = request.candidates[static_cast<std::size_t>(actions[i])].semantic_key;
-                {
-                    std::lock_guard lock(slot.mutex);
-                    slot.info.actions.push_back(key);
-                    slot.info.busy = true;
-                }
-                struct NotBusy {
-                    Slot& slot;
-                    ~NotBusy() {
-                        std::lock_guard lock(slot.mutex);
-                        slot.info.busy = false;
-                    }
-                } not_busy{slot};
-                slot.duel->act(key);
-                if (!slot.duel->finished()) {
-                    slot.decision = encode(*slot.duel->observation(), slot.duel->request(), card_index_);
-                    return;
-                }
-                result.done[i] = 1;
-                result.winner[i] = slot.duel->result()->winner;
-            } catch (const std::exception& error) {
-                // DuelError (stuck, engine failure) or a decision the encoder cannot
-                // represent: this duel has no result, start another.
-                result.done[i] = 1;
-                result.errors[i] = error.what();
-            }
-            reset(slot);
+            auto ready = play(i, actions[i]);
+            result.done[i] = ready.done;
+            result.winner[i] = ready.winner;
+            result.errors[i] = std::move(ready.error);
         } catch (const std::exception& error) {
             fatal[i] = error.what();
         }
@@ -231,10 +279,100 @@ StepResult VectorEnv::step(const std::vector<std::int64_t>& actions) {
             broken_ = "env " + std::to_string(i) + " could not start a new duel: " + fatal[i];
             throw std::runtime_error(broken_);
         }
-        duels_finished_ += result.done[i];
-        duel_errors_ += result.errors[i].empty() ? 0 : 1;
     }
     return result;
+}
+
+void VectorEnv::start_workers() {
+    state_.assign(slots_.size(), EnvState::Queued);
+    for (std::size_t i = 0; i < slots_.size(); ++i) {
+        ready_.push_back(Ready{i, 0, 255, {}});
+    }
+    const auto threads = config_.threads != 0 ? config_.threads : std::max(1u, std::thread::hardware_concurrency());
+    for (std::size_t i = 0; i < threads; ++i) {
+        workers_.emplace_back([this] { work(); });
+    }
+}
+
+void VectorEnv::work() {
+    std::unique_lock lock(async_mutex_);
+    for (;;) {
+        jobs_ready_.wait(lock, [&] { return stop_workers_ || !jobs_.empty(); });
+        if (stop_workers_) {
+            return;
+        }
+        const auto [env, action] = jobs_.front();
+        jobs_.pop_front();
+        lock.unlock();
+        Ready ready;
+        std::string fatal;
+        try {
+            ready = play(env, action);
+        } catch (const std::exception& error) {
+            fatal = "env " + std::to_string(env) + " could not start a new duel: " + error.what();
+        } catch (...) {
+            fatal = "env " + std::to_string(env) + ": unknown error";
+        }
+        lock.lock();
+        --playing_;
+        if (!fatal.empty()) {
+            broken_ = fatal;
+        } else {
+            state_[env] = EnvState::Queued;
+            ready_.push_back(std::move(ready));
+        }
+        envs_ready_.notify_one();
+    }
+}
+
+std::vector<Ready> VectorEnv::recv(std::size_t min_count) {
+    if (stepping_) {
+        throw std::logic_error("VectorEnv::recv called while step is running");
+    }
+    std::unique_lock lock(async_mutex_);
+    if (workers_.empty()) {
+        start_workers();
+    }
+    // Never wait for more envs than can still arrive.
+    envs_ready_.wait(lock, [&] {
+        return !broken_.empty() || ready_.size() >= std::min(min_count, ready_.size() + playing_);
+    });
+    if (!broken_.empty()) {
+        throw std::runtime_error(broken_);
+    }
+    std::vector<Ready> out(std::make_move_iterator(ready_.begin()), std::make_move_iterator(ready_.end()));
+    ready_.clear();
+    for (const auto& ready : out) {
+        state_[ready.env] = EnvState::HandedOut;
+    }
+    return out;
+}
+
+void VectorEnv::send(const std::vector<std::size_t>& envs, const std::vector<std::int64_t>& actions) {
+    if (envs.size() != actions.size()) {
+        throw std::invalid_argument("send needs one action per env");
+    }
+    std::lock_guard lock(async_mutex_);
+    if (!broken_.empty()) {
+        throw std::runtime_error(broken_);
+    }
+    std::vector<bool> seen(slots_.size());
+    for (std::size_t i = 0; i < envs.size(); ++i) {
+        if (envs[i] >= slots_.size() || state_.empty() || state_[envs[i]] != EnvState::HandedOut) {
+            throw std::logic_error("send for env " + std::to_string(envs[i]) + ", which recv did not hand out");
+        }
+        if (seen[envs[i]]) {
+            throw std::logic_error("send got env " + std::to_string(envs[i]) + " twice");
+        }
+        seen[envs[i]] = true;
+        check_action(envs[i], actions[i]);
+    }
+    for (std::size_t i = 0; i < envs.size(); ++i) {
+        state_[envs[i]] = EnvState::Playing;
+        jobs_.emplace_back(envs[i], actions[i]);
+        ++playing_;
+    }
+    jobs_ready_.notify_all();
 }
 
 }  // namespace ygo::encode

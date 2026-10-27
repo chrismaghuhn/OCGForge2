@@ -3,6 +3,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -62,6 +63,15 @@ struct EnvInfo {
     std::vector<std::string> actions;  // semantic keys played in this duel, the last one possibly still running
 };
 
+// An env whose decision is pending, from VectorEnv::recv: done/winner/error describe the
+// move that got it there (when done, the env already holds a new duel).
+struct Ready {
+    std::size_t env = 0;
+    std::uint8_t done = 0;
+    std::uint8_t winner = 255;
+    std::string error;
+};
+
 struct StepResult {
     std::vector<std::uint8_t> done;    // the duel of this env ended with this step
     std::vector<std::uint8_t> winner;  // when done: 0 or 1, 2 = draw, 255 = error (see errors)
@@ -70,8 +80,17 @@ struct StepResult {
 
 // num_envs duels that always have a pending decision: a finished duel is
 // replaced by a fresh one (new seed, new deck pair, random starting player).
-// Not thread-safe: one caller at a time (step throws if called concurrently).
-// If a new duel cannot be started at all, step throws and the env is unusable.
+//
+// Two ways to drive it (pick one per env):
+// - step: every env moves, in lockstep; deterministic, but each step waits for the
+//   slowest duel.
+// - recv/send: recv hands out envs whose decision is ready, send gives their moves
+//   to worker threads and returns at once; the next recv returns whichever envs are
+//   done first. Nothing waits for stragglers, and the caller (e.g. the GPU) works
+//   while the engine does. Per-env play is still deterministic; batch composition
+//   is not.
+// Not thread-safe: one caller at a time. If a new duel cannot be started at all,
+// the env throws and is unusable.
 class VectorEnv final {
 public:
     VectorEnv(VectorEnvConfig config, CardIndex card_index);
@@ -89,6 +108,12 @@ public:
     // actions[env] is the index of the chosen candidate in decision(env).
     StepResult step(const std::vector<std::int64_t>& actions);
 
+    // Waits until at least min_count envs (or all that can still become ready) have a
+    // pending decision, and hands them out. decision(env) is valid for them until send.
+    std::vector<Ready> recv(std::size_t min_count);
+    // Plays actions[i] in envs[i]; each env must have been handed out by recv.
+    void send(const std::vector<std::size_t>& envs, const std::vector<std::int64_t>& actions);
+
     std::uint64_t duels_finished() const noexcept { return duels_finished_; }
     std::uint64_t duel_errors() const noexcept { return duel_errors_; }
     // Duels that failed to start (and were replaced by another seed/deck pair), and the
@@ -99,13 +124,33 @@ public:
 private:
     struct Slot;
     void reset(Slot& slot);
+    // Plays one move in one env (restarting it when the duel ends). Throws only when a new
+    // duel cannot be started.
+    Ready play(std::size_t env, std::int64_t action);
+    void check_action(std::size_t env, std::int64_t action) const;
+    // In recv/send mode an env may only be read while recv has handed it out.
+    void require_handed_out(std::size_t env) const;
+    void start_workers();
+    void work();
 
     VectorEnvConfig config_;
     CardIndex card_index_;
     std::vector<std::unique_ptr<Slot>> slots_;
     ThreadPool pool_;
-    std::uint64_t duels_finished_ = 0;
-    std::uint64_t duel_errors_ = 0;
+    std::atomic<std::uint64_t> duels_finished_ = 0;
+    std::atomic<std::uint64_t> duel_errors_ = 0;
+
+    // recv/send mode
+    enum class EnvState : std::uint8_t { Queued, HandedOut, Playing };
+    std::vector<std::thread> workers_;
+    mutable std::mutex async_mutex_;
+    std::condition_variable jobs_ready_;
+    std::condition_variable envs_ready_;
+    std::deque<std::pair<std::size_t, std::int64_t>> jobs_;
+    std::deque<Ready> ready_;
+    std::vector<EnvState> state_;
+    std::size_t playing_ = 0;  // envs queued or being played by workers
+    bool stop_workers_ = false;
     std::string broken_;
     std::atomic<std::uint64_t> start_failures_ = 0;
     mutable std::mutex start_failure_mutex_;

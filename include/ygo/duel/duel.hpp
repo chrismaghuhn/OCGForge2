@@ -30,6 +30,9 @@ struct DuelConfig {
     std::uint64_t seed = 0;
     std::uint8_t starting_player = 0;
     bool build_observations = true;
+    // Model-input observations query only the card properties the encoder uses and carry only
+    // the recent events; full ones have every card property and the whole event history.
+    bool full_observations = false;
 
     // Loop protection: a duel that needs more decisions than this, or that
     // reaches the exact same engine question in the exact same field state
