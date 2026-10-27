@@ -16,6 +16,8 @@ namespace ygo::duel {
 namespace {
 
 constexpr std::size_t kRecentDecisions = 20;
+// Public events copied into each observation (at least; always back to the turn start).
+constexpr std::size_t kEventTail = 512;
 // Engine messages between two decisions (draws, phase changes, chain
 // resolution, ...). Far above anything a real duel needs.
 constexpr std::uint64_t kMaxStepsWithoutDecision = 100000;
@@ -156,11 +158,21 @@ void Duel::publish(protocol::DecisionRequest request) {
     observation::ObservationBuildConfig build;
     build.decision_index = decision_count_;
     build.engine_step_index = request_->engine_step_index;
-    build.visible_events = sessions_[request_->player]->visible_events();
+    // Recent events only, unless full observations are asked for: the encoder remembers 64 and
+    // "revealed this turn" looks back to the turn start, so keep the whole current turn and at
+    // least kEventTail events. The turn/phase state of the whole stream comes from the session.
+    const auto& session = *sessions_[request_->player];
+    const auto& events = session.visible_events();
+    auto first = config_.full_observations || events.size() <= kEventTail ? 0 : events.size() - kEventTail;
+    first = std::min(first, session.turn_start());
+    build.visible_events.assign(events.begin() + static_cast<std::ptrdiff_t>(first), events.end());
+    build.event_summary = session.summary();
+    build.detail = config_.full_observations ? observation::ObservationDetail::Full
+                                             : observation::ObservationDetail::ModelInput;
     build.knowledge.own_decklist_known = true;
     build.own_deck.known = true;
     build.own_deck.main_deck = request_->player == 0 ? config_.deck0.main_deck : config_.deck1.main_deck;
-    observation_ = observation::build_player_observation(*host_, request_->player, build);
+    observation_ = observation::build_player_observation(*host_, request_->player, std::move(build));
     observation::attach_decision_context(*observation_, *request_);
 
     // Every card a candidate refers to must be visible to the deciding player.

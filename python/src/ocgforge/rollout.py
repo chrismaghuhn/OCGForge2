@@ -1,7 +1,9 @@
 """Playing duels in the C++ VectorEnv: self-play rollouts for PPO and matches between two policies.
 
 A policy maps a list of pending decisions (features.py dicts) to (choices, logprobs, values), one
-entry per decision. Every env always has a pending decision; finished duels restart by themselves.
+entry per decision; policies with an `on_batch` method also take a padded VectorEnv.recv_batch
+batch directly, which saves building per-decision dicts. Every env always has a pending decision;
+finished duels restart by themselves.
 """
 
 from __future__ import annotations
@@ -37,7 +39,12 @@ class RandomPolicy:
         self.rng = np.random.default_rng(seed)
 
     def __call__(self, decisions: Sequence[dict]) -> tuple[list[int], list[float], list[float]]:
-        counts = [len(d["candidate_kind"]) for d in decisions]
+        return self._choose([len(d["candidate_kind"]) for d in decisions])
+
+    def on_batch(self, batch: dict) -> tuple[list[int], list[float], list[float]]:
+        return self._choose([int(c) for c in batch["candidate_count"]])
+
+    def _choose(self, counts: list[int]) -> tuple[list[int], list[float], list[float]]:
         return [int(self.rng.integers(c)) for c in counts], [-float(np.log(c)) for c in counts], [0.0] * len(counts)
 
 
@@ -48,10 +55,16 @@ class ModelPolicy:
         self.model, self.device, self.sample = model, device, sample
         self.generator = torch.Generator().manual_seed(seed)
 
-    @torch.no_grad()
     def __call__(self, decisions: Sequence[dict]) -> tuple[list[int], list[float], list[float]]:
+        return self._choose(features.collate(decisions, self.device))
+
+    def on_batch(self, batch: dict) -> tuple[list[int], list[float], list[float]]:
+        return self._choose(features.from_padded(batch, self.device))
+
+    @torch.no_grad()
+    def _choose(self, inputs: dict) -> tuple[list[int], list[float], list[float]]:
         self.model.eval()
-        scores, values = self.model(features.collate(decisions, self.device))
+        scores, values = self.model(inputs)
         logprobs = torch.log_softmax(scores.float(), dim=-1).cpu()
         if self.sample:
             choices = torch.multinomial(logprobs.exp(), 1, generator=self.generator).squeeze(1)
@@ -114,6 +127,50 @@ def collect(env, policy: Policy, duels: int) -> tuple[list[tuple[list[dict], flo
             for player, seat in enumerate(seats):
                 if seat:
                     trajectories.append((seat, _result_for(player, winners[i])))
+    return trajectories, stats
+
+
+def collect_async(env, policy: Policy, duels: int, batch_size: int) -> tuple[list[tuple[list[dict], float]], RolloutStats]:
+    """Like collect, but with env.recv/send: the policy gets whichever `batch_size` envs are ready
+    first, so neither the engine nor the policy waits for the slowest duel. Use an env that is
+    driven only this way (not with step)."""
+    pending: dict[tuple[int, int], list[dict]] = {}
+    trajectories: list[tuple[list[dict], float]] = []
+    stats = RolloutStats()
+    fresh: dict[int, bool] = {}  # we saw env i's current duel from its first decision
+    while stats.duels + stats.errors < duels:
+        ids, batch, done, winners, errors = env.recv_batch(batch_size)
+        ids = ids.tolist()
+        for i, finished, winner, error in zip(ids, done.tolist(), winners.tolist(), errors):
+            if not finished:
+                continue
+            seats = [pending.pop((i, p), []) for p in (0, 1)]
+            was_fresh, fresh[i] = fresh.get(i, False), True
+            if not was_fresh:
+                continue
+            if error:
+                stats.errors += 1
+                stats.error_messages.append(error)
+                continue
+            stats.duels += 1
+            stats.wins[min(winner, 2)] += 1
+            for player, seat in enumerate(seats):
+                if seat:
+                    trajectories.append((seat, _result_for(player, winner)))
+        for i, first in zip(ids, (batch["duel_decision"] == 0).tolist()):
+            fresh.setdefault(i, first)
+        if not ids:  # every env is still handed out, e.g. by an earlier interrupted call
+            raise RuntimeError("recv_batch returned no envs: some envs were never sent an action")
+        if hasattr(policy, "on_batch"):
+            choices, logprobs, values = policy.on_batch(batch)
+        else:
+            choices, logprobs, values = policy([features.row(batch, n) for n in range(len(ids))])
+        for n, (i, choice, logprob, value) in enumerate(zip(ids, choices, logprobs, values)):
+            decision = features.row(batch, n, copy=True)  # compact: a view would keep the whole batch alive
+            decision.update(chosen=choice, logprob=logprob, value=value)
+            pending.setdefault((i, decision["player"]), []).append(decision)
+        env.send(ids, choices)
+        stats.decisions += len(ids)
     return trajectories, stats
 
 

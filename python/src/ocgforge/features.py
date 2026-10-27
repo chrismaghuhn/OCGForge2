@@ -160,6 +160,35 @@ def collate(samples: Sequence[dict], device: torch.device | str = "cpu") -> dict
     return {k: v.to(device, non_blocking=True) for k, v in out.items()}
 
 
+def from_padded(batch: dict, device: torch.device | str = "cpu") -> dict[str, torch.Tensor]:
+    """A VectorEnv.recv_batch batch (numpy arrays, already padded) as model input tensors: the same
+    tensors collate builds from the individual decisions."""
+    out = {name: torch.from_numpy(np.asarray(batch[name])) for name in
+           _TOKEN_FIELDS + _CANDIDATE_FIELDS + _EVENT_FIELDS + ("global_numeric", "phase", "decision")}
+    t, c, e = out["token_card"].shape[1], out["candidate_kind"].shape[1], out["event_kind"].shape[1]
+    tokens = torch.from_numpy(np.asarray(batch["token_count"]))
+    out["token_pad"] = torch.arange(t).unsqueeze(0) >= tokens.unsqueeze(1)
+    out["token_pad"][:, 0] &= tokens > 0
+    out["candidate_pad"] = torch.arange(c).unsqueeze(0) >= torch.from_numpy(np.asarray(batch["candidate_count"])).unsqueeze(1)
+    out["event_pad"] = torch.arange(e).unsqueeze(0) >= torch.from_numpy(np.asarray(batch["event_count"])).unsqueeze(1)
+    return {k: v.to(device, non_blocking=True) for k, v in out.items()}
+
+
+def row(batch: dict, i: int, copy: bool = False) -> dict:
+    """Decision i of a recv_batch batch in the per-decision layout. Without `copy` the arrays are
+    views into the batch, which keep the whole batch alive: copy anything you keep around. Copies
+    store indices as int32 (collate widens them again)."""
+    t, c, e = (int(batch[k][i]) for k in ("token_count", "candidate_count", "event_count"))
+    take = (lambda a: a.astype(np.int32) if a.dtype == np.int64 else a.copy()) if copy else (lambda a: a)
+    out = {name: take(batch[name][i, :t]) for name in _TOKEN_FIELDS}
+    out.update({name: take(batch[name][i, :c]) for name in _CANDIDATE_FIELDS})
+    out.update({name: take(batch[name][i, :e]) for name in _EVENT_FIELDS})
+    out["global_numeric"] = take(batch["global_numeric"][i])
+    for name in ("phase", "decision", "player", "duel_decision"):
+        out[name] = int(batch[name][i])
+    return out
+
+
 def check(sample: dict, where: str = "decision") -> None:
     """Reject inputs the model would silently mis-read: no candidates (all scores -inf, NaN loss),
     candidate source/target and event token indices outside the decision's own tokens (these would

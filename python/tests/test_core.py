@@ -118,3 +118,41 @@ def test_match_counts_both_seats(card_features):
     assert len(results) >= 6
     assert all(r["a"] == "r1" and r["winner"] in ("a", "b", "draw") for r in results)
     assert {r["deck_a"] for r in results} <= {"swordsoul", "salamangreat"}
+
+
+def test_padded_batches_match_collated_decisions(card_features):
+    """recv_batch pads in C++; it must give exactly what collate gives for the same decisions."""
+    a = rollout.vector_env(card_features, DECKS, num_envs=12, seed=21, threads=1)
+    b = rollout.vector_env(card_features, DECKS, num_envs=12, seed=21, threads=1)
+    rng = np.random.default_rng(0)
+    for _ in range(40):
+        ids_a, decisions, *_ = a.recv(12)
+        ids_b, batch, *_ = b.recv_batch(12)
+        assert list(ids_a) == list(ids_b)
+        collated = features.collate(decisions)
+        padded = features.from_padded(batch)
+        assert collated.keys() - {"chosen"} == padded.keys()
+        for key, value in padded.items():
+            assert torch.equal(collated[key], value), key
+        for i, decision in enumerate(decisions):
+            view = features.row(batch, i)
+            for key, value in decision.items():
+                assert np.array_equal(np.asarray(view[key]), np.asarray(value)), key
+        actions = [int(rng.integers(len(d["candidate_kind"]))) for d in decisions]
+        a.send(ids_a, actions)
+        b.send(list(ids_b), actions)
+
+
+def test_async_self_play_rollout_feeds_a_ppo_update(card_features):
+    torch.manual_seed(0)
+    model = Model(card_features, ModelConfig(d_model=32, heads=2, layers=1, ff=64, dropout=0.0))
+    env = rollout.vector_env(card_features, DECKS, num_envs=8, seed=6)
+    trajectories, stats = rollout.collect_async(env, rollout.ModelPolicy(model), duels=4, batch_size=4)
+    # Which duel an env plays next depends on thread timing here, so now and then one is stopped by
+    # the loop protection or the Lua budget; only that kind of error is fine.
+    assert stats.duels >= 1 and stats.duels + stats.errors >= 4
+    assert all("stuck" in m or "budget" in m for m in stats.error_messages), stats.error_messages
+    assert {result for _, result in trajectories} <= {-1.0, 0.0, 1.0}
+    steps = build_steps(trajectories, gamma=1.0, lam=0.95)
+    history = ppo_update(model, torch.optim.AdamW(model.parameters(), lr=1e-4), steps, PPOConfig(epochs=1, batch_size=256))
+    assert history and np.isfinite(history[0]["loss"])

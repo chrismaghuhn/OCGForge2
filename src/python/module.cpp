@@ -8,7 +8,9 @@
 #include <nanobind/stl/unordered_map.h>
 #include <nanobind/stl/vector.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <type_traits>
 #include <string>
 #include <vector>
 
@@ -27,6 +29,69 @@ nb::object to_numpy(const std::vector<T>& values, std::initializer_list<std::siz
     auto* data = new std::vector<T>(values);
     nb::capsule owner(data, [](void* pointer) noexcept { delete static_cast<std::vector<T>*>(pointer); });
     return nb::cast(nb::ndarray<nb::numpy, T>(data->data(), shape.size(), shape.begin(), owner));
+}
+
+// A batch of decisions padded to common widths, in the layout features.collate produces
+// (pad values: token_side/event_side 2, indices -1, else 0), plus per-row counts.
+nb::dict to_padded(const std::vector<const EncodedDecision*>& rows) {
+    namespace E = ygo::encode;
+    const auto b = rows.size();
+    std::size_t t = 1, c = 0, e = 0;
+    for (const auto* d : rows) {
+        t = std::max(t, d->token_card.size());
+        c = std::max(c, d->candidate_kind.size());
+        e = std::max(e, d->event_kind.size());
+    }
+    const auto tn = E::token_numeric_names().size();
+    const auto cn = E::candidate_numeric_names().size();
+    const auto en = E::event_numeric_names().size();
+    const auto gn = E::global_numeric_names().size();
+    // Copies row r's `values` (width w per item) into a [b, rows_max, w] buffer.
+    auto pack = [&](auto member, std::size_t rows_max, std::size_t w, auto pad) {
+        using T = typename std::decay_t<decltype(rows[0]->*member)>::value_type;
+        std::vector<T> out(b * rows_max * w, static_cast<T>(pad));
+        for (std::size_t r = 0; r < b; ++r) {
+            const auto& values = rows[r]->*member;
+            std::copy(values.begin(), values.end(), out.begin() + static_cast<std::ptrdiff_t>(r * rows_max * w));
+        }
+        return out;
+    };
+    nb::dict out;
+    out["token_card"] = to_numpy(pack(&EncodedDecision::token_card, t, 1, 0), {b, t});
+    out["token_zone"] = to_numpy(pack(&EncodedDecision::token_zone, t, 1, 0), {b, t});
+    out["token_side"] = to_numpy(pack(&EncodedDecision::token_side, t, 1, 2), {b, t});
+    out["token_numeric"] = to_numpy(pack(&EncodedDecision::token_numeric, t, tn, 0.0f), {b, t, tn});
+    out["candidate_kind"] = to_numpy(pack(&EncodedDecision::candidate_kind, c, 1, 0), {b, c});
+    out["candidate_source"] = to_numpy(pack(&EncodedDecision::candidate_source, c, 1, -1), {b, c});
+    out["candidate_card"] = to_numpy(pack(&EncodedDecision::candidate_card, c, 1, 0), {b, c});
+    out["candidate_zone"] = to_numpy(pack(&EncodedDecision::candidate_zone, c, 1, 0), {b, c});
+    out["candidate_targets"] = to_numpy(pack(&EncodedDecision::candidate_targets, c, E::kMaxTargets, -1),
+                                        {b, c, E::kMaxTargets});
+    out["candidate_numeric"] = to_numpy(pack(&EncodedDecision::candidate_numeric, c, cn, 0.0f), {b, c, cn});
+    out["event_kind"] = to_numpy(pack(&EncodedDecision::event_kind, e, 1, 0), {b, e});
+    out["event_card"] = to_numpy(pack(&EncodedDecision::event_card, e, 1, 0), {b, e});
+    out["event_side"] = to_numpy(pack(&EncodedDecision::event_side, e, 1, 2), {b, e});
+    out["event_from"] = to_numpy(pack(&EncodedDecision::event_from, e, 1, 0), {b, e});
+    out["event_to"] = to_numpy(pack(&EncodedDecision::event_to, e, 1, 0), {b, e});
+    out["event_token"] = to_numpy(pack(&EncodedDecision::event_token, e, 1, -1), {b, e});
+    out["event_numeric"] = to_numpy(pack(&EncodedDecision::event_numeric, e, en, 0.0f), {b, e, en});
+    out["global_numeric"] = to_numpy(pack(&EncodedDecision::global_numeric, 1, gn, 0.0f), {b, gn});
+    std::vector<std::int64_t> phase(b), decision(b), player(b), tokens(b), candidates(b), events(b);
+    for (std::size_t r = 0; r < b; ++r) {
+        phase[r] = rows[r]->phase;
+        decision[r] = rows[r]->decision;
+        player[r] = rows[r]->player;
+        tokens[r] = static_cast<std::int64_t>(rows[r]->token_card.size());
+        candidates[r] = static_cast<std::int64_t>(rows[r]->candidate_kind.size());
+        events[r] = static_cast<std::int64_t>(rows[r]->event_kind.size());
+    }
+    out["phase"] = to_numpy(phase, {b});
+    out["decision"] = to_numpy(decision, {b});
+    out["player"] = to_numpy(player, {b});
+    out["token_count"] = to_numpy(tokens, {b});
+    out["candidate_count"] = to_numpy(candidates, {b});
+    out["event_count"] = to_numpy(events, {b});
+    return out;
 }
 
 nb::dict to_dict(const EncodedDecision& d) {
@@ -109,6 +174,58 @@ NB_MODULE(_core, m) {
              "actions"_a,
              "Play candidate actions[i] in env i. Returns (done, winner, errors) per env; winner 2 = draw, "
              "255 = the duel failed (errors[i] says why).")
+        .def("recv",
+             [](VectorEnv& env, std::size_t min_count) {
+                 std::vector<ygo::encode::Ready> ready;
+                 {
+                     nb::gil_scoped_release release;
+                     ready = env.recv(min_count);
+                 }
+                 nb::list ids, decisions, done, winner, errors;
+                 for (const auto& r : ready) {
+                     auto decision = to_dict(env.decision(r.env));
+                     decision["duel_decision"] = env.duel_decision(r.env);
+                     ids.append(r.env);
+                     decisions.append(decision);
+                     done.append(r.done != 0);
+                     winner.append(r.winner);
+                     errors.append(r.error);
+                 }
+                 return nb::make_tuple(ids, decisions, done, winner, errors);
+             },
+             "min_count"_a,
+             "Wait until at least min_count envs (or all that still can) have a pending decision and hand them "
+             "out: (envs, decisions, done, winner, errors). done/winner/errors describe the move that led there; "
+             "a done env already holds a new duel. Do not mix with step.")
+        .def("recv_batch",
+             [](VectorEnv& env, std::size_t min_count) {
+                 std::vector<ygo::encode::Ready> ready;
+                 {
+                     nb::gil_scoped_release release;
+                     ready = env.recv(min_count);
+                 }
+                 std::vector<const EncodedDecision*> rows;
+                 std::vector<std::int64_t> ids, duel_decision;
+                 std::vector<std::uint8_t> done, winner;
+                 nb::list errors;
+                 for (const auto& r : ready) {
+                     rows.push_back(&env.decision(r.env));
+                     ids.push_back(static_cast<std::int64_t>(r.env));
+                     duel_decision.push_back(static_cast<std::int64_t>(env.duel_decision(r.env)));
+                     done.push_back(r.done);
+                     winner.push_back(r.winner);
+                     errors.append(r.error);
+                 }
+                 auto batch = to_padded(rows);
+                 batch["duel_decision"] = to_numpy(duel_decision, {rows.size()});
+                 return nb::make_tuple(to_numpy(ids, {rows.size()}), batch, to_numpy(done, {rows.size()}),
+                                       to_numpy(winner, {rows.size()}), errors);
+             },
+             "min_count"_a,
+             "Like recv, but the decisions come as one padded batch of numpy arrays (features.collate layout "
+             "plus player, duel_decision and *_count per row): (envs, batch, done, winner, errors).")
+        .def("send", &VectorEnv::send, "envs"_a, "actions"_a,
+             "Play actions[i] in envs[i] on the worker threads; returns at once.")
         .def("decks", &VectorEnv::decks, "env"_a, "Deck indices of player 0 and 1 in the env's current duel.")
         .def("info",
              [](const VectorEnv& env, std::size_t i) {

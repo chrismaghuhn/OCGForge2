@@ -351,3 +351,31 @@ TEST_CASE("events never name a card the opponent set face-down") {
     }
     CHECK(opponent_sets > 0);
 }
+
+// Model-input observations query only some card properties; the encoded input must be
+// exactly what a full observation gives.
+TEST_CASE("model-input observations encode exactly like full ones") {
+    const auto index = all_cards_index();
+    for (std::uint64_t seed = 1; seed <= 3; ++seed) {
+        auto lean_config = test::duel_config(seed);
+        auto full_config = lean_config;
+        full_config.full_observations = true;
+        ygo::duel::Duel lean(lean_config), full(full_config);
+        std::mt19937_64 rng(seed);
+        std::size_t decisions = 0;
+        while (!lean.finished()) {
+            REQUIRE_FALSE(full.finished());
+            const auto a = encode(*lean.observation(), lean.request(), index);
+            const auto b = encode(*full.observation(), full.request(), index);
+            CAPTURE(seed, decisions);
+            REQUIRE(a == b);
+            const auto& candidates = lean.request().candidates;
+            const auto key = candidates[rng() % candidates.size()].semantic_key;
+            lean.act(key);
+            full.act(key);
+            ++decisions;
+        }
+        REQUIRE(full.finished());
+        CHECK(decisions > 100);
+    }
+}

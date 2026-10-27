@@ -27,13 +27,7 @@ struct RawCounter {
     std::uint32_t count = 0;
 };
 
-struct RawQueryRecord {
-    std::uint32_t flag = 0;
-    std::vector<std::uint8_t> payload;
-};
-
 struct RawCardQuery {
-    std::vector<RawQueryRecord> records;
     std::optional<std::uint32_t> code;
     std::optional<std::uint32_t> position;
     std::optional<std::uint32_t> alias;

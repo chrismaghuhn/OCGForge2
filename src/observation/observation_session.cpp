@@ -1,5 +1,8 @@
 #include "ygo/observation/observation_session.hpp"
 
+#include <iterator>
+#include <stdexcept>
+
 #include "event_projection.hpp"
 
 namespace ygo::observation {
@@ -17,13 +20,45 @@ void ObservationSession::ingest(const std::vector<std::uint8_t>& framed_messages
                                                      engine_step_index, duel_flags_, next_event_index_);
     if (!projected.empty()) {
         next_event_index_ = projected.back().event_index + 1;
-        events_.insert(events_.end(), projected.begin(), projected.end());
+        for (std::size_t i = 0; i < projected.size(); ++i) {
+            summary_.add(projected[i]);
+            if (projected[i].kind == VisibleEventKind::TurnStarted) {
+                turn_start_ = events_.size() + i;
+            }
+        }
+        events_.insert(events_.end(), std::make_move_iterator(projected.begin()),
+                       std::make_move_iterator(projected.end()));
     }
 }
 
 void ObservationSession::clear() {
     events_.clear();
+    summary_ = {};
+    turn_start_ = 0;
     next_event_index_ = 0;
+}
+
+void EventSummary::add(const VisibleGameEvent& event) {
+    switch (event.kind) {
+    case VisibleEventKind::TurnStarted:
+        ++turns;
+        if (event.player) {
+            turn_player = event.player;
+        }
+        break;
+    case VisibleEventKind::PhaseChanged:
+        if (event.phase) {
+            phase = event.phase;
+        }
+        break;
+    case VisibleEventKind::Win:
+        terminal = true;
+        winner = event.winner;
+        win_reason = event.win_reason;
+        break;
+    default:
+        break;
+    }
 }
 
 }  // namespace ygo::observation

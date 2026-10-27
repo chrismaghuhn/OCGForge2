@@ -102,9 +102,14 @@ class Model(nn.Module):
         self.value = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, 1), nn.Tanh())
 
     def card_static(self, cards_: torch.Tensor) -> torch.Tensor:
-        """[...] card indices -> [..., d]: what the card is, from its database facts and text."""
+        """[...] card indices -> [..., d]: what the card is, from its database facts and text.
+        Computed once per distinct card in the batch (the text bag alone reads up to MAX_TEXT
+        terms per card), then spread back to every position."""
         shape = cards_.shape
-        flat = cards_.reshape(-1)
+        distinct, inverse = torch.unique(cards_.reshape(-1), return_inverse=True)
+        return self._card_static_rows(distinct)[inverse].reshape(*shape, self.config.d_model)
+
+    def _card_static_rows(self, flat: torch.Tensor) -> torch.Tensor:
         x = (
             self.types(self.card_types[flat])
             + self.attribute(self.card_attribute[flat])
@@ -115,7 +120,7 @@ class Model(nn.Module):
         )
         if self.config.text_embedding_dim > 0:
             x = x + self.text_embedding(self.card_textemb[flat])
-        return x.reshape(*shape, self.config.d_model)  # explicit width: shape may contain a 0
+        return x
 
     def card_embedding(self, cards_: torch.Tensor) -> torch.Tensor:
         """card_static plus a learned per-card embedding, which is "unknown" for cards never seen in
@@ -169,25 +174,33 @@ class Model(nn.Module):
         t = tokens.shape[1]
         context, card_tokens = encoded[:, 0], encoded[:, 1:1 + t]
 
-        def gather(indices: torch.Tensor) -> torch.Tensor:
-            safe = indices.clamp(min=0)
-            picked = torch.gather(card_tokens, 1, safe.unsqueeze(-1).expand(-1, -1, card_tokens.size(-1)))
-            return picked * (indices >= 0).unsqueeze(-1)
+        # Candidates are scored packed (only real ones, all decisions back to back): padding
+        # every decision to the batch's largest candidate list would blow up memory when one
+        # decision has thousands of candidates.
+        row, col = (~batch["candidate_pad"]).nonzero(as_tuple=True)
+        width = card_tokens.size(-1)
 
-        c = batch["candidate_kind"].shape[1]
-        has_source = (batch["candidate_source"] >= 0).unsqueeze(-1)
-        source = torch.where(has_source, gather(batch["candidate_source"]), self.no_source)
-        targets = gather(batch["candidate_targets"].reshape(b, c * features.MAX_TARGETS))
-        targets = targets.reshape(b, c, features.MAX_TARGETS, -1).sum(2)
-        targets = targets / (batch["candidate_targets"] >= 0).sum(-1, keepdim=True).clamp(min=1)
+        def card_token(indices: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+            """card_tokens[rows, indices] with zeros where indices is -1."""
+            if card_tokens.size(1) == 0:
+                return torch.zeros(*indices.shape, width, device=card_tokens.device, dtype=card_tokens.dtype)
+            return card_tokens[rows, indices.clamp(min=0)] * (indices >= 0).unsqueeze(-1)
+
+        source_index = batch["candidate_source"][row, col]
+        source = torch.where((source_index >= 0).unsqueeze(-1), card_token(source_index, row), self.no_source)
+        target_index = batch["candidate_targets"][row, col]  # [n, MAX_TARGETS]
+        targets = card_token(target_index, row.unsqueeze(1).expand_as(target_index)).sum(1)
+        targets = targets / (target_index >= 0).sum(-1, keepdim=True).clamp(min=1)
         # Without a source token the candidate's own card (if any) stands in for it.
-        own_card = torch.where((batch["candidate_card"] > 0).unsqueeze(-1), self.card_embedding(batch["candidate_card"]),
-                               torch.zeros_like(source))
-        candidate = (self.kind(batch["candidate_kind"]) + source + own_card + self.zone(batch["candidate_zone"])
-                     + targets + self.candidate_numeric(batch["candidate_numeric"]))
-        ctx = context.unsqueeze(1).expand_as(candidate)
-        scores = self.score(torch.cat([candidate, ctx, candidate * ctx], dim=-1)).squeeze(-1)
-        scores = scores.masked_fill(batch["candidate_pad"], float("-inf"))
+        own = batch["candidate_card"][row, col]
+        own_card = torch.where((own > 0).unsqueeze(-1), self.card_embedding(own), torch.zeros_like(source))
+        candidate = (self.kind(batch["candidate_kind"][row, col]) + source + own_card
+                     + self.zone(batch["candidate_zone"][row, col]) + targets
+                     + self.candidate_numeric(batch["candidate_numeric"][row, col]))
+        ctx = context[row]
+        packed = self.score(torch.cat([candidate, ctx, candidate * ctx], dim=-1)).squeeze(-1)
+        scores = torch.full(batch["candidate_kind"].shape, float("-inf"), device=packed.device, dtype=packed.dtype)
+        scores[row, col] = packed
         return scores, self.value(context).squeeze(-1)
 
 

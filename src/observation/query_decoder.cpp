@@ -13,9 +13,11 @@ namespace {
 
 class Cursor final {
 public:
-    explicit Cursor(const std::vector<std::uint8_t>& bytes) : bytes_(bytes) {}
+    // A view of the bytes; nothing is copied.
+    explicit Cursor(const std::vector<std::uint8_t>& bytes) : bytes_(bytes.data()), size_(bytes.size()) {}
+    Cursor(const std::uint8_t* bytes, std::size_t size) : bytes_(bytes), size_(size) {}
 
-    std::size_t remaining() const noexcept { return bytes_.size() - offset_; }
+    std::size_t remaining() const noexcept { return size_ - offset_; }
     bool empty() const noexcept { return remaining() == 0; }
 
     std::uint16_t peek_u16() const {
@@ -58,10 +60,10 @@ public:
         return value;
     }
 
-    std::vector<std::uint8_t> bytes(std::size_t count) {
+    // The next `count` bytes as their own cursor (a view), skipping them here.
+    Cursor take(std::size_t count) {
         require(count);
-        std::vector<std::uint8_t> result(bytes_.begin() + static_cast<std::ptrdiff_t>(offset_),
-                                         bytes_.begin() + static_cast<std::ptrdiff_t>(offset_ + count));
+        Cursor result(bytes_ + offset_, count);
         offset_ += count;
         return result;
     }
@@ -73,7 +75,8 @@ private:
         }
     }
 
-    const std::vector<std::uint8_t>& bytes_;
+    const std::uint8_t* bytes_;
+    std::size_t size_;
     std::size_t offset_ = 0;
 };
 
@@ -133,9 +136,7 @@ bool is_scalar_u32(std::uint32_t flag) {
     }
 }
 
-void decode_record_payload(std::uint32_t flag, const std::vector<std::uint8_t>& payload,
-                           RawCardQuery& result) {
-    Cursor cursor(payload);
+void decode_record_payload(std::uint32_t flag, Cursor cursor, RawCardQuery& result) {
     if (is_scalar_u32(flag)) {
         require_exact(cursor, 4, "scalar query");
         const auto value = cursor.u32();
@@ -237,7 +238,8 @@ void decode_record_payload(std::uint32_t flag, const std::vector<std::uint8_t>& 
 
 RawCardQuery decode_card_query_from_cursor(Cursor& cursor) {
     RawCardQuery result;
-    std::set<std::uint32_t> seen_flags;
+    std::uint64_t seen_bits = 0;  // query flags are single bits
+    std::size_t records = 0;
     bool ended = false;
     while (!cursor.empty()) {
         const auto record_length = cursor.u16();
@@ -245,11 +247,15 @@ RawCardQuery decode_card_query_from_cursor(Cursor& cursor) {
             throw QueryDecodeError("invalid pinned card query record length");
         }
         const auto flag = cursor.u32();
-        const auto payload = cursor.bytes(record_length - sizeof(std::uint32_t));
-        if (!seen_flags.insert(flag).second) {
+        auto payload = cursor.take(record_length - sizeof(std::uint32_t));
+        if (flag == 0 || (flag & (flag - 1)) != 0) {
+            throw QueryDecodeError("pinned card query flag is not a single bit");
+        }
+        if ((seen_bits & flag) != 0) {
             throw QueryDecodeError("duplicate pinned card query flag");
         }
-        result.records.push_back({flag, payload});
+        seen_bits |= flag;
+        ++records;
         if (flag == QUERY_END) {
             if (!payload.empty()) {
                 throw QueryDecodeError("QUERY_END has a payload");
@@ -260,8 +266,7 @@ RawCardQuery decode_card_query_from_cursor(Cursor& cursor) {
         decode_record_payload(flag, payload, result);
     }
     if (!ended) {
-        throw QueryDecodeError("pinned card query has no QUERY_END after " +
-                               std::to_string(result.records.size()) + " records");
+        throw QueryDecodeError("pinned card query has no QUERY_END after " + std::to_string(records) + " records");
     }
     return result;
 }
