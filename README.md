@@ -53,6 +53,27 @@ A duel that needs more than `max_decisions` choices, or that keeps asking the
 same question in the same state, throws `DuelError` with the last decisions in
 the message instead of hanging.
 
+## Python: model and training
+
+`python/` is the `ocgforge` package: the policy/value model (a set transformer that scores every
+legal candidate, ported from Argentum P1), the PPO core, an Elo ladder and the card-text
+embeddings.
+
+```bash
+uv venv .venv && uv pip install --python .venv/bin/python torch --index-url https://download.pytorch.org/whl/cpu
+uv pip install --python .venv/bin/python -e "python[test]"
+.venv/bin/python -m pytest python
+```
+
+Card text embeddings (needs the `embed` extra; downloads BAAI/bge-small-en-v1.5 once):
+
+```bash
+.venv/bin/python -m ocgforge.embed_cards --cdb .cache/babelcdb/cards.cdb --out .cache/card_text_emb.npz
+```
+
+The model's input format is described at the top of `python/src/ocgforge/features.py`. The C++
+side that produces it from a `Duel` does not exist yet.
+
 ## Layout
 
 | Path | What |
@@ -64,6 +85,7 @@ the message instead of hanging.
 | `tests/` | Catch2 tests, one executable |
 | `third_party/` | pinned dependency commits and our ocgcore patches |
 | `tools/setup_deps.py` | fetches/patches dependencies, extracts card data (run by CMake) |
+| `python/` | `ocgforge` Python package: model, PPO, ladder, card embeddings |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the pieces fit together.
 

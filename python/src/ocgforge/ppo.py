@@ -1,0 +1,162 @@
+"""PPO core, ported from Argentum P1: GAE, the clipped loss and one update over collected decisions.
+
+Rollout collection is not here; it will drive the C++ duels directly. What this module needs per
+decision is a features.py sample plus:
+
+    chosen       index of the candidate that was played
+    logprob      its log-probability under the policy that played it
+    value        the value head's estimate at the time
+
+grouped into one trajectory per (duel, seat), with the duel result from that seat's view
+(+1 win, -1 loss, 0 draw). Reward only arrives at the end.
+"""
+
+from __future__ import annotations
+
+import random
+from collections import defaultdict
+from collections.abc import Sequence
+from dataclasses import dataclass
+
+import torch
+
+from .features import collate
+from .model import Model
+
+
+@dataclass(frozen=True)
+class PPOConfig:
+    epochs: int = 3
+    batch_size: int = 512
+    lr: float = 1.5e-4
+    clip: float = 0.2
+    gamma: float = 1.0
+    lam: float = 0.95
+    value_coef: float = 0.5
+    entropy_coef: float = 0.01
+    kl_coef: float = 0.1  # KL to a fixed reference policy; 0 = off
+    target_kl: float = 0.03  # stop the update once the policy moved this far from the rollout policy
+    max_grad_norm: float = 0.5
+
+
+def gae(values: Sequence[float], final_reward: float, gamma: float, lam: float) -> tuple[list[float], list[float]]:
+    """Generalized advantage estimation for a trajectory whose only reward arrives after the last
+    decision. Returns (advantages, returns); the episode ends after the last step (no bootstrap)."""
+    advantages = [0.0] * len(values)
+    running = 0.0
+    for t in reversed(range(len(values))):
+        last = t == len(values) - 1
+        reward = final_reward if last else 0.0
+        next_value = 0.0 if last else values[t + 1]
+        delta = reward + gamma * next_value - values[t]
+        running = delta + gamma * lam * running
+        advantages[t] = running
+    return advantages, [a + v for a, v in zip(advantages, values)]
+
+
+def build_steps(trajectories: Sequence[tuple[Sequence[dict], float]], gamma: float, lam: float) -> list[dict]:
+    """(decisions of one seat, final result) pairs -> decisions with `advantage` and `return`,
+    advantages normalized over the whole batch."""
+    steps: list[dict] = []
+    for decisions, result in trajectories:
+        advantages, returns = gae([float(d["value"]) for d in decisions], result, gamma, lam)
+        for decision, advantage, ret in zip(decisions, advantages, returns):
+            steps.append({**decision, "advantage": advantage, "return": ret})
+    if steps:
+        advantages = torch.tensor([s["advantage"] for s in steps])
+        mean, std = advantages.mean(), advantages.std().clamp(min=1e-6) if len(steps) > 1 else torch.tensor(1.0)
+        for s in steps:
+            s["advantage"] = float((s["advantage"] - mean) / std)
+    return steps
+
+
+def collate_steps(steps: Sequence[dict], device: torch.device | str = "cpu") -> dict[str, torch.Tensor]:
+    batch = collate(steps, device)
+    for name in ("logprob", "value", "advantage", "return"):
+        batch[name] = torch.tensor([float(s[name]) for s in steps], device=device)
+    if "ref_logprobs" in steps[0]:
+        width = batch["candidate_kind"].shape[1]
+        rows = torch.full((len(steps), width), float("-inf"))
+        for i, s in enumerate(steps):
+            rows[i, : len(s["ref_logprobs"])] = torch.as_tensor(s["ref_logprobs"])
+        batch["ref_logprobs"] = rows.to(device)
+    return batch
+
+
+def ppo_loss(model: Model, batch: dict[str, torch.Tensor], config: PPOConfig) -> tuple[torch.Tensor, dict[str, float]]:
+    scores, value = model(batch)
+    logprobs = torch.log_softmax(scores.float(), dim=-1)
+    valid = torch.isfinite(logprobs)
+    probs = logprobs.exp()
+    new_logprob = logprobs.gather(1, batch["chosen"].unsqueeze(1)).squeeze(1)
+
+    advantage = batch["advantage"]
+    log_ratio = new_logprob - batch["logprob"]
+    ratio = log_ratio.exp()
+    surrogate = torch.minimum(ratio * advantage, ratio.clamp(1 - config.clip, 1 + config.clip) * advantage)
+    policy_loss = -surrogate.mean()
+    value_loss = torch.mean((value.float() - batch["return"]) ** 2)
+    safe = torch.where(valid, logprobs, torch.zeros_like(logprobs))
+    entropy = -(probs * safe).sum(-1).mean()
+    loss = policy_loss + config.value_coef * value_loss - config.entropy_coef * entropy
+
+    kl_ref = torch.zeros((), device=scores.device)
+    if config.kl_coef > 0 and "ref_logprobs" in batch:
+        reference = torch.where(valid, batch["ref_logprobs"], torch.zeros_like(logprobs))
+        kl_ref = (probs * (safe - reference)).sum(-1).mean()
+        loss = loss + config.kl_coef * kl_ref
+
+    with torch.no_grad():
+        approx_kl = ((ratio - 1) - log_ratio).mean()
+        clip_fraction = ((ratio - 1).abs() > config.clip).float().mean()
+    stats = {"loss": loss.item(), "policyLoss": policy_loss.item(), "valueLoss": value_loss.item(),
+             "entropy": entropy.item(), "klRef": kl_ref.item(), "approxKl": approx_kl.item(),
+             "clipFraction": clip_fraction.item()}
+    return loss, stats
+
+
+@torch.no_grad()
+def attach_reference_logprobs(reference: Model, steps: Sequence[dict], device: torch.device | str = "cpu",
+                              batch_size: int = 512) -> None:
+    reference.eval()
+    for start in range(0, len(steps), batch_size):
+        chunk = steps[start:start + batch_size]
+        scores, _ = reference(collate(chunk, device))
+        logprobs = torch.log_softmax(scores.float(), dim=-1).cpu()
+        for row, step in zip(logprobs, chunk):
+            step["ref_logprobs"] = row[: len(step["candidate_kind"])].clone()
+
+
+def ppo_update(model: Model, optimizer: torch.optim.Optimizer, steps: Sequence[dict], config: PPOConfig,
+               device: torch.device | str = "cpu", seed: int = 0) -> list[dict[str, float]]:
+    """Clipped-PPO epochs over `steps` (from build_steps). Returns per-epoch mean stats; stops early
+    once the approximate KL to the rollout policy exceeds 1.5 x target_kl.
+
+    Use a model without dropout (dropout noise would read as policy change in the ratio)."""
+    rng = random.Random(seed)
+    history: list[dict[str, float]] = []
+    for epoch in range(1, config.epochs + 1):
+        model.train()
+        totals: dict[str, float] = defaultdict(float)
+        batches = 0
+        stopped = False
+        order = list(range(len(steps)))
+        rng.shuffle(order)
+        for start in range(0, len(order), config.batch_size):
+            batch = collate_steps([steps[i] for i in order[start:start + config.batch_size]], device)
+            loss, stats = ppo_loss(model, batch, config)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+            optimizer.step()
+            for key, value in stats.items():
+                totals[key] += value
+            batches += 1
+            if stats["approxKl"] > 1.5 * config.target_kl:
+                stopped = True
+                break
+        history.append({**{k: v / max(batches, 1) for k, v in totals.items()},
+                        "epoch": epoch, "batches": batches, "stoppedEarly": stopped})
+        if stopped:
+            break
+    return history
