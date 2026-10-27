@@ -13,7 +13,7 @@ struct Deck {
     std::string sha256;
 };
 
-// Reads a .ydk file (#main / #extra sections; side deck must be empty).
+// Reads a .ydk file (#main / #extra; the !side section is ignored).
 Deck load_deck(const std::filesystem::path& path);
 
 // Sorted, de-duplicated passcodes of every card in the given decks.

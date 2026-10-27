@@ -10,6 +10,7 @@ include(Catch)
 add_executable(ocgforge_tests
     core/deck_test.cpp
     protocol/select_unselect_test.cpp
+    protocol/sum_selection_test.cpp
     duel/duel_test.cpp
     encode/encoder_test.cpp
 )

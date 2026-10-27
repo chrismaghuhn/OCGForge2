@@ -1,6 +1,6 @@
 """Precompute a frozen sentence embedding of every card's text, ported from Argentum P1.
 
-    python -m ocgforge.embed_cards --cdb .cache/babelcdb/cards.cdb --out .cache/card_text_emb.npz
+    python -m ocgforge.embed_cards --out .cache/card_text_emb.npz
 
 Text per card: a short type line ("Effect Monster, LIGHT, Warrior, Level 4") and the card text with
 its own name replaced by "this card", encoded by a small pretrained text encoder (default
@@ -59,7 +59,7 @@ def load_text_embeddings(path: Path, card_features: CardFeatures) -> np.ndarray:
 
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--cdb", type=Path, required=True)
+    parser.add_argument("--cdb", type=Path, nargs="*", help="card databases (default: the pinned ones)")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--encoder", default=DEFAULT_ENCODER)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -68,7 +68,7 @@ def main(argv=None) -> None:
     import torch
     from transformers import AutoModel, AutoTokenizer
 
-    table = CardTable.from_cdb(args.cdb)
+    table = CardTable.from_cdb(args.cdb or None)
     sentences = [card_sentence(card) for card in table.cards]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = AutoTokenizer.from_pretrained(args.encoder)

@@ -28,6 +28,13 @@ std::optional<ObservationLocator> find_card(const PlayerObservation& observation
                                             std::uint32_t sequence,
                                             std::optional<std::uint32_t> overlay_sequence = std::nullopt);
 
+// Whether, since the start of the current turn, the engine showed this card
+// (by passcode) to the observing player in that controller's zone, e.g. an
+// effect that looks at the opponent's hand. Such a card may be chosen even
+// though the observation keeps it hidden.
+bool revealed_this_turn(const PlayerObservation& observation, std::uint32_t code, std::uint8_t controller,
+                        std::uint32_t location);
+
 bool candidate_observation_consistent(const PlayerObservation& observation,
                                       const ygo::protocol::ActionCandidate& candidate);
 

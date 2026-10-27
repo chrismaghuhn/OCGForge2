@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <limits>
 #include <numeric>
+#include <set>
+#include <tuple>
 #include <iterator>
 #include <sstream>
 #include <utility>
@@ -157,6 +159,7 @@ bool sum_terminal(const SelectionContinuation& continuation) {
     return !cards.empty() && exact_sum_reachable(cards, 0, continuation.target_sum);
 }
 
+// Fallback for targets too large for the bitmask below: tries subsets of the tail.
 bool sum_completion_search(const SelectionContinuation& continuation, std::vector<std::uint32_t>& selected,
                            const std::vector<ContinuationItem>& tail, std::size_t position) {
     auto candidate = continuation;
@@ -177,6 +180,97 @@ bool sum_completion_search(const SelectionContinuation& continuation, std::vecto
     return false;
 }
 
+// Whether adding some subset of `tail` to `base` makes the selection legal (what
+// sum_terminal checks). Searching subsets directly is exponential and never ends
+// when there is no legal completion among ~20+ cards (e.g. a Ritual Summon with a
+// big graveyard), so this decides it over small summaries of the selection,
+// remembering every summary already ruled out.
+class SumCompletion final {
+public:
+    SumCompletion(const SelectionContinuation& continuation, const std::vector<ContinuationItem>& tail)
+        : continuation_(continuation), tail_(tail), target_(continuation.target_sum) {}
+
+    // "At least target, but not without the smallest card": only the maximum sum,
+    // the minimum sum and the smallest value matter. minimum_sum - smallest never
+    // decreases as cards are added, so once it reaches the target that branch is dead.
+    bool greater(const std::vector<ContinuationItem>& base) {
+        std::uint64_t maximum = 0;
+        std::uint64_t minimum = 0;
+        std::uint64_t smallest = std::numeric_limits<std::uint32_t>::max();
+        for (const auto& item : base) {
+            maximum += contribution_max(item);
+            minimum += contribution_min(item);
+            smallest = std::min<std::uint64_t>(smallest, contribution_min(item));
+        }
+        return greater_from(0, !base.empty(), maximum, minimum, smallest);
+    }
+
+    // "Exactly target with count in [min_count, max_count]": only the number of
+    // cards and the set of reachable sums (bit s = some choice of values sums to s)
+    // matter. Sums are tracked below 64; callers fall back for larger targets.
+    bool exact(const std::vector<ContinuationItem>& base, std::uint32_t count) {
+        std::uint64_t reachable = 1;  // the empty sum
+        for (const auto& item : base) {
+            reachable = add(reachable, item);
+        }
+        return exact_from(0, count, reachable, !base.empty());
+    }
+
+private:
+    bool greater_legal(bool any, std::uint64_t maximum, std::uint64_t minimum, std::uint64_t smallest) const {
+        return any && maximum >= target_ && minimum - smallest < target_;
+    }
+
+    bool greater_from(std::size_t position, bool any, std::uint64_t maximum, std::uint64_t minimum,
+                      std::uint64_t smallest) {
+        if (greater_legal(any, maximum, minimum, smallest)) {
+            return true;
+        }
+        if ((any && minimum - smallest >= target_) || position >= tail_.size()) {
+            return false;
+        }
+        const auto key = std::make_tuple(position, any, std::min<std::uint64_t>(maximum, target_), minimum, smallest);
+        if (!greater_dead_.insert(key).second) {
+            return false;
+        }
+        const auto& item = tail_[position];
+        return greater_from(position + 1, any, maximum, minimum, smallest) ||
+               greater_from(position + 1, true, maximum + contribution_max(item), minimum + contribution_min(item),
+                            std::min<std::uint64_t>(smallest, contribution_min(item)));
+    }
+
+    std::uint64_t add(std::uint64_t reachable, const ContinuationItem& item) const {
+        const auto mask = target_ >= 63 ? ~std::uint64_t{0} : (std::uint64_t{1} << (target_ + 1)) - 1;
+        std::uint64_t next = reachable << std::min<std::uint32_t>(item.primary_value, 63);
+        if (item.secondary_value > 0) {
+            next |= reachable << std::min<std::uint32_t>(item.secondary_value, 63);
+        }
+        return next & mask;
+    }
+
+    bool exact_from(std::size_t position, std::uint32_t count, std::uint64_t reachable, bool any) {
+        if (any && count >= continuation_.min_count && count <= continuation_.max_count &&
+            (reachable >> target_ & 1) != 0) {
+            return true;
+        }
+        if (count >= continuation_.max_count || position >= tail_.size() || reachable == 0) {
+            return false;
+        }
+        const auto key = std::make_tuple(position, count, reachable, any);
+        if (!exact_dead_.insert(key).second) {
+            return false;
+        }
+        return exact_from(position + 1, count, reachable, any) ||
+               exact_from(position + 1, count + 1, add(reachable, tail_[position]), true);
+    }
+
+    const SelectionContinuation& continuation_;
+    const std::vector<ContinuationItem>& tail_;
+    std::uint64_t target_;
+    std::set<std::tuple<std::size_t, bool, std::uint64_t, std::uint64_t, std::uint64_t>> greater_dead_;
+    std::set<std::tuple<std::size_t, std::uint32_t, std::uint64_t, bool>> exact_dead_;
+};
+
 bool sum_can_complete_after(const SelectionContinuation& continuation, std::uint32_t picked_index) {
     std::vector<ContinuationItem> tail;
     for (const auto& item : continuation.items) {
@@ -186,7 +280,15 @@ bool sum_can_complete_after(const SelectionContinuation& continuation, std::uint
     }
     auto selected = continuation.selected_indices;
     selected.push_back(picked_index);
-    return sum_completion_search(continuation, selected, tail, 0);
+    if (!continuation.greater_sum && continuation.target_sum >= 63) {
+        return sum_completion_search(continuation, selected, tail, 0);
+    }
+    auto picked = continuation;
+    picked.selected_indices = selected;
+    SumCompletion completion(continuation, tail);
+    return continuation.greater_sum
+               ? completion.greater(selected_items(picked))
+               : completion.exact(selected_items(picked), static_cast<std::uint32_t>(selected.size()));
 }
 
 std::uint64_t selected_tribute_value(const SelectionContinuation& continuation) {

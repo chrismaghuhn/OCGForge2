@@ -115,6 +115,22 @@ void attach_decision_context(PlayerObservation& observation,
 }
 
 
+bool revealed_this_turn(const PlayerObservation& observation, std::uint32_t code, std::uint8_t controller,
+                        std::uint32_t location) {
+    const auto zone = detail::project_zone(location, controller, 0,
+                                           static_cast<std::uint32_t>(observation.match_context.duel_flags)).zone;
+    for (auto it = observation.visible_events.rbegin(); it != observation.visible_events.rend(); ++it) {
+        if (it->kind == VisibleEventKind::TurnStarted) {
+            return false;
+        }
+        if (it->kind == VisibleEventKind::CardRevealed && it->public_passcode == code && it->player == controller &&
+            it->to_zone == zone) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::optional<ObservationLocator> find_card(const PlayerObservation& observation, std::uint32_t code,
                                             std::uint8_t controller, std::uint32_t location,
                                             std::uint32_t sequence,

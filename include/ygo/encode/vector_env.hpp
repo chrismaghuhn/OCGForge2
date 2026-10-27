@@ -52,6 +52,16 @@ struct VectorEnvConfig {
     std::uint64_t max_decisions = 5000;
 };
 
+// What an env is doing, for diagnosing a duel that hangs: enough to replay it
+// with duel::Duel (same seed, decks, starting player, then the actions).
+struct EnvInfo {
+    bool busy = false;  // inside step right now
+    std::uint64_t seed = 0;
+    std::uint8_t starting_player = 0;
+    std::pair<std::size_t, std::size_t> decks;
+    std::vector<std::string> actions;  // semantic keys played in this duel, the last one possibly still running
+};
+
 struct StepResult {
     std::vector<std::uint8_t> done;    // the duel of this env ended with this step
     std::vector<std::uint8_t> winner;  // when done: 0 or 1, 2 = draw, 255 = error (see errors)
@@ -73,12 +83,18 @@ public:
     std::uint64_t duel_decision(std::size_t env) const;
     // Deck indices (into config.decks) of player 0 and 1 in this env's current duel.
     std::pair<std::size_t, std::size_t> decks(std::size_t env) const;
+    // Safe to call while another thread is inside step.
+    EnvInfo info(std::size_t env) const;
 
     // actions[env] is the index of the chosen candidate in decision(env).
     StepResult step(const std::vector<std::int64_t>& actions);
 
     std::uint64_t duels_finished() const noexcept { return duels_finished_; }
     std::uint64_t duel_errors() const noexcept { return duel_errors_; }
+    // Duels that failed to start (and were replaced by another seed/deck pair), and the
+    // last reason. Nonzero usually means a deck or card data problem.
+    std::uint64_t start_failures() const noexcept { return start_failures_; }
+    std::string last_start_failure() const;
 
 private:
     struct Slot;
@@ -91,6 +107,9 @@ private:
     std::uint64_t duels_finished_ = 0;
     std::uint64_t duel_errors_ = 0;
     std::string broken_;
+    std::atomic<std::uint64_t> start_failures_ = 0;
+    mutable std::mutex start_failure_mutex_;
+    std::string last_start_failure_;
     std::atomic<bool> stepping_ = false;
 };
 

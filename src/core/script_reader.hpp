@@ -20,6 +20,8 @@ public:
     {}
 
     int load(OCG_Duel duel, const char* name, std::string* error);
+    // For cards that have no script at all (plain Normal Monsters, tokens).
+    void not_required(std::uint32_t code) { required_codes_.erase(code); }
     std::size_t reader_requests() const noexcept { return reader_requests_; }
     std::size_t successful_loads() const noexcept { return successful_loads_; }
 

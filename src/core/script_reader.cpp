@@ -97,8 +97,9 @@ int script_reader_callback(void* payload, OCG_Duel duel, const char* name) {
 }
 
 void log_callback(void* payload, const char* message, int type) {
+    constexpr std::size_t kMaxLog = 64 * 1024;  // a script error can repeat thousands of times
     auto* output = static_cast<std::string*>(payload);
-    if (output != nullptr && message != nullptr) {
+    if (output != nullptr && message != nullptr && output->size() < kMaxLog) {
         *output += "[" + std::to_string(type) + "] " + message + "\n";
     }
 }

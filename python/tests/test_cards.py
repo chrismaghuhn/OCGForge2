@@ -75,3 +75,8 @@ def test_real_database_features_build(cdb_table):
     features = CardFeatures.build(cdb_table)
     assert features.text.shape[0] == len(cdb_table)
     assert np.count_nonzero(features.text[2:].any(axis=1)) > 0.95 * (len(cdb_table) - 2)
+
+
+def test_release_databases_are_included(cdb_table):
+    # Destiny HERO - Destro-Dogma is only in release-betb.cdb, not in cards.cdb.
+    assert cdb_table.index(25158975) != UNK

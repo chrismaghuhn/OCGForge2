@@ -171,7 +171,9 @@ void Duel::publish(protocol::DecisionRequest request) {
                               (candidate.target_card != 0 && candidate.target_location != 0 &&
                                candidate.target_location != LOCATION_DECK &&
                                candidate.target_location != LOCATION_EXTRA);
-        if (has_card && !observation::candidate_observation_consistent(*observation_, candidate)) {
+        if (has_card && !observation::candidate_observation_consistent(*observation_, candidate) &&
+            !observation::revealed_this_turn(*observation_, candidate.source_card, candidate.source_controller,
+                                             candidate.source_location)) {
             fail("candidate refers to a card the player cannot see: " + candidate.semantic_key);
         }
     }

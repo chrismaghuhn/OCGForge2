@@ -2,6 +2,8 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <cstdlib>
+#include <algorithm>
+#include <filesystem>
 #include <random>
 #include <string>
 #include <vector>
@@ -119,4 +121,38 @@ TEST_CASE("select/unselect ping-pong is detected as stuck") {
         }
     }
     CHECK(detected);
+}
+
+// Every deck in decks/ (training and hold-out) against every other, random play. Slow; run with
+// "[slow]". Duels cut off by the Lua instruction budget count as finished but are reported.
+TEST_CASE("random duels across all deck pairings finish", "[.][slow]") {
+    std::vector<std::filesystem::path> paths;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(OCGFORGE_SOURCE_DIR "/decks")) {
+        if (entry.path().extension() == ".ydk") {
+            paths.push_back(entry.path());
+        }
+    }
+    std::sort(paths.begin(), paths.end());
+    std::size_t budget_failures = 0;
+    std::uint64_t seed = 1;
+    for (const auto& a : paths) {
+        for (const auto& b : paths) {
+            auto config = test::duel_config(seed);
+            config.deck0 = ygo::core::load_deck(a);
+            config.deck1 = ygo::core::load_deck(b);
+            std::mt19937_64 rng(seed++);
+            CAPTURE(a.stem().string(), b.stem().string(), config.seed);
+            try {
+                Duel duel(config);
+                while (!duel.finished()) {
+                    const auto& candidates = duel.request().candidates;
+                    duel.act(candidates[rng() % candidates.size()].semantic_key);
+                }
+            } catch (const DuelError& error) {
+                REQUIRE_THAT(error.what(), Catch::Matchers::ContainsSubstring("Lua instruction budget exceeded"));
+                ++budget_failures;
+            }
+        }
+    }
+    WARN(budget_failures << " of " << paths.size() * paths.size() << " duels hit the Lua instruction budget");
 }

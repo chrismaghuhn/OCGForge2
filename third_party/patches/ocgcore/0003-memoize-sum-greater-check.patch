@@ -1,0 +1,62 @@
+diff --git a/field.cpp b/field.cpp
+index 602ed6d..88a3a2d 100644
+--- a/field.cpp
++++ b/field.cpp
+@@ -12,6 +12,7 @@
+ #include "duel.h"
+ #include "effect.h"
+ #include "field.h"
++#include <unordered_map>
+ #include "group.h"
+ #include "interpreter.h"
+ 
+@@ -2640,19 +2641,41 @@ int32_t field::check_with_sum_limit_m(const card_vector& mats, int32_t acc, int3
+ 		return TRUE;
+ 	return FALSE;
+ }
+-int32_t field::check_with_sum_greater_limit(const card_vector& mats, int32_t acc, int32_t index, int32_t opmin, int32_t* should_continue) {
++namespace {
++// The result of a check depends only on (index, acc, opmin), and the same triples
++// come up again and again on different paths: remember them, so a check that has
++// no solution costs polynomial time instead of trying every subset (which never
++// finishes with ~20+ materials).
++int32_t check_with_sum_greater_limit_memo(const card_vector& mats, int32_t acc, int32_t index, int32_t opmin,
++                                          std::unordered_map<uint64_t, bool>& memo) {
++	const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(index)) << 48) |
++	                     (static_cast<uint64_t>(static_cast<uint32_t>(acc)) << 16) |
++	                     static_cast<uint64_t>(static_cast<uint16_t>(opmin));
++	if(auto it = memo.find(key); it != memo.end())
++		return it->second;
++	int32_t result = FALSE;
+ 	while(index < (int32_t)mats.size()) {
+ 		int32_t op1 = mats[index]->sum_param & 0xffff;
+ 		int32_t op2 = (mats[index]->sum_param >> 16) & 0xffff;
+-		if((acc <= op1 && acc + opmin > op1) || (op2 && acc <= op2 && acc + opmin > op2))
+-			return TRUE;
++		if((acc <= op1 && acc + opmin > op1) || (op2 && acc <= op2 && acc + opmin > op2)) {
++			result = TRUE;
++			break;
++		}
+ 		++index;
+-		if(check_with_sum_greater_limit(mats, acc - op1, index, std::min(opmin, op1), should_continue))
+-			return TRUE;
+-		if(op2 && check_with_sum_greater_limit(mats, acc - op2, index, std::min(opmin, op2), should_continue))
+-			return TRUE;
++		if(check_with_sum_greater_limit_memo(mats, acc - op1, index, std::min(opmin, op1), memo) ||
++		   (op2 && check_with_sum_greater_limit_memo(mats, acc - op2, index, std::min(opmin, op2), memo))) {
++			result = TRUE;
++			break;
++		}
+ 	}
+-	return FALSE;
++	memo.emplace(key, result != FALSE);
++	return result;
++}
++}
++int32_t field::check_with_sum_greater_limit(const card_vector& mats, int32_t acc, int32_t index, int32_t opmin, int32_t* should_continue) {
++	(void)should_continue;
++	std::unordered_map<uint64_t, bool> memo;
++	return check_with_sum_greater_limit_memo(mats, acc, index, opmin, memo);
+ }
+ int32_t field::check_with_sum_greater_limit_m(const card_vector& mats, int32_t acc, int32_t index, int32_t opmin, int32_t must_count, int32_t* should_continue) {
+ 	if(acc <= 0)

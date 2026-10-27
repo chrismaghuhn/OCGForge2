@@ -3,9 +3,14 @@
 A deterministic Yu-Gi-Oh! duel environment for game-AI experiments, built as a
 thin C++ layer around [ygopro-core](https://github.com/edo9300/ygopro-core).
 
-Current scope: two fixed decks (Swordsoul Tenyi vs. Salamangreat), full duels,
-every legal choice exposed as a candidate, and a per-player view that never
-leaks hidden information.
+Current scope: a pool of current meta decks (`decks/`, with two hold-out decks
+in `decks/holdout/` that are never used for training), full duels, every legal
+choice exposed as a candidate, and a per-player view that never leaks hidden
+information.
+
+Decks are `.ydk` files (`#main`, `#extra`; a `!side` section is ignored). The
+card pool is the pinned BabelCDB (`cards.cdb` plus `release-*.cdb`); a card
+missing from it makes `tools/setup_deps.py` fail and name the deck.
 
 ## Build and test (Linux)
 
@@ -22,7 +27,8 @@ Presets: `debug`, `release`, `asan` (AddressSanitizer + UBSan).
 `OCGFORGE_RANDOM_DUELS=<n>` sets how many random duels the smoke test plays
 (default 25; CI uses 5 for the slow sanitizer build).
 
-The slow soak test (500 random duels) is hidden by default:
+The slow soak tests (500 random duels, and one random duel for every pairing of
+the decks in `decks/`) are hidden by default:
 
 ```bash
 ./build/release/tests/ocgforge_tests "[slow]"
@@ -84,7 +90,7 @@ and returns results for `ladder.elo`.
 Card text embeddings (needs the `embed` extra; downloads BAAI/bge-small-en-v1.5 once):
 
 ```bash
-.venv/bin/python -m ocgforge.embed_cards --cdb .cache/babelcdb/cards.cdb --out .cache/card_text_emb.npz
+.venv/bin/python -m ocgforge.embed_cards --out .cache/card_text_emb.npz
 ```
 
 The model's input format is described at the top of `python/src/ocgforge/features.py`; the C++

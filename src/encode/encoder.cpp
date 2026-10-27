@@ -292,11 +292,14 @@ EncodedDecision encode(const PlayerObservation& observation, const DecisionReque
         out.candidate_source.push_back(source);
 
         // A card the observation does not show (e.g. in the deck during a search)
-        // still needs an identity, or the choices would look the same. Only the
-        // deciding player's own cards: those it is allowed to look at.
+        // still needs an identity, or the choices would look the same. Only cards
+        // the deciding player may know: its own, or ones just shown to it.
         std::int64_t own_card = 0;
         std::uint32_t named_card = 0;
-        if (source < 0 && candidate.source_card != 0 && candidate.source_controller == self) {
+        if (source < 0 && candidate.source_card != 0 &&
+            (candidate.source_controller == self ||
+             observation::revealed_this_turn(observation, candidate.source_card, candidate.source_controller,
+                                             candidate.source_location))) {
             named_card = candidate.source_card;
         } else if (candidate.action_kind == ActionKind::Option && candidate.choice_value) {
             named_card = static_cast<std::uint32_t>(*candidate.choice_value >> 20);  // the card offering the option

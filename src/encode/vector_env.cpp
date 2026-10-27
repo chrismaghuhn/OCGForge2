@@ -64,6 +64,8 @@ void ThreadPool::work() {
 }
 
 struct VectorEnv::Slot {
+    mutable std::mutex mutex;  // guards info
+    EnvInfo info;
     std::size_t index = 0;
     std::uint64_t episode = 0;
     std::mt19937_64 rng;
@@ -118,6 +120,13 @@ void VectorEnv::reset(Slot& slot) {
         config.starting_player = static_cast<std::uint8_t>(slot.rng() & 1);
         config.max_decisions = config_.max_decisions;
         ++slot.episode;
+        {
+            std::lock_guard lock(slot.mutex);
+            slot.info.seed = config.seed;
+            slot.info.starting_player = config.starting_player;
+            slot.info.decks = slot.decks;
+            slot.info.actions.clear();
+        }
         try {
             slot.duel = std::make_unique<duel::Duel>(std::move(config));
             if (slot.duel->finished()) {
@@ -125,7 +134,12 @@ void VectorEnv::reset(Slot& slot) {
             }
             slot.decision = encode(*slot.duel->observation(), slot.duel->request(), card_index_);
             return;
-        } catch (const std::exception&) {  // stuck duel or undecodable first decision
+        } catch (const std::exception& error) {  // stuck duel or undecodable first decision
+            ++start_failures_;
+            {
+                std::lock_guard lock(start_failure_mutex_);
+                last_start_failure_ = error.what();
+            }
             if (attempt >= 10) {
                 throw;
             }
@@ -136,6 +150,17 @@ void VectorEnv::reset(Slot& slot) {
 const EncodedDecision& VectorEnv::decision(std::size_t env) const { return slots_.at(env)->decision; }
 
 std::uint64_t VectorEnv::duel_decision(std::size_t env) const { return slots_.at(env)->duel->decision_count(); }
+
+std::string VectorEnv::last_start_failure() const {
+    std::lock_guard lock(start_failure_mutex_);
+    return last_start_failure_;
+}
+
+EnvInfo VectorEnv::info(std::size_t env) const {
+    const auto& slot = *slots_.at(env);
+    std::lock_guard lock(slot.mutex);
+    return slot.info;
+}
 
 std::pair<std::size_t, std::size_t> VectorEnv::decks(std::size_t env) const { return slots_.at(env)->decks; }
 
@@ -170,7 +195,20 @@ StepResult VectorEnv::step(const std::vector<std::int64_t>& actions) {
         try {
             try {
                 const auto& request = slot.duel->request();
-                slot.duel->act(request.candidates[static_cast<std::size_t>(actions[i])].semantic_key);
+                const auto& key = request.candidates[static_cast<std::size_t>(actions[i])].semantic_key;
+                {
+                    std::lock_guard lock(slot.mutex);
+                    slot.info.actions.push_back(key);
+                    slot.info.busy = true;
+                }
+                struct NotBusy {
+                    Slot& slot;
+                    ~NotBusy() {
+                        std::lock_guard lock(slot.mutex);
+                        slot.info.busy = false;
+                    }
+                } not_busy{slot};
+                slot.duel->act(key);
                 if (!slot.duel->finished()) {
                     slot.decision = encode(*slot.duel->observation(), slot.duel->request(), card_index_);
                     return;

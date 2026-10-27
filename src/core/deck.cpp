@@ -57,7 +57,7 @@ Deck load_deck(const std::filesystem::path& path) {
             throw std::runtime_error("deck card appears before a section in " + path.string() + ": " + line);
         }
         if (section == Section::Side) {
-            throw std::runtime_error("side deck must be empty: " + path.string());
+            continue;  // not played
         }
         std::uint32_t code = 0;
         std::istringstream parser(line);
