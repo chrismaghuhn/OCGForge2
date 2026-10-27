@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <map>
 #include <random>
 #include <algorithm>
 #include <set>
@@ -182,4 +183,171 @@ TEST_CASE("cards picked in an ongoing selection are marked selected and nothing 
         }
     }
     CHECK(checked_with_picks > 0);  // the situation actually came up
+}
+
+namespace {
+
+CardIndex all_cards_index() {
+    CardIndex index;
+    std::int64_t next = 2;
+    for (const auto code : ygo::core::card_codes(test::swordsoul(), test::salamangreat())) {
+        index[code] = next++;
+    }
+    return index;
+}
+
+}  // namespace
+
+// Every encoded event is a copy of an event in the deciding player's own stream, in order:
+// kind, side, zones, card and numeric fields agree with that event, and nothing is invented.
+TEST_CASE("encoded events copy the deciding player's public event stream") {
+    using K = ygo::observation::VisibleEventKind;
+    const auto index = all_cards_index();
+    const auto& kinds = event_kind_names();
+    const auto kind_name = [](K kind) {
+        switch (kind) {
+        case K::TurnStarted: return "turn_started"; case K::CardMoved: return "card_moved";
+        case K::CardRevealed: return "card_revealed"; case K::Summoned: return "summoned"; case K::Set: return "set";
+        case K::LifePointsChanged: return "life_points_changed"; case K::ChainActivated: return "chain_activated";
+        case K::CardDestroyed: return "card_destroyed"; case K::CardBanished: return "card_banished";
+        case K::CardReturned: return "card_returned"; case K::PositionChanged: return "position_changed";
+        case K::CounterChanged: return "counter_changed"; case K::Equipped: return "equipped";
+        case K::Targeted: return "targeted"; default: return "";
+        }
+    };
+    ygo::duel::Duel duel(test::duel_config(5));
+    std::mt19937_64 rng(5);
+    std::size_t named = 0, decisions = 0;
+    while (!duel.finished()) {
+        const auto& observation = *duel.observation();
+        const auto& events = observation.visible_events;
+        const auto encoded = encode(observation, duel.request(), index);
+        REQUIRE(encoded.event_kind.size() <= kMaxEvents);
+        // Match encoded events to stream events, newest to oldest, in order.
+        std::size_t cursor = events.size();
+        for (std::size_t i = encoded.event_kind.size(); i-- > 0;) {
+            const std::string kind = kinds[static_cast<std::size_t>(encoded.event_kind[i])];
+            bool found = false;
+            while (cursor-- > 0) {
+                const auto& e = events[cursor];
+                const auto passcode = e.public_passcode.value_or(0);
+                const std::int64_t card = passcode == 0 ? 0 : (index.count(passcode) ? index.at(passcode) : 1);
+                const std::int64_t from = e.from_zone ? static_cast<std::int64_t>(*e.from_zone) + 1 : 0;
+                const std::int64_t to = e.to_zone ? static_cast<std::int64_t>(*e.to_zone) + 1 : 0;
+                if (kind == kind_name(e.kind) && card == encoded.event_card[i] && from == encoded.event_from[i] &&
+                    to == encoded.event_to[i]) {
+                    found = true;
+                    break;
+                }
+            }
+            REQUIRE(found);
+            const auto& e = events[cursor];
+            named += encoded.event_card[i] != 0;
+            if (encoded.event_side[i] != 2) {
+                REQUIRE(e.player.has_value());
+                REQUIRE(encoded.event_side[i] == (*e.player == observation.perspective_player ? 0 : 1));
+            }
+            const auto* row = &encoded.event_numeric[i * event_numeric_names().size()];
+            const bool life_points = e.kind == K::LifePointsChanged;
+            REQUIRE(row[2] == (life_points && e.amount ? std::clamp(*e.amount / 8000.0f, -1.0f, 1.0f) : 0.0f));
+            REQUIRE(row[1] == static_cast<float>(encoded.event_kind.size() - 1 - i) / kMaxEvents);
+            // turnsAgo: turns started after this event.
+            const auto later_turns = std::count_if(events.begin() + static_cast<std::ptrdiff_t>(cursor) + 1, events.end(),
+                                                   [](const auto& x) { return x.kind == K::TurnStarted; });
+            REQUIRE(row[0] == std::min(static_cast<float>(later_turns) / 8.0f, 1.0f));
+        }
+        ++decisions;
+        const auto& candidates = duel.request().candidates;
+        duel.act(candidates[rng() % candidates.size()].semantic_key);
+    }
+    CHECK(named > 0);
+    CHECK(decisions > 100);
+}
+
+// event_token must point at the very card the event happened to. Ground truth: the token's
+// own identity when the deciding player knows it, else the owner's view of that place
+// (locators such as "p1:SPELL_TRAP_ZONE:2" are the same for both players). A link to a
+// different card would hand the model a false memory.
+TEST_CASE("event links point at the card the event happened to") {
+    const auto index = all_cards_index();
+    std::size_t checked = 0, hidden_checked = 0, wrong = 0;
+    for (std::uint64_t seed = 1; seed <= 6; ++seed) {
+        ygo::duel::Duel duel(test::duel_config(seed));
+        std::mt19937_64 rng(seed);
+        std::map<std::string, std::uint32_t> owner_view[2];
+        while (!duel.finished()) {
+            const auto& observation = *duel.observation();
+            const auto self = observation.perspective_player;
+            owner_view[self].clear();
+            for (const auto& card : observation.entities) {
+                if (card.identity_known && card.passcode && card.controller == self) {
+                    owner_view[self][card.locator.value] = *card.passcode;
+                }
+            }
+            const auto encoded = encode(observation, duel.request(), index);
+            for (std::size_t i = 0; i < encoded.event_kind.size(); ++i) {
+                const auto token = encoded.event_token[i];
+                if (token < 0 || encoded.event_card[i] <= 1) {
+                    continue;  // no link, or the event does not name a card to compare with
+                }
+                const auto& card = observation.entities[static_cast<std::size_t>(token)];
+                std::int64_t truth = 0;
+                if (card.identity_known && card.passcode) {
+                    truth = index.count(*card.passcode) ? index.at(*card.passcode) : 1;
+                } else if (card.controller) {
+                    const auto& theirs = owner_view[*card.controller];
+                    const auto it = theirs.find(card.locator.value);
+                    if (it == theirs.end() || !index.count(it->second)) {
+                        continue;
+                    }
+                    truth = index.at(it->second);
+                    ++hidden_checked;
+                }
+                if (truth == 0) {
+                    continue;
+                }
+                ++checked;
+                if (truth != encoded.event_card[i]) {
+                    ++wrong;
+                    // A different card with the same name in the same place is indistinguishable here.
+                }
+            }
+            const auto& candidates = duel.request().candidates;
+            duel.act(candidates[rng() % candidates.size()].semantic_key);
+        }
+    }
+    INFO(checked << " links checked (" << hidden_checked << " to face-down cards), " << wrong << " wrong");
+    CHECK(checked > 100);
+    CHECK(wrong == 0);
+}
+
+// Cards the opponent moves face-down (set from hand, face-down to the field) stay unnamed.
+TEST_CASE("events never name a card the opponent set face-down") {
+    using K = ygo::observation::VisibleEventKind;
+    const auto index = all_cards_index();
+    std::size_t opponent_sets = 0;
+    for (std::uint64_t seed = 1; seed <= 4; ++seed) {
+        ygo::duel::Duel duel(test::duel_config(seed));
+        std::mt19937_64 rng(seed);
+        while (!duel.finished()) {
+            const auto& observation = *duel.observation();
+            const auto encoded = encode(observation, duel.request(), index);
+            const auto set_kind = std::find(event_kind_names().begin(), event_kind_names().end(), "set") -
+                                  event_kind_names().begin();
+            for (std::size_t i = 0; i < encoded.event_kind.size(); ++i) {
+                if (encoded.event_kind[i] == set_kind && encoded.event_side[i] == 1) {
+                    ++opponent_sets;
+                    REQUIRE(encoded.event_card[i] == 0);
+                }
+            }
+            for (const auto& e : observation.visible_events) {
+                if (e.kind == K::Set && e.player && *e.player != observation.perspective_player) {
+                    REQUIRE_FALSE(e.public_passcode.has_value());
+                }
+            }
+            const auto& candidates = duel.request().candidates;
+            duel.act(candidates[rng() % candidates.size()].semantic_key);
+        }
+    }
+    CHECK(opponent_sets > 0);
 }

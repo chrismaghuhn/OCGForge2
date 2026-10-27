@@ -41,6 +41,15 @@ per visible card, a global feature vector, and one row per candidate pointing at
 its source card's token. Card identities become model card indices through the
 checkpoint's `cards.json`; hidden cards are "unknown".
 
+Memory: the 64 most recent remembered public events from the deciding player's
+own event stream become event tokens (kind, card when it was public, side,
+zones, turns ago, life point change). Phase changes, shuffles, chain
+bookkeeping and the player's own draws are left out. An event links to the
+field card token it happened to only while that is provably the same card: no
+card has moved into or out of that place since (hand, graveyard and banished
+positions renumber and are never linked). Tests check the events against the
+stream and every link against the true card.
+
 `encode::VectorEnv` keeps N duels that always have a pending decision. `step`
 plays one candidate per duel on a thread pool and restarts finished or failed
 duels with a new seed and deck pair. `ocgforge._core` exposes it to Python with

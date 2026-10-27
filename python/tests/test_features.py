@@ -34,3 +34,25 @@ def test_plain_lists_with_no_tokens_first():
     batch = features.collate([empty, random_decision(rng, 5, tokens=3, candidates=2)])
     assert batch["token_numeric"].shape == (2, 3, len(features.TOKEN_NUMERIC))
     assert batch["token_pad"][0].tolist() == [False, True, True]
+
+
+def test_event_link_past_own_tokens_is_rejected():
+    sample = random_decision(np.random.default_rng(3), 5, tokens=2, candidates=1, events=2)
+    sample["event_token"] = np.array([-1, 2])
+    with pytest.raises(ValueError, match="event_token"):
+        features.check(sample)
+
+
+def test_event_fields_must_line_up():
+    rng = np.random.default_rng(4)
+    too_many = random_decision(rng, 5, tokens=2, candidates=1, events=features.MAX_EVENTS + 1)
+    with pytest.raises(ValueError, match="more than"):
+        features.check(too_many)
+    ragged = random_decision(rng, 5, tokens=2, candidates=1, events=3)
+    ragged["event_numeric"] = ragged["event_numeric"][:2]
+    with pytest.raises(ValueError, match="different lengths"):
+        features.check(ragged)
+    no_kinds = random_decision(rng, 5, tokens=2, candidates=1, events=3)
+    no_kinds["event_kind"] = no_kinds["event_kind"][:0]
+    with pytest.raises(ValueError, match="different lengths"):
+        features.check(no_kinds)

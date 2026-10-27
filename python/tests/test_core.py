@@ -39,6 +39,9 @@ def test_cpp_and_python_agree_on_the_input_contract():
     assert tuple(core.global_numeric_names()) == features.GLOBAL_NUMERIC
     assert tuple(core.candidate_numeric_names()) == features.CANDIDATE_NUMERIC
     assert core.MAX_TARGETS == features.MAX_TARGETS
+    assert tuple(core.event_kind_names()) == features.EVENT_KINDS
+    assert tuple(core.event_numeric_names()) == features.EVENT_NUMERIC
+    assert core.MAX_EVENTS == features.MAX_EVENTS
 
 
 def _play_random(env, steps, seed=0):

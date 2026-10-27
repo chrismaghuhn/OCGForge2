@@ -406,9 +406,11 @@ std::vector<VisibleGameEvent> project_visible_events(const std::vector<std::uint
             break;
         }
         case MSG_LPUPDATE: {
+            // Sets life points to a value; `amount` means a change (damage/recover),
+            // so it stays empty here. The new total is in the observation's globals.
             auto& event = emit(VisibleEventKind::LifePointsChanged);
             event.player = reader.u8();
-            event.amount = static_cast<std::int32_t>(reader.u32());
+            (void)reader.u32();
             reader.finish("MSG_LPUPDATE");
             break;
         }

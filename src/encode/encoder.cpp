@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <bit>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <tuple>
 
@@ -48,6 +49,18 @@ const std::vector<std::string> kGlobalNumeric = {
     "opp_lp", "opp_hand", "opp_deck", "opp_extra", "opp_graveyard", "opp_banished", "opp_monsters",
     "opp_spellTraps",
     "turn", "isOwnTurn", "chainSize", "selectMin", "selectMax", "selectedCount"};
+// Public events worth remembering (see remembered_kind); phase changes, shuffles,
+// chain bookkeeping and own draws carry nothing a later decision needs.
+const std::vector<std::string> kEventKinds = {
+    "<pad>", "turn_started", "card_moved", "card_revealed", "summoned", "set", "life_points_changed",
+    "chain_activated", "card_destroyed", "card_banished", "card_returned", "position_changed", "counter_changed",
+    "equipped", "targeted"};
+const std::vector<std::string> kEventNumeric = {
+    "turnsAgo",  // turns started since the event / 8, capped at 1
+    "recency",   // 0 = newest encoded event, 1 = oldest possible
+    "amount",    // life point change / 8000 (life point events only)
+    "count"};    // the event's count / 20, capped at 1
+
 const std::vector<std::string> kCandidateNumeric = {
     "hasSource", "targetCount", "effectIndex", "value", "faceUp", "attackPosition", "zone", "opponentSide",
     "variant"};
@@ -101,6 +114,31 @@ std::int64_t candidate_kind(const ActionCandidate& candidate) {
         return kind_index("assign_amount");
     }
     throw std::invalid_argument("cannot encode candidate " + candidate.semantic_key);
+}
+
+// Index into kEventKinds, or -1 for events not worth a memory slot: besides the kinds
+// left out of kEventKinds, the empty chain marker (MSG_CHAINED, no card, no player) and
+// the deciding player's own draws/hand reveals (its hand is visible anyway).
+std::int64_t remembered_kind(const observation::VisibleGameEvent& event, std::uint8_t self) {
+    using observation::VisibleEventKind;
+    switch (event.kind) {
+    case VisibleEventKind::TurnStarted: return 1;
+    case VisibleEventKind::CardMoved: return 2;
+    case VisibleEventKind::CardRevealed:
+        return event.player == self && event.to_zone == SemanticZone::Hand ? -1 : 3;
+    case VisibleEventKind::Summoned: return event.player ? 4 : -1;  // the engine also sends an empty "summoned" marker
+    case VisibleEventKind::Set: return 5;
+    case VisibleEventKind::LifePointsChanged: return 6;
+    case VisibleEventKind::ChainActivated: return event.player || event.public_passcode ? 7 : -1;
+    case VisibleEventKind::CardDestroyed: return 8;
+    case VisibleEventKind::CardBanished: return 9;
+    case VisibleEventKind::CardReturned: return 10;
+    case VisibleEventKind::PositionChanged: return 11;
+    case VisibleEventKind::CounterChanged: return 12;
+    case VisibleEventKind::Equipped: return 13;
+    case VisibleEventKind::Targeted: return 14;
+    default: return -1;
+    }
 }
 
 std::int64_t zone_index(SemanticZone zone) {
@@ -354,6 +392,93 @@ EncodedDecision encode(const PlayerObservation& observation, const DecisionReque
         out.candidate_numeric.insert(out.candidate_numeric.end(), std::begin(row), std::end(row));
     }
 
+    // Memory: the most recent events worth remembering, oldest first. Everything comes
+    // from the deciding player's event stream, which only names cards it could see.
+    //
+    // event_token links an event to the card token at the place it happened, but only
+    // while that is provably still the same card: walking from the newest event back,
+    // a field slot becomes unusable as soon as a later card arrives there, a card leaves
+    // its zone (we don't know which slot), or set cards are shuffled. Hand, graveyard
+    // and banished positions renumber constantly and are never linked.
+    {
+        struct Picked {
+            std::size_t index;
+            std::uint32_t turns_ago;
+            std::int64_t token;
+        };
+        std::vector<Picked> picked;
+        std::set<std::tuple<std::uint8_t, SemanticZone, std::string>> moved_slots;  // (player, zone, sequence)
+        std::set<std::pair<std::uint8_t, SemanticZone>> moved_zones;
+        std::uint32_t turns = 0;
+        const auto& events = observation.visible_events;
+        const auto sequence_of = [](const observation::ObservationLocator& locator) {
+            return locator.value.substr(locator.value.rfind(':') + 1);
+        };
+        for (auto it = events.rbegin(); it != events.rend(); ++it) {
+            const auto& event = *it;
+            if (picked.size() < kMaxEvents && remembered_kind(event, self) >= 0) {
+                std::int64_t token = -1;
+                if (event.entity && event.player && event.to_zone && on_field_zone(*event.to_zone) &&
+                    moved_zones.count({*event.player, *event.to_zone}) == 0 &&
+                    moved_slots.count({*event.player, *event.to_zone, sequence_of(*event.entity)}) == 0) {
+                    const auto found = token_of.find(event.entity->value);
+                    token = found == token_of.end() ? -1 : found->second;
+                }
+                picked.push_back({static_cast<std::size_t>(events.rend() - it - 1), turns, token});
+            }
+            // What this event changes for the older events still to come.
+            // Moves come as CardMoved or, for some, as their own kind (returned, destroyed, banished).
+            const bool move = event.kind == observation::VisibleEventKind::CardMoved ||
+                              event.kind == observation::VisibleEventKind::CardReturned ||
+                              event.kind == observation::VisibleEventKind::CardDestroyed ||
+                              event.kind == observation::VisibleEventKind::CardBanished;
+            if (move) {
+                if (event.entity && event.player && event.to_zone) {
+                    moved_slots.insert({*event.player, *event.to_zone, sequence_of(*event.entity)});
+                }
+                if (event.from_zone && on_field_zone(*event.from_zone)) {
+                    moved_zones.insert({0, *event.from_zone});  // either player: control can change
+                    moved_zones.insert({1, *event.from_zone});
+                }
+            } else if (event.kind == observation::VisibleEventKind::Shuffle && !event.player) {
+                for (const std::uint8_t player : {0, 1}) {  // set cards shuffled: no field slot is certain
+                    for (const auto zone : {SemanticZone::MonsterZone, SemanticZone::SpellTrapZone,
+                                            SemanticZone::FieldZone, SemanticZone::PendulumRelevant}) {
+                        moved_zones.insert({player, zone});
+                    }
+                }
+            } else if (event.kind == observation::VisibleEventKind::TurnStarted) {
+                ++turns;
+            }
+        }
+        for (std::size_t n = picked.size(); n-- > 0;) {
+            const auto& event = events[picked[n].index];
+            out.event_kind.push_back(remembered_kind(event, self));
+            std::int64_t card = 0;
+            if (event.public_passcode && *event.public_passcode != 0) {
+                const auto it = card_index.find(*event.public_passcode);
+                card = it == card_index.end() ? kUnknownCard : it->second;
+            }
+            out.event_card.push_back(card);
+            // A removed token has no destination, so no owner either.
+            const bool has_side = event.player && !(event.from_zone && !event.to_zone);
+            out.event_side.push_back(!has_side ? 2 : (*event.player == self ? 0 : 1));
+            out.event_from.push_back(event.from_zone ? zone_index(*event.from_zone) : 0);
+            out.event_to.push_back(event.to_zone ? zone_index(*event.to_zone) : 0);
+            out.event_token.push_back(picked[n].token);
+            const bool life_points = event.kind == observation::VisibleEventKind::LifePointsChanged;
+            const float row[] = {
+                std::min(static_cast<float>(picked[n].turns_ago) / 8.0f, 1.0f),
+                static_cast<float>(n) / static_cast<float>(kMaxEvents),
+                life_points && event.amount ? std::clamp(static_cast<float>(*event.amount) / 8000.0f, -1.0f, 1.0f)
+                                            : 0.0f,
+                static_cast<float>(std::min<std::uint32_t>(event.count.value_or(0), 20)) / 20.0f,
+            };
+            static_assert(std::size(row) == 4);
+            out.event_numeric.insert(out.event_numeric.end(), std::begin(row), std::end(row));
+        }
+    }
+
     // Globals, from the deciding player's point of view.
     const auto opponent = static_cast<std::uint8_t>(1 - self);
     const auto& lp = observation.globals.life_points;
@@ -392,5 +517,7 @@ const std::vector<std::string>& candidate_kind_names() { return kCandidateKinds;
 const std::vector<std::string>& token_numeric_names() { return kTokenNumeric; }
 const std::vector<std::string>& global_numeric_names() { return kGlobalNumeric; }
 const std::vector<std::string>& candidate_numeric_names() { return kCandidateNumeric; }
+const std::vector<std::string>& event_kind_names() { return kEventKinds; }
+const std::vector<std::string>& event_numeric_names() { return kEventNumeric; }
 
 }  // namespace ygo::encode

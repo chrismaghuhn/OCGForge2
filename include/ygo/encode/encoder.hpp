@@ -14,6 +14,8 @@ namespace ygo::encode {
 // match python/src/ocgforge/features.py; tests/test_core.py compares them
 // through the *_names() functions below.
 inline constexpr std::size_t kMaxTargets = 4;
+// Most recent public events encoded per decision (the model's memory of the duel).
+inline constexpr std::size_t kMaxEvents = 64;
 
 struct EncodedDecision {
     std::uint8_t player = 0;
@@ -30,6 +32,14 @@ struct EncodedDecision {
     std::vector<std::int64_t> candidate_zone;     // zone of the candidate's card or place, 0 = none
     std::vector<std::int64_t> candidate_targets;  // [candidates x kMaxTargets], token index or -1
     std::vector<float> candidate_numeric;         // [candidates x candidate_numeric_names().size()]
+    // Recent public events, oldest first, at most kMaxEvents.
+    std::vector<std::int64_t> event_kind;         // index into event_kind_names()
+    std::vector<std::int64_t> event_card;         // card index when the card was public, 0 = none
+    std::vector<std::int64_t> event_side;         // 0 = deciding player, 1 = opponent, 2 = neither
+    std::vector<std::int64_t> event_from;         // zone index, 0 = none
+    std::vector<std::int64_t> event_to;           // zone index, 0 = none
+    std::vector<std::int64_t> event_token;        // field card token the event happened to, only while provably the same card; -1 = none
+    std::vector<float> event_numeric;             // [events x event_numeric_names().size()]
 };
 
 // Passcode (including alternate artworks) -> model card index; anything else
@@ -48,5 +58,7 @@ const std::vector<std::string>& candidate_kind_names();
 const std::vector<std::string>& token_numeric_names();
 const std::vector<std::string>& global_numeric_names();
 const std::vector<std::string>& candidate_numeric_names();
+const std::vector<std::string>& event_kind_names();
+const std::vector<std::string>& event_numeric_names();
 
 }  // namespace ygo::encode
