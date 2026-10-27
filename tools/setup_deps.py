@@ -27,11 +27,13 @@ def git(*args: str, cwd: Path | None = None, check: bool = True) -> subprocess.C
 
 def checkout(name: str, spec: dict, cache: Path) -> Path:
     path = cache / name
-    if not path.exists():
+    fresh = not path.exists()
+    if fresh:
         print(f"fetching {name} @ {spec['commit'][:12]}", file=sys.stderr)
         git("clone", "--filter=blob:none", "--no-checkout", spec["repository"], str(path))
     head = git("rev-parse", "HEAD", cwd=path, check=False).stdout.strip()
-    if head != spec["commit"]:
+    # A fresh --no-checkout clone has no files yet, even when HEAD already is the pinned commit.
+    if fresh or head != spec["commit"]:
         git("fetch", "origin", spec["commit"], cwd=path, check=False)
         git("checkout", "--force", "--detach", spec["commit"], cwd=path)
     if spec.get("submodules"):
