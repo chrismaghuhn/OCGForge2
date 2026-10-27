@@ -7,8 +7,10 @@ decision is a features.py sample plus:
     logprob      its log-probability under the policy that played it
     value        the value head's estimate at the time
 
-grouped into one trajectory per (duel, seat), with the duel result from that seat's view
-(+1 win, -1 loss, 0 draw). Reward only arrives at the end.
+grouped into trajectories of one seat: (decisions, result) for a whole duel, with the duel result
+from that seat's view (+1 win, -1 loss, 0 draw), or (decisions, result, bootstrap) for a segment
+that the duel continues after: then `bootstrap` is the value at that seat's next decision (and
+result 0), or None when the duel ended after the segment. Reward only arrives at the end.
 """
 
 from __future__ import annotations
@@ -39,27 +41,30 @@ class PPOConfig:
     max_grad_norm: float = 0.5
 
 
-def gae(values: Sequence[float], final_reward: float, gamma: float, lam: float) -> tuple[list[float], list[float]]:
+def gae(values: Sequence[float], final_reward: float, gamma: float, lam: float,
+        bootstrap: float | None = None) -> tuple[list[float], list[float]]:
     """Generalized advantage estimation for a trajectory whose only reward arrives after the last
-    decision. Returns (advantages, returns); the episode ends after the last step (no bootstrap)."""
+    decision. Returns (advantages, returns). The episode ends after the last step, unless
+    `bootstrap` gives the value of the state that follows it."""
     advantages = [0.0] * len(values)
     running = 0.0
     for t in reversed(range(len(values))):
         last = t == len(values) - 1
         reward = final_reward if last else 0.0
-        next_value = 0.0 if last else values[t + 1]
+        next_value = (0.0 if bootstrap is None else bootstrap) if last else values[t + 1]
         delta = reward + gamma * next_value - values[t]
         running = delta + gamma * lam * running
         advantages[t] = running
     return advantages, [a + v for a, v in zip(advantages, values)]
 
 
-def build_steps(trajectories: Sequence[tuple[Sequence[dict], float]], gamma: float, lam: float) -> list[dict]:
-    """(decisions of one seat, final result) pairs -> decisions with `advantage` and `return`,
+def build_steps(trajectories: Sequence[tuple], gamma: float, lam: float) -> list[dict]:
+    """Trajectories (see the module docstring) -> decisions with `advantage` and `return`,
     advantages normalized over the whole batch."""
     steps: list[dict] = []
-    for decisions, result in trajectories:
-        advantages, returns = gae([float(d["value"]) for d in decisions], result, gamma, lam)
+    for decisions, result, *rest in trajectories:
+        bootstrap = rest[0] if rest else None
+        advantages, returns = gae([float(d["value"]) for d in decisions], result, gamma, lam, bootstrap)
         for decision, advantage, ret in zip(decisions, advantages, returns):
             steps.append({**decision, "advantage": advantage, "return": ret})
     if steps:

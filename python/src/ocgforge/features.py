@@ -119,6 +119,12 @@ _WIDTHS = {"token_numeric": (len(TOKEN_NUMERIC),), "candidate_targets": (MAX_TAR
 _TOKEN_FIELDS = ("token_card", "token_zone", "token_side", "token_numeric")
 _CANDIDATE_FIELDS = ("candidate_kind", "candidate_source", "candidate_card", "candidate_zone", "candidate_targets",
                      "candidate_numeric")
+# Smallest dtypes that hold each index field, for decisions kept in memory (collate widens them).
+_COMPACT = {**dict.fromkeys(("token_zone", "token_side", "candidate_kind", "candidate_zone", "event_kind",
+                             "event_side", "event_from", "event_to"), np.uint8),
+            **dict.fromkeys(("token_card", "candidate_card", "event_card", "candidate_source",
+                             "candidate_targets", "event_token"), np.int16)}
+MAX_COMPACT_CARDS = np.iinfo(np.int16).max
 _PAD_VALUES = {"token_side": 2, "candidate_source": -1, "candidate_targets": -1, "event_side": 2, "event_token": -1}
 
 
@@ -177,13 +183,19 @@ def from_padded(batch: dict, device: torch.device | str = "cpu") -> dict[str, to
 def row(batch: dict, i: int, copy: bool = False) -> dict:
     """Decision i of a recv_batch batch in the per-decision layout. Without `copy` the arrays are
     views into the batch, which keep the whole batch alive: copy anything you keep around. Copies
-    store indices as int32 (collate widens them again)."""
+    store indices in the smallest dtype that holds them (card indices below MAX_COMPACT_CARDS);
+    collate widens them again."""
     t, c, e = (int(batch[k][i]) for k in ("token_count", "candidate_count", "event_count"))
-    take = (lambda a: a.astype(np.int32) if a.dtype == np.int64 else a.copy()) if copy else (lambda a: a)
-    out = {name: take(batch[name][i, :t]) for name in _TOKEN_FIELDS}
-    out.update({name: take(batch[name][i, :c]) for name in _CANDIDATE_FIELDS})
-    out.update({name: take(batch[name][i, :e]) for name in _EVENT_FIELDS})
-    out["global_numeric"] = take(batch["global_numeric"][i])
+    if copy:
+        def take(name, a):
+            return a.astype(_COMPACT[name]) if name in _COMPACT else a.copy()
+    else:
+        def take(name, a):
+            return a
+    out = {name: take(name, batch[name][i, :t]) for name in _TOKEN_FIELDS}
+    out.update({name: take(name, batch[name][i, :c]) for name in _CANDIDATE_FIELDS})
+    out.update({name: take(name, batch[name][i, :e]) for name in _EVENT_FIELDS})
+    out["global_numeric"] = take("global_numeric", batch["global_numeric"][i])
     for name in ("phase", "decision", "player", "duel_decision"):
         out[name] = int(batch[name][i])
     return out

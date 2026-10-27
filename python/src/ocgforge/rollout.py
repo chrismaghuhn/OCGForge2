@@ -29,6 +29,8 @@ def vector_env(card_features: CardFeatures, decks: Sequence[Path | str], num_env
     """A VectorEnv whose card indices match `card_features` (e.g. model.card_features)."""
     from ._core import VectorEnv
 
+    if card_features.size > features.MAX_COMPACT_CARDS:
+        raise ValueError(f"{card_features.size} cards do not fit the compact int16 card indices of features.row")
     return VectorEnv(str(cache / "cardscripts"), str(cache / "card_data.tsv"), [str(d) for d in decks],
                      card_features.index_map(), num_envs=num_envs, seed=seed, threads=threads,
                      max_decisions=max_decisions)
@@ -130,48 +132,71 @@ def collect(env, policy: Policy, duels: int) -> tuple[list[tuple[list[dict], flo
     return trajectories, stats
 
 
-def collect_async(env, policy: Policy, duels: int, batch_size: int) -> tuple[list[tuple[list[dict], float]], RolloutStats]:
-    """Like collect, but with env.recv/send: the policy gets whichever `batch_size` envs are ready
-    first, so neither the engine nor the policy waits for the slowest duel. Use an env that is
-    driven only this way (not with step)."""
-    pending: dict[tuple[int, int], list[dict]] = {}
-    trajectories: list[tuple[list[dict], float]] = []
-    stats = RolloutStats()
-    fresh: dict[int, bool] = {}  # we saw env i's current duel from its first decision
-    while stats.duels + stats.errors < duels:
-        ids, batch, done, winners, errors = env.recv_batch(batch_size)
-        ids = ids.tolist()
-        for i, finished, winner, error in zip(ids, done.tolist(), winners.tolist(), errors):
-            if not finished:
-                continue
-            seats = [pending.pop((i, p), []) for p in (0, 1)]
-            was_fresh, fresh[i] = fresh.get(i, False), True
-            if not was_fresh:
-                continue
-            if error:
-                stats.errors += 1
-                stats.error_messages.append(error)
-                continue
-            stats.duels += 1
-            stats.wins[min(winner, 2)] += 1
-            for player, seat in enumerate(seats):
-                if seat:
-                    trajectories.append((seat, _result_for(player, winner)))
-        for i, first in zip(ids, (batch["duel_decision"] == 0).tolist()):
-            fresh.setdefault(i, first)
-        if not ids:  # every env is still handed out, e.g. by an earlier interrupted call
-            raise RuntimeError("recv_batch returned no envs: some envs were never sent an action")
-        if hasattr(policy, "on_batch"):
-            choices, logprobs, values = policy.on_batch(batch)
-        else:
-            choices, logprobs, values = policy([features.row(batch, n) for n in range(len(ids))])
-        for n, (i, choice, logprob, value) in enumerate(zip(ids, choices, logprobs, values)):
-            decision = features.row(batch, n, copy=True)  # compact: a view would keep the whole batch alive
-            decision.update(chosen=choice, logprob=logprob, value=value)
-            pending.setdefault((i, decision["player"]), []).append(decision)
-        env.send(ids, choices)
-        stats.decisions += len(ids)
-    return trajectories, stats
+class AsyncCollector:
+    """Self-play with env.recv_batch/send in segments: each seat of each env keeps at most `segment`
+    decisions; a full segment is handed out with the value of that seat's next decision as its
+    bootstrap, so memory does not grow with the length of a duel. The policy gets whichever
+    `batch_size` envs are ready first, so neither the engine nor the policy waits for the slowest
+    duel. Duels keep running between collect calls; at the end of a call every open segment is
+    handed out too, bootstrapped from its seat's latest decision, so at most that one decision per
+    seat (played by the policy before the update) carries over. Use an env driven only this way."""
+
+    def __init__(self, env, batch_size: int, segment: int = 128):
+        self.env, self.batch_size, self.segment = env, batch_size, segment
+        self.pending: dict[tuple[int, int], list[dict]] = {}
+
+    def collect(self, policy: Policy, steps: int, max_errors: int | None = None
+                ) -> tuple[list[tuple[list[dict], float, float | None]], RolloutStats]:
+        """Plays until at least `steps` decisions are in segments. Returns the segments as
+        (decisions, result, bootstrap) for ppo.build_steps. Failed duels (including ones that hit the
+        decision limit) drop their unfinished segments; more than `max_errors` failed duels (default:
+        10 per env) without a single kept decision raise, since nothing would ever be collected."""
+        max_errors = 10 * len(self.env) if max_errors is None else max_errors
+        segments: list[tuple[list[dict], float, float | None]] = []
+        stats = RolloutStats()
+        kept = 0
+        while kept < steps:
+            ids, batch, done, winners, errors = self.env.recv_batch(self.batch_size)
+            ids = ids.tolist()
+            if not ids:  # every env is still handed out, e.g. by an earlier interrupted call
+                raise RuntimeError("recv_batch returned no envs: some envs were never sent an action")
+            for i, finished, winner, error in zip(ids, done.tolist(), winners.tolist(), errors):
+                if not finished:
+                    continue
+                seats = [self.pending.pop((i, p), []) for p in (0, 1)]
+                if error:
+                    stats.errors += 1
+                    stats.error_messages.append(error)
+                    if kept == 0 and stats.errors > max_errors:
+                        raise RuntimeError(f"{stats.errors} duels failed before any decision was kept; last: {error}")
+                    continue
+                stats.duels += 1
+                stats.wins[min(winner, 2)] += 1
+                for player, seat in enumerate(seats):
+                    if seat:
+                        segments.append((seat, _result_for(player, winner), None))
+                        kept += len(seat)
+            if hasattr(policy, "on_batch"):
+                choices, logprobs, values = policy.on_batch(batch)
+            else:
+                choices, logprobs, values = policy([features.row(batch, n) for n in range(len(ids))])
+            for n, (i, choice, logprob, value) in enumerate(zip(ids, choices, logprobs, values)):
+                decision = features.row(batch, n, copy=True)  # compact: a view would keep the whole batch alive
+                decision.update(chosen=choice, logprob=logprob, value=value)
+                key = (i, decision["player"])
+                seat = self.pending.setdefault(key, [])
+                if len(seat) == self.segment:
+                    segments.append((seat, 0.0, float(value)))
+                    kept += len(seat)
+                    seat = self.pending[key] = []
+                seat.append(decision)
+            self.env.send(ids, choices)
+            stats.decisions += len(ids)
+        for key, seat in self.pending.items():
+            if len(seat) > 1:
+                segments.append((seat[:-1], 0.0, float(seat[-1]["value"])))
+                self.pending[key] = seat[-1:]
+        return segments, stats
 
 
 def match(env, policy_a: Policy, policy_b: Policy, duels: int, name_a: str = "a", name_b: str = "b",

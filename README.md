@@ -84,12 +84,15 @@ trajectories, stats = collect(env, ModelPolicy(model, device), duels=512)
 ppo_update(model, optimizer, build_steps(trajectories, gamma=1.0, lam=0.95), PPOConfig(), device)
 ```
 
-`rollout.collect_async(env, policy, duels, batch_size)` drives the same env with `recv_batch`/`send`
-instead, so the policy only waits for the first `batch_size` ready duels (faster with a GPU model).
+`rollout.AsyncCollector(env, batch_size, segment=128).collect(policy, steps)` drives the same env
+with `recv_batch`/`send` instead, so the policy only waits for the first `batch_size` ready duels
+(faster with a GPU model). It hands out segments of at most `segment` decisions per seat, cut-off
+ones with a value bootstrap; duels keep running across calls (only each seat's latest decision
+carries over), so memory does not depend on how long duels get.
 
-Memory: each env holds a duel engine (~5 MB) plus the trajectory of its running duel, ~9 KB per
-decision. Untrained policies play long duels (several thousand decisions), so budget up to ~50 MB per
-env: a few hundred envs on a 32 GB machine.
+Memory: each env holds a duel engine (~3.5–5.5 MB, all engines share the card data) plus up to two
+open segments of ~6 KB per decision, so ~7 MB per env with the default segment; the collected
+segments (`steps` decisions) come on top.
 
 `rollout.match(env, policy_a, policy_b, duels)` plays two policies against each other on both seats
 and returns results for `ladder.elo`.
