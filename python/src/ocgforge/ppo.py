@@ -132,11 +132,13 @@ def ppo_update(model: Model, optimizer: torch.optim.Optimizer, steps: Sequence[d
     """Clipped-PPO epochs over `steps` (from build_steps). Returns per-epoch mean stats; stops early
     once the approximate KL to the rollout policy exceeds 1.5 x target_kl.
 
-    Use a model without dropout (dropout noise would read as policy change in the ratio)."""
+    The forward passes run in eval mode: rollouts are played in eval mode, and dropout or name
+    dropout here would make the probability ratio and KL measure masking noise, not policy change.
+    Gradients flow as usual."""
     rng = random.Random(seed)
     history: list[dict[str, float]] = []
     for epoch in range(1, config.epochs + 1):
-        model.train()
+        model.eval()
         totals: dict[str, float] = defaultdict(float)
         batches = 0
         stopped = False

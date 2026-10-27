@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .cards import TYPE_LINK, TYPE_MONSTER, Card, CardFeatures, CardTable
+from .cards import TYPE_LINK, TYPE_MONSTER, Card, CardFeatures, CardTable, replace_own_name
 
 DEFAULT_ENCODER = "BAAI/bge-small-en-v1.5"
 
@@ -41,7 +41,7 @@ def card_sentence(card: Card) -> str:
         level = card.level & 0xFF
         parts.append(f"Link {level}" if card.type & TYPE_LINK else f"Level {level}")
     header = ", ".join(p for p in parts if p)
-    text = card.text.replace(f'"{card.name}"', "this card").replace(card.name, "this card").strip()
+    text = replace_own_name(card.text, card.name, "this card").strip()
     return f"{header}. {text}".strip()
 
 

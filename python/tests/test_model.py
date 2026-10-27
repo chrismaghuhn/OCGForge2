@@ -45,7 +45,8 @@ def test_name_dropout_only_while_training(card_features):
     model = Model(card_features, ModelConfig(d_model=16, heads=2, layers=1, ff=32, dropout=0.0, name_dropout=1.0))
     cards = torch.tensor([[2, 3]])
     model.eval()
-    assert not torch.equal(model.card_embedding(cards), model.card_embedding(torch.tensor([[1, 1]])))
+    kept = model.card_embedding(cards) - model.card_static(cards)
+    assert torch.allclose(kept, model.name(cards), atol=1e-6)
     model.train()
     # With every name dropped, a card only differs from "unknown" by its static features.
     dropped = model.card_embedding(cards) - model.card_static(cards)
@@ -75,3 +76,10 @@ def test_checkpoint_roundtrip(card_features, tmp_path):
         torch.testing.assert_close(a, b)
     assert loaded.card_features.text_vocab == card_features.text_vocab
     np.testing.assert_array_equal(loaded.card_features.text, card_features.text)
+
+
+def test_text_embeddings_are_required_when_enabled(card_features):
+    import pytest
+
+    with pytest.raises(ValueError, match="text_embeddings"):
+        Model(card_features, ModelConfig(d_model=16, heads=2, layers=1, ff=32, text_embedding_dim=8))

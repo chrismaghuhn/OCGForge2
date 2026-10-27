@@ -23,7 +23,7 @@ UNK = 1
 
 MAX_TYPES = 8
 MAX_SETCODES = 8  # up to 4 setcodes, each as full value and as base archetype
-MAX_TEXT = 192  # unigram + bigram ids per card
+MAX_TEXT = 192  # unigram + bigram ids per card; ~8% of cards lose some trailing bigrams
 ARTWORK_ALIAS_RANGE = 20
 
 TYPE_MONSTER = 0x1
@@ -47,10 +47,16 @@ CARD_NUMERIC = (
 _TOKEN = re.compile(r"~|[a-z]+(?:'[a-z]+)?|\d+")
 
 
+def replace_own_name(text: str, name: str, replacement: str) -> str:
+    """Replace the card's own name, quoted or not, but never inside a longer word."""
+    if not name:
+        return text
+    return re.sub(rf'"{re.escape(name)}"|(?<!\w){re.escape(name)}(?!\w)', replacement, text)
+
+
 def tokenize(text: str, name: str = "") -> list[str]:
     """Card text -> lowercase word tokens; the card's own name becomes `~`, `<nl>` between lines."""
-    if name:
-        text = text.replace(f'"{name}"', "~").replace(name, "~")
+    text = replace_own_name(text, name, "~")
     tokens: list[str] = []
     for line in text.lower().split("\n"):
         words = _TOKEN.findall(line)
@@ -198,7 +204,8 @@ class CardFeatures:
             types[i, : len(type_ids)] = type_ids
             attribute[i] = next((b + 2 for b in _bits(card.attribute, 8)), PAD)
             race[i] = next((b + 2 for b in _bits(card.race, 64)), PAD)
-            set_ids = [setcode_vocab.get(v, UNK) for s in card.setcodes for v in (s, s & 0x0FFF)][:MAX_SETCODES]
+            set_ids = list(dict.fromkeys(setcode_vocab.get(v, UNK) for s in card.setcodes
+                                         for v in (s, s & 0x0FFF)))[:MAX_SETCODES]
             setcodes[i, : len(set_ids)] = set_ids
             numeric[i] = card_numeric(card)
             term_ids = [text_vocab.get(t, UNK) for t in text_terms(card.text, card.name)][:MAX_TEXT]

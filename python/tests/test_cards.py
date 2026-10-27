@@ -11,6 +11,21 @@ def test_tokenize_replaces_own_name_and_marks_lines():
     assert "~ is" in text_terms('"Test Warrior" is', "Test Warrior")
 
 
+def test_own_name_is_not_replaced_inside_longer_words():
+    assert tokenize("Hyenas gain 7 ATK; Hyena is great.", "Hyena") == \
+        ["hyenas", "gain", "7", "atk", "~", "is", "great", "<nl>"]
+
+
+def test_base_archetype_counts_once_for_plain_members():
+    table = make_table()
+    plain = table.cards[0].__class__(1005, "Plain", "", 0x21, 0x10, 0x1, 4, 0, 0, 0x00D2)
+    table.cards.append(plain)
+    table.index_of[1005] = len(table.cards) + 1
+    features = CardFeatures.build(table, min_term_count=1)
+    row = features.setcodes[features.index_map()[1005]]
+    assert sorted(i for i in row if i) == [features.setcode_vocab[0x00D2]]
+
+
 def test_alternate_artwork_shares_the_card_index():
     table = make_table()
     assert table.index(1004) == table.index(1001)

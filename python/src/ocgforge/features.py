@@ -35,6 +35,7 @@ DECISIONS = ("<pad>", "idle_command", "battle_command", "chain", "option", "card
 ZONES = ("<pad>", "unknown", "main_deck", "hand", "monster_zone", "spell_trap_zone", "graveyard", "banished",
          "extra_deck", "field_zone", "pendulum_zone", "overlay", "chain")
 
+# Index = log2(PHASE_* bit) + 1.
 PHASES = ("<pad>", "draw", "standby", "main1", "battle_start", "battle_step", "damage", "damage_calculation",
           "battle", "main2", "end")
 
@@ -87,6 +88,8 @@ CANDIDATE_NUMERIC = (
     "zone",  # place candidates: column / 7
 )
 
+_WIDTHS = {"token_numeric": (len(TOKEN_NUMERIC),), "candidate_targets": (MAX_TARGETS,),
+           "candidate_numeric": (len(CANDIDATE_NUMERIC),)}
 _TOKEN_FIELDS = ("token_card", "token_zone", "token_side", "token_numeric")
 _CANDIDATE_FIELDS = ("candidate_kind", "candidate_source", "candidate_targets", "candidate_numeric")
 _PAD_VALUES = {"token_side": 2, "candidate_source": -1, "candidate_targets": -1}
@@ -96,18 +99,20 @@ def collate(samples: Sequence[dict], device: torch.device | str = "cpu") -> dict
     """Pad decisions into one batch. Adds `token_pad` and `candidate_pad` (True = padding)."""
     if not samples:
         raise ValueError("cannot collate an empty batch")
+    for i, s in enumerate(samples):
+        check(s, f"decision {i}")
     b = len(samples)
     t = max(1, max(len(s["token_card"]) for s in samples))
     c = max(len(s["candidate_kind"]) for s in samples)
     out: dict[str, torch.Tensor] = {}
     for name in _TOKEN_FIELDS + _CANDIDATE_FIELDS:
-        first = np.asarray(samples[0][name])
-        width = (t if name.startswith("token") else c,) + first.shape[1:]
+        width = (t if name.startswith("token") else c,) + _WIDTHS.get(name, ())
         dtype = np.float32 if name.endswith("numeric") else np.int64
         array = np.full((b, *width), _PAD_VALUES.get(name, 0), dtype=dtype)
         for i, s in enumerate(samples):
             values = np.asarray(s[name], dtype=dtype)
-            array[i, : len(values)] = values
+            if len(values):  # an empty list has shape (0,), not (0, width)
+                array[i, : len(values)] = values
         out[name] = torch.from_numpy(array)
     token_counts = torch.tensor([len(s["token_card"]) for s in samples])
     candidate_counts = torch.tensor([len(s["candidate_kind"]) for s in samples])
@@ -119,3 +124,16 @@ def collate(samples: Sequence[dict], device: torch.device | str = "cpu") -> dict
         if name in samples[0]:
             out[name] = torch.tensor([int(s[name]) for s in samples])
     return {k: v.to(device, non_blocking=True) for k, v in out.items()}
+
+
+def check(sample: dict, where: str = "decision") -> None:
+    """Reject inputs the model would silently mis-read: no candidates (all scores -inf, NaN loss),
+    and candidate source/target indices outside the decision's own tokens (these would read
+    another sample's padding once batched)."""
+    tokens = len(sample["token_card"])
+    if len(sample["candidate_kind"]) == 0:
+        raise ValueError(f"{where}: no candidates")
+    for name in ("candidate_source", "candidate_targets"):
+        values = np.asarray(sample[name])
+        if values.size and (values.min() < -1 or values.max() >= tokens):
+            raise ValueError(f"{where}: {name} must be -1 or a token index below {tokens}")

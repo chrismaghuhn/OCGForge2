@@ -71,6 +71,18 @@ def test_update_makes_rewarded_choices_more_likely(card_features):
     assert mean_prob_first() > before + 0.05
 
 
+def test_unchanged_policy_is_not_mistaken_for_policy_change(card_features):
+    """Default config (name dropout on): with lr 0 the policy cannot move, so no early stop."""
+    torch.manual_seed(0)
+    model = Model(card_features, ModelConfig(d_model=32, heads=2, layers=1, ff=64))
+    decisions = _rollout(model, np.random.default_rng(3), card_features.size, 64)
+    steps = build_steps([([d], 1.0 if d["chosen"] == 0 else -1.0) for d in decisions], 1.0, 0.95)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    history = ppo_update(model, optimizer, steps, PPOConfig(epochs=2, batch_size=16, target_kl=0.001))
+    assert len(history) == 2 and not history[-1]["stoppedEarly"]
+    assert abs(history[0]["approxKl"]) < 1e-6
+
+
 def test_update_stops_early_at_target_kl(card_features):
     torch.manual_seed(0)
     model = Model(card_features, SMALL)

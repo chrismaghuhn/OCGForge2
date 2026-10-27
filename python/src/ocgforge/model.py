@@ -65,8 +65,9 @@ class Model(nn.Module):
         self.register_buffer("card_text", torch.from_numpy(f.text))
         self.register_buffer("card_seen", torch.from_numpy(f.seen))
         if config.text_embedding_dim > 0:
-            rows = (torch.from_numpy(np.asarray(text_embeddings, dtype=np.float32)) if text_embeddings is not None
-                    else torch.zeros(f.size, config.text_embedding_dim))
+            if text_embeddings is None:
+                raise ValueError("text_embedding_dim > 0 needs text_embeddings (embed_cards.load_text_embeddings)")
+            rows = torch.from_numpy(np.asarray(text_embeddings, dtype=np.float32))
             if rows.shape != (f.size, config.text_embedding_dim):
                 raise ValueError(f"text embeddings must be {(f.size, config.text_embedding_dim)}, got {tuple(rows.shape)}")
             self.register_buffer("card_textemb", rows)
@@ -181,7 +182,8 @@ def load_checkpoint(directory: Path, device: torch.device | str = "cpu", dropout
     if dropout is not None:
         config = replace(config, dropout=dropout)
     card_features = CardFeatures.from_json(json.loads((directory / CARDS_FILE).read_text(encoding="utf-8")))
-    model = Model(card_features, config)
+    placeholder = np.zeros((card_features.size, config.text_embedding_dim), np.float32)  # filled by the weights
+    model = Model(card_features, config, text_embeddings=placeholder if config.text_embedding_dim else None)
     model.load_state_dict(load_file(str(directory / WEIGHTS_FILE)))
     # Keep the numpy rows in sync with the loaded buffers, so saving again writes the same table.
     for name, attr in (("card_types", "types"), ("card_attribute", "attribute"), ("card_race", "race"),
