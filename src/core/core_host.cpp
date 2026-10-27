@@ -18,7 +18,7 @@ namespace ygo::core {
 
 struct CoreHost::Impl {
     OCG_DuelOptions options{};
-    detail::CardDataStore card_data;
+    std::shared_ptr<const detail::CardDataStore> card_data;
     detail::CardDataCallbackContext card_data_payload;
     detail::ScriptStore scripts;
     std::string callback_error;
@@ -26,10 +26,11 @@ struct CoreHost::Impl {
     std::pair<detail::ScriptStore*, std::string*> script_payload;
     OCG_Duel duel = nullptr;
 
-    explicit Impl(const std::filesystem::path& script_root,
+    explicit Impl(const std::filesystem::path& card_data_tsv, const std::filesystem::path& script_root,
                   const std::vector<std::uint32_t>& required_script_codes
                   )
-        : card_data_payload{&card_data, &callback_error},
+        : card_data(detail::CardDataStore::shared(card_data_tsv)),
+          card_data_payload{card_data.get(), &callback_error},
           scripts(script_root, required_script_codes
           ),
           script_payload(&scripts, &callback_error) {}
@@ -47,13 +48,12 @@ CoreHost::CoreHost(CoreHostConfig config) : config_(std::move(config)) {
         throw CoreError(CoreErrorCode::Lifecycle, "OCG_GetVersion",
                         "expected 11.0, got " + std::to_string(api_major_) + "." + std::to_string(api_minor_));
     }
-    impl_ = new Impl(config_.card_scripts_root, config_.required_script_codes
+    impl_ = new Impl(config_.card_data_tsv, config_.card_scripts_root, config_.required_script_codes
     );
     try {
-        impl_->card_data.load(config_.card_data_tsv);
         // Plain Normal Monsters and tokens have no script (Normal Pendulum Monsters do).
         for (const auto code : config_.required_script_codes) {
-            const auto data = impl_->card_data.snapshot(code);
+            const auto data = impl_->card_data->snapshot(code);
             if (data && (((data->type & TYPE_NORMAL) != 0 && (data->type & TYPE_PENDULUM) == 0) ||
                          (data->type & TYPE_TOKEN) != 0)) {
                 impl_->scripts.not_required(code);
@@ -73,7 +73,7 @@ CoreHost::CoreHost(CoreHostConfig config) : config_(std::move(config)) {
         options.logHandler = detail::log_callback;
         options.payload3 = &impl_->log;
         options.cardReaderDone = detail::card_data_done_callback;
-        options.payload4 = &impl_->card_data;
+        options.payload4 = nullptr;
         options.enableUnsafeLibraries = 0;
 
         const int status = OCG_CreateDuel(&impl_->duel, &options);
@@ -258,7 +258,7 @@ CoreHostMetrics CoreHost::metrics() const noexcept {
 }
 
 std::optional<StaticCardData> CoreHost::static_card_data(std::uint32_t code) const {
-    return impl_->card_data.snapshot(code);
+    return impl_->card_data->snapshot(code);
 }
 
 }  // namespace ygo::core

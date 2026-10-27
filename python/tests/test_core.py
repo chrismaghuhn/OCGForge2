@@ -135,24 +135,39 @@ def test_padded_batches_match_collated_decisions(card_features):
         for key, value in padded.items():
             assert torch.equal(collated[key], value), key
         for i, decision in enumerate(decisions):
-            view = features.row(batch, i)
+            view, compact = features.row(batch, i), features.row(batch, i, copy=True)
             for key, value in decision.items():
                 assert np.array_equal(np.asarray(view[key]), np.asarray(value)), key
+                assert np.array_equal(np.asarray(compact[key]), np.asarray(value)), key
+        assert torch.equal(features.collate([features.row(batch, i, copy=True) for i in range(len(ids_b))])["token_card"],
+                           collated["token_card"])
         actions = [int(rng.integers(len(d["candidate_kind"]))) for d in decisions]
         a.send(ids_a, actions)
         b.send(list(ids_b), actions)
 
 
-def test_async_self_play_rollout_feeds_a_ppo_update(card_features):
+def test_async_segments_feed_a_ppo_update(card_features):
     torch.manual_seed(0)
     model = Model(card_features, ModelConfig(d_model=32, heads=2, layers=1, ff=64, dropout=0.0))
     env = rollout.vector_env(card_features, DECKS, num_envs=8, seed=6)
-    trajectories, stats = rollout.collect_async(env, rollout.ModelPolicy(model), duels=4, batch_size=4)
+    collector = rollout.AsyncCollector(env, batch_size=4, segment=16)
+    policy = rollout.ModelPolicy(model)
+    segments, stats = collector.collect(policy, steps=300)
+    assert all(len(seat) == 1 for seat in collector.pending.values())  # only the latest decision carries over
+    more, more_stats = collector.collect(policy, steps=300)  # duels carry over between calls
+    segments += more
+    assert sum(len(s) for s, _, _ in segments) >= 600
+    assert all(1 <= len(s) <= 16 for s, _, _ in segments)
+    cut = [(s, result) for s, result, bootstrap in segments if bootstrap is not None]
+    assert cut and all(result == 0.0 for _, result in cut) and any(len(s) == 16 for s, _ in cut)
+    for decisions, _, _ in segments:  # one seat of one duel, in order
+        assert len({d["player"] for d in decisions}) == 1
+        assert all(a["duel_decision"] < b["duel_decision"] for a, b in zip(decisions, decisions[1:]))
     # Which duel an env plays next depends on thread timing here, so now and then one is stopped by
     # the loop protection or the Lua budget; only that kind of error is fine.
-    assert stats.duels >= 1 and stats.duels + stats.errors >= 4
-    assert all("stuck" in m or "budget" in m for m in stats.error_messages), stats.error_messages
-    assert {result for _, result in trajectories} <= {-1.0, 0.0, 1.0}
-    steps = build_steps(trajectories, gamma=1.0, lam=0.95)
+    errors = stats.error_messages + more_stats.error_messages
+    assert all("stuck" in m or "budget" in m for m in errors), errors
+    assert {result for _, result, _ in segments} <= {-1.0, 0.0, 1.0}
+    steps = build_steps(segments, gamma=1.0, lam=0.95)
     history = ppo_update(model, torch.optim.AdamW(model.parameters(), lr=1e-4), steps, PPOConfig(epochs=1, batch_size=256))
     assert history and np.isfinite(history[0]["loss"])

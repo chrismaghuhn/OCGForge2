@@ -19,6 +19,14 @@ def test_gae_with_terminal_reward_only():
     assert advantages == pytest.approx([0.0, -1.5])  # lam 0: one-step TD errors
 
 
+def test_gae_bootstraps_a_cut_off_segment():
+    advantages, returns = gae([0.25, 0.5], 0.0, gamma=1.0, lam=1.0, bootstrap=0.75)
+    assert advantages == pytest.approx([0.5, 0.25])
+    assert returns == pytest.approx([0.75, 0.75])
+    steps = build_steps([([{"value": 0.25}, {"value": 0.5}], 0.0, 0.75), ([{"value": 0.0}], 1.0)], 1.0, 1.0)
+    assert [s["return"] for s in steps] == pytest.approx([0.75, 0.75, 1.0])
+
+
 def test_build_steps_normalizes_advantages():
     trajectory = [{"value": 0.0}, {"value": 0.2}, {"value": -0.1}]
     steps = build_steps([(trajectory, 1.0), (trajectory, -1.0)], gamma=1.0, lam=0.95)

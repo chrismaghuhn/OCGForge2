@@ -1,6 +1,8 @@
 #include "card_data_reader.hpp"
 
 #include <fstream>
+#include <map>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -52,7 +54,22 @@ void CardDataStore::load(const std::filesystem::path& path) {
     }
 }
 
-void CardDataStore::read(std::uint32_t code, OCG_CardData* output) {
+std::shared_ptr<const CardDataStore> CardDataStore::shared(const std::filesystem::path& path) {
+    // Never destroyed: worker threads may still start duels while the process exits.
+    static auto* mutex = new std::mutex;
+    static auto* cache = new std::map<std::filesystem::path, std::weak_ptr<const CardDataStore>>;
+    std::lock_guard lock(*mutex);
+    auto& weak = (*cache)[path];
+    if (auto store = weak.lock()) {
+        return store;
+    }
+    auto store = std::make_shared<CardDataStore>();
+    store->load(path);
+    weak = store;
+    return store;
+}
+
+void CardDataStore::read(std::uint32_t code, OCG_CardData* output) const {
     if (output == nullptr) {
         throw std::runtime_error("card data callback received null output");
     }
@@ -118,8 +135,6 @@ void card_data_callback(void* payload, std::uint32_t code, OCG_CardData* output)
     }
 }
 
-void card_data_done_callback(void* payload, OCG_CardData* data) {
-    static_cast<CardDataStore*>(payload)->release(data);
-}
+void card_data_done_callback(void*, OCG_CardData*) {}
 
 }  // namespace ygo::core::detail

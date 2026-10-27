@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -14,10 +15,13 @@ namespace ygo::core::detail {
 
 class CardDataStore final {
 public:
+    // One store per file and process, shared by every duel (read-only, so thread-safe); read
+    // again only once no duel holds it any more.
+    static std::shared_ptr<const CardDataStore> shared(const std::filesystem::path& path);
+
     void load(const std::filesystem::path& path);
-    void read(std::uint32_t code, OCG_CardData* output);
+    void read(std::uint32_t code, OCG_CardData* output) const;
     std::optional<StaticCardData> snapshot(std::uint32_t code) const;
-    void release(OCG_CardData*) noexcept {}
 
 private:
     struct Record {
@@ -28,7 +32,7 @@ private:
 };
 
 struct CardDataCallbackContext {
-    CardDataStore* store = nullptr;
+    const CardDataStore* store = nullptr;
     std::string* error = nullptr;
 };
 
