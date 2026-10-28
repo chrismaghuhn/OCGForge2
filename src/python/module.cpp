@@ -16,6 +16,8 @@
 #include <vector>
 
 #include "ygo/client/client_duel.hpp"
+#include "ygo/core/deck.hpp"
+#include "ygo/duel/duel.hpp"
 #include "ygo/encode/vector_env.hpp"
 #include "ygo/protocol/message_decoder.hpp"
 
@@ -252,6 +254,51 @@ NB_MODULE(_core, m) {
         .def_prop_ro("start_failures", &VectorEnv::start_failures,
                      "Duels that failed to start and were replaced; nonzero usually means a deck problem.")
         .def_prop_ro("last_start_failure", &VectorEnv::last_start_failure);
+
+    using ygo::duel::Duel;
+    nb::class_<Duel>(m, "Duel",
+                     "One duel on our engine, as VectorEnv plays it: same seed, decks, starting player and answers "
+                     "give the same duel, so search can try a line by replaying a duel's actions.")
+        .def(
+            "__init__",
+            [](Duel* self, const std::string& card_scripts_root, const std::string& card_data_tsv,
+               const std::string& deck0, const std::string& deck1, std::uint64_t seed, std::uint8_t starting_player,
+               std::uint64_t max_decisions) {
+                ygo::duel::DuelConfig config;
+                config.card_scripts_root = card_scripts_root;
+                config.card_data_tsv = card_data_tsv;
+                config.deck0 = ygo::core::load_deck(deck0);
+                config.deck1 = ygo::core::load_deck(deck1);
+                config.seed = seed;
+                config.starting_player = starting_player;
+                config.max_decisions = max_decisions;
+                new (self) Duel(std::move(config));
+            },
+            "card_scripts_root"_a, "card_data_tsv"_a, "deck0"_a, "deck1"_a, "seed"_a, "starting_player"_a,
+            "max_decisions"_a = 5000)
+        .def("act", &Duel::act, "semantic_key"_a, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("finished", &Duel::finished)
+        .def_prop_ro("winner", [](const Duel& d) -> std::optional<std::uint8_t> {
+            return d.result() ? std::optional(d.result()->winner) : std::nullopt;
+        })
+        .def_prop_ro("decision_count", &Duel::decision_count)
+        .def_prop_ro("player", [](const Duel& d) { return d.request().player; })
+        .def("keys", [](const Duel& d) {
+            std::vector<std::string> keys;
+            for (const auto& candidate : d.request().candidates) keys.push_back(candidate.semantic_key);
+            return keys;
+        })
+        .def_prop_ro("turn", [](const Duel& d) -> std::uint32_t {
+            const auto* o = d.observation();
+            return o && o->globals.turn_count ? *o->globals.turn_count : 0;
+        })
+        .def_prop_ro("turn_player", [](const Duel& d) -> std::uint8_t {
+            const auto* o = d.observation();
+            return o && o->globals.turn_player ? *o->globals.turn_player : 255;
+        })
+        .def("encode", [](const Duel& d, const ygo::encode::CardIndex& card_index) {
+            return to_dict(ygo::encode::encode(*d.observation(), d.request(), card_index));
+        }, "card_index"_a, "The pending decision as model input (one row, like features.row).");
 
     using ygo::client::ClientDuel;
     auto to_vector = [](const nb::bytes& bytes) {
