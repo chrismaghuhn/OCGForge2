@@ -2,6 +2,7 @@
 
     python -m ocgforge.edopro.client --deck decks/elfnote.ydk --checkpoint runs/focus-large-s0/latest \\
         --record runs/edopro/duel.bin
+    python -m ocgforge.edopro.client --port 7920 --create --password bench ...  # host on Multirole
 
 The room is created in EDOPro (LAN/host, Master Rule 2020: the rules the model is trained on). The
 bot sends its deck, gets ready, and once the host starts, plays rock paper scissors, goes first if it
@@ -40,7 +41,8 @@ def main_deck(path: Path) -> list[int]:
 
 class Bot:
     def __init__(self, deck: Path, name: str, password: str, seed: int, record: Path | None,
-                 checkpoint: Path | None = None, sample: bool = False, device: str = "cpu"):
+                 checkpoint: Path | None = None, sample: bool = False, device: str = "cpu", create: bool = False,
+                 duels: int = 0):
         from .._core import ClientDuel
 
         self.ClientDuel = ClientDuel
@@ -55,6 +57,10 @@ class Bot:
             self.policy = rollout.ModelPolicy(model, device, sample=sample, seed=seed)
             self.index = model.card_features.index_map()
         self.name, self.password = name, password
+        self.create = create  # host the room (on a server such as Multirole) instead of joining one
+        self.seat = None
+        self.duels = duels  # leave after this many duels (0 = keep accepting rematches)
+        self.finished = 0
         self.rng = random.Random(seed)
         self.record = open(record, "wb", buffering=0) if record else None  # complete even after a crash
         self.duel = None
@@ -73,7 +79,7 @@ class Bot:
     async def run(self, host: str, port: int) -> None:
         reader, self.writer = await asyncio.open_connection(host, port)
         self.send(p.player_info(self.name))
-        self.send(p.join_game(self.password))
+        self.send(p.create_game(self.password) if self.create else p.join_game(self.password))
         buffer = bytearray()
         while not self.done:
             chunk = await reader.read(65536)
@@ -97,8 +103,14 @@ class Bot:
             print(f"joined the room ({rules})", flush=True)
             self.send(p.update_deck(*self.deck))
             self.send(p.packet(p.CTOS_HS_READY))
+        elif kind == p.STOC_CREATE_GAME:
+            print(f"room {struct.unpack_from('<I', payload)[0]} created", flush=True)
+        elif kind == p.STOC_HS_PLAYER_CHANGE:
+            # The host starts the duel once the other duelist is ready (the bot always is).
+            if self.create and payload[0] >> 4 != self.seat and payload[0] & 0xF == p.PLAYERCHANGE_READY:
+                self.send(p.packet(p.CTOS_HS_START))
         elif kind == p.STOC_TYPE_CHANGE:
-            seat = payload[0] & 0xF
+            seat = self.seat = payload[0] & 0xF
             if seat == 7:  # NETPLAYER_TYPE_OBSERVER: the duelist seats are taken or a duel is running
                 print("joined as a spectator: no free duelist seat (or a duel is running); leaving", flush=True)
                 self.send(p.packet(p.CTOS_LEAVE_GAME))
@@ -149,6 +161,11 @@ class Bot:
             return
         if self.duel.finished:
             print(f"duel over, winner {self.duel.winner}", flush=True)
+            self.finished += 1
+            if self.duels and self.finished >= self.duels:
+                self.send(p.packet(p.CTOS_LEAVE_GAME))
+                self.done = True
+            return
         if not asked:
             return
         while True:
@@ -181,17 +198,22 @@ def main(argv=None) -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7911)
     parser.add_argument("--password", default="")
+    parser.add_argument("--create", action="store_true",
+                        help="create the room (with --password) instead of joining one: needs a server such as "
+                             "Multirole; prints 'room <id> created' for the other player to join")
     parser.add_argument("--name", default="OCGForge")
     parser.add_argument("--deck", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--record", type=Path)
+    parser.add_argument("--duels", type=int, default=0, help="leave after this many duels (0 = no limit)")
     parser.add_argument("--checkpoint", type=Path, help="model checkpoint directory, e.g. runs/x/latest")
     parser.add_argument("--sample", action="store_true", help="sample answers instead of the most likely")
     parser.add_argument("--device", default="cpu")
     args = parser.parse_args(argv)
     if args.record:
         args.record.parent.mkdir(parents=True, exist_ok=True)
-    bot = Bot(args.deck, args.name, args.password, args.seed, args.record, args.checkpoint, args.sample, args.device)
+    bot = Bot(args.deck, args.name, args.password, args.seed, args.record, args.checkpoint, args.sample, args.device,
+              args.create, args.duels)
     try:
         asyncio.run(bot.run(args.host, args.port))
     finally:

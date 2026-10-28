@@ -18,11 +18,13 @@ CTOS_UPDATE_DECK = 0x02
 CTOS_HAND_RESULT = 0x03
 CTOS_TP_RESULT = 0x04
 CTOS_PLAYER_INFO = 0x10
+CTOS_CREATE_GAME = 0x11
 CTOS_JOIN_GAME = 0x12
 CTOS_LEAVE_GAME = 0x13
 CTOS_TIME_CONFIRM = 0x15
 CTOS_HS_TODUELIST = 0x20
 CTOS_HS_READY = 0x22
+CTOS_HS_START = 0x25
 CTOS_REMATCH_RESPONSE = 0xF0
 
 # server to client
@@ -34,6 +36,7 @@ STOC_HAND_RESULT = 0x05
 STOC_TP_RESULT = 0x06
 STOC_CHANGE_SIDE = 0x07
 STOC_WAITING_SIDE = 0x08
+STOC_CREATE_GAME = 0x11
 STOC_JOIN_GAME = 0x12
 STOC_TYPE_CHANGE = 0x13
 STOC_LEAVE_GAME = 0x14
@@ -52,6 +55,9 @@ STOC_CHAT_2 = 0xF3
 STOC_NEW_REPLAY = 0x30
 
 STOC_NAMES = {v: k for k, v in globals().items() if k.startswith("STOC_") and isinstance(v, int)}
+
+PLAYERCHANGE_READY = 0x9
+SERVER_HANDSHAKE = 4043399681
 
 MSG_RETRY = 1
 MSG_START = 4
@@ -96,6 +102,22 @@ def join_game(password: str = "", game_id: int = 0) -> bytes:
     # u16 version, 2 bytes padding, u32 game id, password[20], client version (4 x u8): 52 bytes
     payload = struct.pack("<HxxI", PRO_VERSION, game_id) + utf16(password) + bytes(CLIENT_VERSION)
     return packet(CTOS_JOIN_GAME, payload)
+
+
+def create_game(password: str, duel_flags: int = 0x2E800, time_limit: int = 0) -> bytes:
+    """Create a 1v1 room (a server such as Multirole; EDOPro's own LAN host cannot be created
+    remotely): no deck checks, any deck size, Master Rule 2020 unless duel_flags say otherwise.
+    HostInfo is 68 bytes (gframe/network.h), then name[20], pass[20], notes[200]."""
+    host_info = struct.pack(
+        "<IBBBBB3xIBBHII4siiiIIH6H2x",  # deck limits right after extra rules, then padding
+        0, 3, 0, 0, 1, 0,  # banlist hash, allowed cards (all), mode, duel rule, no deck check, shuffle
+        8000, 5, 1, time_limit,  # LP, starting hand, draw per turn, seconds (0 = none)
+        duel_flags >> 32, SERVER_HANDSHAKE, bytes(CLIENT_VERSION),
+        1, 1, 1,  # one player per team, best of 1
+        duel_flags & 0xFFFFFFFF, 0, 0,  # forbidden types, extra rules
+        0, 999, 0, 999, 0, 999)  # main, extra, side deck size limits
+    assert len(host_info) == 68
+    return packet(CTOS_CREATE_GAME, host_info + utf16("") + utf16(password) + bytes(200))
 
 
 def update_deck(main_and_extra: list[int], side: list[int]) -> bytes:

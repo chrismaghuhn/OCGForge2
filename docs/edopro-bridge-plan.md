@@ -151,3 +151,16 @@ Damit ist das größte Risiko weg: Unser Decoder versteht EDOPro vollständig. N
 - Die echten Aufzeichnungen (642 Fragen) baut `ClientDuel` fehlerfrei zu Modelleingaben.
 - `ocgforge.edopro.client --checkpoint …` lässt das Modell spielen (Standard: wahrscheinlichste
   Antwort); die Regeln kommen aus dem Raum, Abweichung von Master Rule 2020 wird gemeldet.
+
+## Benchmark gegen WindBot (2026-10-28)
+
+Lokaler Server: [Multirole](https://github.com/ProjectIgnis/Multirole) in `.cache/multirole` (Meson-Build;
+Systempakete libfmt-dev libgit2-dev libsqlite3-dev libboost-all-dev). `run/config.json` nimmt unsere
+gepinnten Kartenskripte und Datenbanken (`.cache/cardscripts`, `.cache/babelcdb`) und unsere gepatchte
+ocgcore als `libocgcore.so` (Meson-Build von `.cache/ocgcore`, als lokales Git-Repo `local-bin`); Räume
+auf Port 7920, Lobby 7921. WindBot (EDOPro-Installation, braucht mono) tritt per `RoomId` bei.
+
+    python -m ocgforge.edopro.windbot --checkpoint runs/focus-large-s0/latest --duels 10
+
+Unser Bot erstellt je Paarung einen Raum (`client --create`), WindBot spielt eines seiner 41
+Master-Rule-5-Decks, beide nehmen Revanchen an. Erster Test (Elfnote, 4 Duelle): 1 Sieg.
