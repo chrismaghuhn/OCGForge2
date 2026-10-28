@@ -1,6 +1,7 @@
 import json
 
 import pytest
+import torch
 
 from ocgforge import train
 
@@ -23,12 +24,27 @@ def test_training_runs_an_arena_and_resumes(tmp_path):
     metrics = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
     arena = [json.loads(line) for line in (tmp_path / "arena.jsonl").read_text().splitlines()]
     assert [m["iteration"] for m in metrics] == [1, 2]
-    assert arena[0]["iteration"] == 2
+    assert arena[0]["iteration"] == 2 and "games_random" in arena[0]
     assert arena[0]["vs_random"] is None or 0.0 <= arena[0]["vs_random"] <= 1.0  # duels can be cut off
     assert (tmp_path / "checkpoints" / "000002" / "model.safetensors").exists()
     cards = json.loads((tmp_path / "cards.jsonl").read_text().splitlines()[0])["cards"]
     assert cards and all(0 <= c["rate"] <= 1 for c in cards)
+    with pytest.raises(SystemExit):  # the directory holds a run
+        train.main(args)
     args[args.index("--iterations") + 1] = "3"
     train.main([*args, "--resume"])
     metrics = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
     assert [m["iteration"] for m in metrics] == [1, 2, 3]
+
+
+def test_latest_is_replaced_whole(tmp_path):
+    from ocgforge.model import Model, ModelConfig
+    from ocgforge.cards import CardFeatures
+    from conftest import make_table
+
+    model = Model(CardFeatures.build(make_table(), min_term_count=1), ModelConfig(d_model=16, heads=2, layers=1, ff=32))
+    optimizer = torch.optim.AdamW(model.parameters())
+    train.save_latest(model, optimizer, tmp_path, 1)
+    train.save_latest(model, optimizer, tmp_path, 2)
+    assert torch.load(tmp_path / "latest" / train.STATE_FILE)["iteration"] == 2
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["latest"]

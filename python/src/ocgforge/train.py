@@ -3,10 +3,13 @@
     python -m ocgforge.train --out runs/base-s0 --size base --seed 0
 
 Every iteration plays `--steps` decisions with AsyncCollector, runs one PPO update and appends a
-line to <out>/metrics.jsonl. A `--league-share` of the envs play frozen earlier checkpoints (the
-last `--league-size` arena checkpoints, picked by PFSP) instead of the current model. Every `--arena-every` iterations the model plays `--arena-duels` duels
-against a random policy and against its previous arena checkpoint (both seats, sampled moves); the
-results and an Elo estimate (random = 0) go to <out>/arena.jsonl, how often the model took each
+line to <out>/metrics.jsonl. A `--league-share` of the envs play frozen earlier checkpoints instead
+of the current model: the last `--league-size` arena checkpoints plus anchors (the first and every
+`--anchor-every` iterations), picked by PFSP (rollout.League). League envs keep only one seat's
+decisions, so their share of the training data is lower (logged as leagueDataShare). Every
+`--arena-every` iterations the model plays `--arena-duels` duels against a random policy, its
+previous and its first arena checkpoint (both seats, sampled moves); win rates, how many duels they
+rest on and an Elo estimate (random = 1500) go to <out>/arena.jsonl, how often the model took each
 card's actions since the last arena to <out>/cards.jsonl and the model to
 <out>/checkpoints/<iteration>. <out>/latest holds the checkpoint plus optimizer state to resume
 from with --resume. Run several --seed values to see how much a result depends on luck.
@@ -17,8 +20,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
+import signal
 import sys
 import time
+from collections import Counter
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -69,11 +75,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=PPOConfig.batch_size)
     p.add_argument("--micro-batch", type=int, default=PPOConfig.micro_batch)
     p.add_argument("--entropy", type=float, default=PPOConfig.entropy_coef)
-    p.add_argument("--league-share", type=float, default=0.25)
-    p.add_argument("--league-size", type=int, default=6)
-    p.add_argument("--arena-every", type=int, default=10)
-    p.add_argument("--arena-duels", type=int, default=256)
-    p.add_argument("--arena-envs", type=int, default=64)
+    p.add_argument("--league-share", type=float, default=0.4, help="share of envs (0.4 = ~25%% of the data)")
+    p.add_argument("--league-size", type=int, default=6, help="newest checkpoints in the league")
+    p.add_argument("--anchor-every", type=int, default=250, help="checkpoints kept as long-term league anchors")
+    p.add_argument("--arena-every", type=int, default=40)
+    p.add_argument("--arena-duels", type=int, default=200, help="per matchup; 200 gives about +-7%% on a win rate")
+    p.add_argument("--arena-envs", type=int, default=128)
+    p.add_argument("--save-every", type=int, default=5, help="iterations between saves of <out>/latest")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--fp32", action="store_true", help="no bf16 autocast (slower, exact)")
@@ -123,21 +131,21 @@ def card_report(usage: rollout.CardUsage, names: dict[int, str]) -> list[dict]:
     return sorted(rows, key=lambda r: -r["chosen"])
 
 
-def arena(model: Model, opponent: Model | None, args: argparse.Namespace, iteration: int) -> dict:
-    """Duels against a random policy and the previous checkpoint; returns win rates and Elo."""
+def arena(model: Model, opponents: dict[str, Model], args: argparse.Namespace, iteration: int) -> dict:
+    """Duels against a random policy and each of `opponents`; returns win rates and Elo."""
     names = [d.stem for d in args.decks]
     env = rollout.vector_env(model.card_features, args.decks, num_envs=args.arena_envs,
                              seed=args.seed * 1_000_003 + iteration, threads=args.threads)
     me = rollout.ModelPolicy(model, args.device, seed=iteration, bf16=not args.fp32)
     name = f"it{iteration}"
     results = rollout.match(env, me, rollout.RandomPolicy(iteration), args.arena_duels, name, "random", names)
-    if opponent is not None:
-        previous = rollout.ModelPolicy(opponent, args.device, seed=iteration + 1, bf16=not args.fp32)
-        results += rollout.match(env, me, previous, args.arena_duels, name, "previous", names)
+    for k, (label, other) in enumerate(opponents.items(), start=1):
+        policy = rollout.ModelPolicy(other, args.device, seed=iteration + k, bf16=not args.fp32)
+        results += rollout.match(env, me, policy, args.arena_duels, name, label, names)
     # Duels cut off (loop protection, Lua budget) are not counted, so a matchup can have no games.
-    summary: dict = {"vs_random": None, "games_random": 0}
-    if opponent is not None:
-        summary.update(vs_previous=None, games_previous=0)
+    summary: dict = {}
+    for label in ("random", *opponents):
+        summary.update({f"vs_{label}": None, f"games_{label}": 0})
     for (a, b), stats in ladder.matchups(results).items():
         if a == name:
             summary[f"vs_{b}"] = round(stats.win_rate, 4)
@@ -146,10 +154,37 @@ def arena(model: Model, opponent: Model | None, args: argparse.Namespace, iterat
     return summary
 
 
+def save_latest(model: Model, optimizer: torch.optim.Optimizer, out: Path, iteration: int) -> None:
+    """<out>/latest, replaced only once the new copy is complete (latest.old survives a crash midway)."""
+    tmp, latest, old = out / "latest.tmp", out / "latest", out / "latest.old"
+    shutil.rmtree(tmp, ignore_errors=True)
+    save_checkpoint(model, tmp)
+    torch.save({"optimizer": optimizer.state_dict(), "iteration": iteration}, tmp / STATE_FILE)
+    shutil.rmtree(old, ignore_errors=True)
+    if latest.exists():
+        latest.rename(old)
+    tmp.rename(latest)
+    shutil.rmtree(old, ignore_errors=True)
+
+
+def drop_after(path: Path, iteration: int) -> None:
+    """Remove log lines of iterations after `iteration` (run again after a resume)."""
+    if path.exists():
+        lines = [l for l in path.read_text(encoding="utf-8").splitlines() if json.loads(l)["iteration"] <= iteration]
+        path.write_text("".join(l + "\n" for l in lines), encoding="utf-8")
+
+
+def error_reasons(messages: list[str], top: int = 3) -> dict[str, int]:
+    return dict(Counter(m.split(" (seed")[0].splitlines()[0][:120] for m in messages).most_common(top))
+
+
 def main(argv=None) -> None:
     args = parse_args(argv)
     out: Path = args.out
+    if not args.resume and (out / "metrics.jsonl").exists():
+        raise SystemExit(f"{out} already holds a run: pass --resume to continue it, or choose another --out")
     out.mkdir(parents=True, exist_ok=True)
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))  # kill: save first
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     torch.backends.cuda.matmul.allow_tf32 = True  # rollouts and updates alike, so logprobs stay comparable
@@ -158,12 +193,15 @@ def main(argv=None) -> None:
     ppo = PPOConfig(lr=args.lr, epochs=args.epochs, batch_size=args.batch_size, micro_batch=args.micro_batch,
                     entropy_coef=args.entropy, kl_coef=0.0, bf16=not args.fp32)
     iteration = 0
-    if args.resume and (out / "latest").exists():
-        model = load_checkpoint(out / "latest", args.device, dropout=0.0)
-        state = torch.load(out / "latest" / STATE_FILE, map_location=args.device)
+    saved = next((d for d in (out / "latest", out / "latest.old") if (d / STATE_FILE).exists()), None)
+    if args.resume and saved is not None:
+        model = load_checkpoint(saved, args.device, dropout=0.0)
+        state = torch.load(saved / STATE_FILE, map_location=args.device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=ppo.lr)
         optimizer.load_state_dict(state["optimizer"])
         iteration = state["iteration"]
+        for log in ("metrics.jsonl", "arena.jsonl", "cards.jsonl"):
+            drop_after(out / log, iteration)
     else:
         model = build_model(args).to(args.device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=ppo.lr)
@@ -177,48 +215,83 @@ def main(argv=None) -> None:
     env = rollout.vector_env(model.card_features, args.decks, num_envs=args.envs,
                              seed=args.seed * 1_000_003 + iteration, threads=args.threads)
     league = rollout.League(args.league_share, args.league_size, seed=args.seed)
-    for checkpoint in sorted((out / "checkpoints").glob("*"))[-args.league_size:]:  # when resuming
-        league.add(checkpoint.name, rollout.ModelPolicy(load_checkpoint(checkpoint, args.device, dropout=0.0),
-                                                        args.device, seed=args.seed + int(checkpoint.name), bf16=ppo.bf16))
+    first: Model | None = None  # first and latest arena checkpoint, for the arena
+    previous: Model | None = None
+    anchored = -1  # anchor_every bucket of the latest anchor
+
+    def admit(checkpoint: Path) -> Model:
+        """Load an arena checkpoint into the league; the first one, and the first one in each new
+        block of --anchor-every iterations, stay as anchors."""
+        nonlocal first, previous, anchored
+        frozen = load_checkpoint(checkpoint, args.device, dropout=0.0)
+        bucket = int(checkpoint.name) // args.anchor_every
+        anchor = first is None or bucket > anchored
+        anchored = max(anchored, bucket) if anchor else anchored
+        league.add(checkpoint.name, rollout.ModelPolicy(frozen, args.device, seed=args.seed + int(checkpoint.name),
+                                                        bf16=ppo.bf16), anchor=anchor)
+        first = frozen if first is None else first
+        previous = frozen
+        return frozen
+
+    for checkpoint in sorted((out / "checkpoints").glob("*")) if args.resume else []:  # the league drops old ones
+        if int(checkpoint.name) <= iteration:
+            admit(checkpoint)
     usage = rollout.CardUsage(model.card_features.size)
     collector = rollout.AsyncCollector(env, batch_size=max(1, args.envs // 2), segment=args.segment,
                                        league=league if args.league_share > 0 else None, card_usage=usage)
     names = card_names(model.card_features)
     policy = rollout.ModelPolicy(model, args.device, seed=args.seed, bf16=ppo.bf16)
-    opponent = None
     deadline = time.time() + args.hours * 3600 if args.hours > 0 else None
-    while iteration < args.iterations and (deadline is None or time.time() < deadline):
-        iteration += 1
-        start = time.time()
-        segments, stats = collector.collect(policy, args.steps)
-        collected = time.time()
-        steps = build_steps(segments, ppo.gamma, ppo.lam)
-        history = ppo_update(model, optimizer, steps, ppo, args.device, seed=args.seed * 1_000_003 + iteration)
-        done = time.time()
-        line = {"iteration": iteration, "time": round(done, 1), "decisions": len(steps),
-                "decisionsPerSecond": round(stats.decisions / (collected - start)),
-                "collectSeconds": round(collected - start, 2), "updateSeconds": round(done - collected, 2),
-                "duels": stats.duels, "leagueDuels": stats.league_duels, "errors": stats.errors,
-                "wins": stats.wins, "league": league.scores(),
-                **{k: round(v, 5) if isinstance(v, float) else v for k, v in history[-1].items()}}
-        with open(out / "metrics.jsonl", "a", encoding="utf-8") as f:
-            f.write(json.dumps(line) + "\n")
-        print(json.dumps(line), flush=True)
+    saved_iteration, failing = iteration, 0
+    try:
+        while iteration < args.iterations and (deadline is None or time.time() < deadline):
+            start = time.time()
+            segments, stats = collector.collect(policy, args.steps)
+            collected = time.time()
+            steps = build_steps(segments, ppo.gamma, ppo.lam)
+            history = ppo_update(model, optimizer, steps, ppo, args.device, seed=args.seed * 1_000_003 + iteration + 1)
+            iteration += 1
+            done = time.time()
+            finished = stats.duels + stats.league_duels + stats.errors
+            line = {"iteration": iteration, "time": round(done, 1), "decisions": len(steps),
+                    "decisionsPerSecond": round(stats.decisions / (collected - start)),
+                    "collectSeconds": round(collected - start, 2), "updateSeconds": round(done - collected, 2),
+                    "duels": stats.duels, "leagueDuels": stats.league_duels, "errors": stats.errors,
+                    "errorReasons": error_reasons(stats.error_messages),
+                    "leagueDataShare": round(stats.league_decisions / max(1, stats.learner_decisions), 3),
+                    "wins": stats.wins, "league": league.scores(),
+                    **{k: round(v, 5) if isinstance(v, float) else v for k, v in history[-1].items()}}
+            with open(out / "metrics.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(line) + "\n")
+            print(json.dumps(line), flush=True)
+            failing = failing + 1 if finished >= 10 and stats.errors > finished / 2 else 0
+            if failing >= 3:
+                print(f"WARNING: more than half of the finished duels failed for {failing} iterations: "
+                      f"{line['errorReasons']}", flush=True)
 
-        if iteration % args.arena_every == 0:
-            checkpoint = out / "checkpoints" / f"{iteration:06d}"
-            save_checkpoint(model, checkpoint)
-            result = {"iteration": iteration, **arena(model, opponent, args, iteration)}
-            with open(out / "arena.jsonl", "a", encoding="utf-8") as f:
-                f.write(json.dumps(result) + "\n")
-            print(json.dumps(result), flush=True)
-            with open(out / "cards.jsonl", "a", encoding="utf-8") as f:
-                f.write(json.dumps({"iteration": iteration, "cards": card_report(usage, names)}) + "\n")
-            usage.reset()
-            opponent = load_checkpoint(checkpoint, args.device, dropout=0.0)
-            league.add(checkpoint.name, rollout.ModelPolicy(opponent, args.device, seed=args.seed + iteration, bf16=ppo.bf16))
-            save_checkpoint(model, out / "latest")
-            torch.save({"optimizer": optimizer.state_dict(), "iteration": iteration}, out / "latest" / STATE_FILE)
+            if iteration % args.arena_every == 0:
+                checkpoint = out / "checkpoints" / f"{iteration:06d}"
+                save_checkpoint(model, checkpoint)
+                opponents = {"previous": previous} if previous is not None else {}
+                if first is not None and first is not previous:
+                    opponents["first"] = first
+                result = {"iteration": iteration, **arena(model, opponents, args, iteration)}
+                with open(out / "arena.jsonl", "a", encoding="utf-8") as f:
+                    f.write(json.dumps(result) + "\n")
+                print(json.dumps(result), flush=True)
+                with open(out / "cards.jsonl", "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"iteration": iteration, "cards": card_report(usage, names)}) + "\n")
+                usage.reset()
+                admit(checkpoint)
+            if iteration % args.save_every == 0 or iteration % args.arena_every == 0:
+                save_latest(model, optimizer, out, iteration)
+                saved_iteration = iteration
+    except KeyboardInterrupt:
+        print("interrupted", flush=True)
+    finally:
+        if iteration > saved_iteration:  # the deadline, the last iterations or an interrupt
+            save_latest(model, optimizer, out, iteration)
+            print(f"saved iteration {iteration} to {out / 'latest'}", flush=True)
 
 
 if __name__ == "__main__":

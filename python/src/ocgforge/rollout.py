@@ -8,6 +8,7 @@ finished duels restart by themselves.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -87,6 +88,8 @@ class RolloutStats:
     decisions: int = 0
     wins: list[int] = field(default_factory=lambda: [0, 0, 0])  # player 0, player 1, draw (self-play duels)
     league_duels: int = 0
+    learner_decisions: int = 0  # decisions kept for training
+    league_decisions: int = 0  # of those, played against a league opponent
     error_messages: list[str] = field(default_factory=list)
 
 
@@ -139,38 +142,51 @@ def collect(env, policy: Policy, duels: int) -> tuple[list[tuple[list[dict], flo
 
 class League:
     """Frozen earlier models the learner plays against in a share of the envs (the rest is plain
-    self-play), so it keeps beating what it already beat instead of chasing its latest self. Who
-    comes up next is prioritized fictitious self-play: opponents the learner scores worse against
-    come up more often, with weight (1 - score)^2 on a smoothed score."""
+    self-play), so it keeps beating what it already beat instead of chasing its latest self.
 
-    def __init__(self, share: float, size: int, seed: int = 0):
-        self.share, self.size = share, size
+    Who comes up next is prioritized fictitious self-play: weight (1 - score)^2 on the learner's
+    smoothed score over its last `window` duels against each opponent (so the weights follow the
+    current learner), mixed with a `uniform` share of uniform picks so no single opponent takes
+    over. The pool holds the `size` newest models plus up to `anchors` anchor models (added with
+    anchor=True, e.g. every few hundred iterations) for a long memory; the first anchor never leaves."""
+
+    def __init__(self, share: float, size: int, seed: int = 0, window: int = 200, uniform: float = 0.2,
+                 anchors: int = 4):
+        self.share, self.size, self.window, self.uniform, self.max_anchors = share, size, window, uniform, anchors
         self.policies: dict[str, Policy] = {}
-        self.record: dict[str, list[float]] = {}  # name -> [games, learner points]
+        self.results: dict[str, deque[float]] = {}  # name -> learner scores of the latest duels
+        self.recent: list[str] = []
+        self.anchors: list[str] = []
         self.rng = np.random.default_rng(seed)
 
-    def add(self, name: str, policy: Policy) -> None:
+    def add(self, name: str, policy: Policy, anchor: bool = False) -> None:
         self.policies[name] = policy
-        self.record.setdefault(name, [0, 0.0])
-        while len(self.policies) > self.size:
-            oldest = next(iter(self.policies))
-            del self.policies[oldest], self.record[oldest]
+        self.results.setdefault(name, deque(maxlen=self.window))
+        (self.anchors if anchor else self.recent).append(name)
+        while len(self.recent) > self.size:
+            self._drop(self.recent.pop(0))
+        while len(self.anchors) > max(self.max_anchors, 1):
+            self._drop(self.anchors.pop(1))
+
+    def _drop(self, name: str) -> None:
+        del self.policies[name], self.results[name]
 
     def pick(self) -> str | None:
         if not self.policies:
             return None
         names = list(self.policies)
-        scores = np.array([(self.record[n][1] + 1) / (self.record[n][0] + 2) for n in names])
-        weights = (1 - scores) ** 2 + 1e-3
-        return names[self.rng.choice(len(names), p=weights / weights.sum())]
+        scores = np.array([(sum(self.results[n]) + 1) / (len(self.results[n]) + 2) for n in names])
+        weights = (1 - scores) ** 2
+        p = (1 - self.uniform) * weights / weights.sum() + self.uniform / len(names)
+        return names[self.rng.choice(len(names), p=p / p.sum())]
 
     def result(self, name: str, learner_score: float) -> None:
-        if name in self.record:
-            self.record[name][0] += 1
-            self.record[name][1] += learner_score
+        if name in self.results:
+            self.results[name].append(learner_score)
 
     def scores(self) -> dict[str, float]:
-        return {n: round(points / games, 3) for n, (games, points) in self.record.items() if games}
+        """Learner score against each opponent over its latest duels."""
+        return {n: round(sum(r) / len(r), 3) for n, r in self.results.items() if r}
 
 
 CARD_ACTIONS = ("summon", "special_summon", "set_monster", "set_spell_trap", "activate", "chain_activate", "attack")
@@ -193,8 +209,9 @@ class CardUsage:
         tokens = batch["token_card"][rows]
         card = np.where(source >= 0, np.take_along_axis(tokens, np.maximum(source, 0), 1), batch["candidate_card"][rows])
         action = np.isin(kind, _CARD_ACTION_IDS) & (card > 1)
-        for r in range(len(rows)):  # count a card once per decision
-            np.add.at(self.offered, np.unique(card[r][action[r]]), 1)
+        row = np.nonzero(action)[0]
+        once = np.unique(row * len(self.offered) + card[action]) % len(self.offered)  # once per decision
+        np.add.at(self.offered, once, 1)
         picked = np.asarray(choices)
         taken = action[np.arange(len(rows)), picked]
         np.add.at(self.chosen, card[np.arange(len(rows)), picked][taken], 1)
@@ -292,6 +309,8 @@ class AsyncCollector:
             for n, (i, choice, logprob, value) in enumerate(zip(ids, choices, logprobs, values)):
                 if actor[n] is not None:
                     continue  # the league opponent's move: not trained on
+                stats.learner_decisions += 1
+                stats.league_decisions += i in self.opponent
                 decision = features.row(batch, n, copy=True)  # compact: a view would keep the whole batch alive
                 decision.update(chosen=choice, logprob=logprob, value=value)
                 key = (i, decision["player"])

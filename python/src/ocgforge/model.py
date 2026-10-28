@@ -198,10 +198,15 @@ class Model(nn.Module):
                      + self.zone(batch["candidate_zone"][row, col]) + targets
                      + self.candidate_numeric(batch["candidate_numeric"][row, col]))
         ctx = context[row]
-        packed = self.score(torch.cat([candidate, ctx, candidate * ctx], dim=-1)).squeeze(-1)
+        # The heads run in fp32 even under autocast: bf16 logits are rounded by up to ~0.1 once the
+        # policy is sharp, and rollout and update would then disagree on the logprobs.
+        with torch.autocast(context.device.type, enabled=False):
+            features_ = torch.cat([candidate, ctx, candidate * ctx], dim=-1).float()
+            packed = self.score(features_).squeeze(-1)
+            value = self.value(context.float()).squeeze(-1)
         scores = torch.full(batch["candidate_kind"].shape, float("-inf"), device=packed.device, dtype=packed.dtype)
         scores[row, col] = packed
-        return scores, self.value(context).squeeze(-1)
+        return scores, value
 
 
 CONFIG_FILE = "config.json"

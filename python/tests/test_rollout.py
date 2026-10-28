@@ -79,17 +79,32 @@ def test_match_maps_seats_and_winners():
 def test_league_prefers_opponents_the_learner_struggles_against():
     from ocgforge.rollout import League
 
-    league = League(share=0.5, size=2, seed=0)
+    league = League(share=0.5, size=2, seed=0, window=10)
     assert league.pick() is None
     league.add("weak", object())
     league.add("strong", object())
     for _ in range(20):
         league.result("weak", 1.0)
         league.result("strong", 0.0)
-    picks = [league.pick() for _ in range(200)]
-    assert picks.count("strong") > 150
+    picks = [league.pick() for _ in range(400)]
+    assert 300 < picks.count("strong") < 390  # PFSP, but the uniform share still picks "weak"
+    for _ in range(10):  # only the latest `window` duels count
+        league.result("strong", 1.0)
+    assert league.scores()["strong"] == 1.0
     league.add("newest", object())  # size 2: the oldest leaves
     assert set(league.policies) == {"strong", "newest"} and "weak" not in league.scores()
+
+
+def test_league_anchors_outlive_the_recent_window():
+    from ocgforge.rollout import League
+
+    league = League(share=0.5, size=1, anchors=2)
+    league.add("first", object(), anchor=True)
+    for name in ("a", "b", "c"):
+        league.add(name, object())
+    league.add("anchor1", object(), anchor=True)
+    league.add("anchor2", object(), anchor=True)  # over 2 anchors: the oldest after "first" leaves
+    assert set(league.policies) == {"first", "anchor2", "c"}
 
 
 def test_card_usage_counts_offered_and_chosen_card_actions():
