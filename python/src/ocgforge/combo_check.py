@@ -33,6 +33,9 @@ PHASE_END = re.compile(r"^idle\.[6-9]\.\d+$")  # to Battle Phase / End Phase (no
 # Monsters that want the center Main Monster Zone (summoned there, or stronger while there).
 CENTER = re.compile(r"(this card|Summoned|it)[^.]{0,40}\b(to|in) (the|your) center Main Monster Zone"
                     r"|while in the center Main Monster Zone")
+# Answers that move the duel on and cannot loop: the board stays the same over several chain windows,
+# so the loop guard (same answer on the same board) must not take them away.
+PASSIVE = ("chain.pass", "yes_no.", "effect_yes_no.")
 POS_ATTACK = 0x1
 MAX_SKIPPED = 2  # steps a checked combo may pass over (once-per-turn effects, steps the board cannot show)
 EMZ = (5, 6)
@@ -138,8 +141,10 @@ def advance(line: Line, targets: list[tuple[int, int | None]], last_key: str | N
             if i >= len(targets):
                 break
             code, location = targets[i]
+            # A step without a location (the card was used) only as the very next step: the answer
+            # summoning a card names it too, before the card arrives for the step before.
             if (location is not None and (code, location) in arrived) or (
-                    location is None and named is not None and int(named[1]) == code):
+                    location is None and skip == 0 and named is not None and int(named[1]) == code):
                 progress, skipped = i + 1, skipped + skip
                 if location is not None:
                     arrived.discard((code, location))
@@ -184,6 +189,20 @@ def forced(keys: list[str], history: list[str], upcoming_center: bool, center: s
     return None
 
 
+def plan_choice(keys: list[str], allowed: set[int], ahead: list[int]) -> set[int]:
+    """In a choice of one card (`card.` answers: a search, a target, a monster to summon), only the
+    card of the earliest coming step that is offered; the model must not swap it for another legal
+    card (Welcome Home calling Fortuna where the plan wants Regina). Unchanged when none is offered."""
+    if not all(k.startswith("card.") for k in keys):
+        return allowed
+    codes = {i: int(ref[1]) for i in allowed if (ref := worlds.card_ref(keys[i])) is not None}
+    for code in ahead:
+        chosen = {i for i, c in codes.items() if c == code}
+        if chosen:
+            return chosen
+    return allowed
+
+
 def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12, branch: int = 4,
           max_decisions: int = 150, lookahead: int = 3, center: set[int] = frozenset(),
           is_extra=lambda code: False) -> tuple[Line, list[tuple[int, int | None]]]:
@@ -192,7 +211,8 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
     of the book's end-board cards are on the field, then by the model's log-probabilities.
 
     Rules from playing Lucina 1cc by hand: positions and monster zones are fixed (`forced`); in a
-    chain window only cards of the next steps may activate, else pass; optional yes/no questions keep
+    chain window only cards of the next steps may activate, else pass; in a choice of one card only the
+    next step's card when offered (`plan_choice`); optional yes/no questions keep
     both answers in the beam (the board decides, not the model: a level change can break a later
     Synchro); end-board cards on the field are never chosen as material or cost."""
     targets = [(e.code, expected_location(e.action)) for step in combo.steps for e in step if e.code is not None]
@@ -229,8 +249,10 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
             field_now = Counter({code: n for (code, loc), n in now.items()
                                  if loc in (worlds.LOCATION_MZONE, worlds.LOCATION_SZONE)})
             line.key_cards = sum((key_cards & field_now).values())
+            # The board has no levels or ATK: yes/no answers (a level change, say) tell such states apart.
+            choices = tuple(k for k in line.keys if k.startswith(("yes_no.", "effect_yes_no.", "option.")))
             identity = (hash(tuple(sorted(now.items()))), tuple(duel.keys()) if not duel.finished else (),
-                        line.progress, line.skipped)
+                        line.progress, line.skipped, choices)
             if identity in seen:
                 continue
             seen.add(identity)
@@ -263,12 +285,13 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
                     if key == fixed:
                         options.append((0.0, i))
                     continue
-                if (state, key) in line.tried and len(keys) > 1:
+                if (state, key) in line.tried and len(keys) > 1 and not key.startswith(PASSIVE):
                     continue  # same answer on the same board again: a summon cancelled and retried
                 options.append((0.0, i))
             if fixed is None:
                 allowed = {i for _, i in options} or set(range(len(keys)))  # all retried: undo still allowed
                 options = []
+                allowed = plan_choice(keys, allowed, ahead)
             for i, key in enumerate(keys):
                 if fixed is not None or i not in allowed:
                     continue

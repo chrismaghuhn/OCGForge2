@@ -29,3 +29,13 @@ def test_zones():
 def test_other_questions_are_searched():
     assert forced(["chain.0.0.14558127.0.2.1", "chain.pass"], [], True, CENTER, is_extra) is None
     assert forced(["yes_no.no", "yes_no.yes"], [], True, CENTER, is_extra) is None
+
+
+def test_plan_choice_takes_the_next_steps_card():
+    from ocgforge.combo_check import plan_choice
+    regina, fortuna = 56651978, 85976588
+    keys = [f"card.0.0.{fortuna}.0.1.4", f"card.0.1.{regina}.0.1.9", "card.0.2.12375297.0.1.3"]
+    assert plan_choice(keys, {0, 1, 2}, [regina, fortuna]) == {1}
+    assert plan_choice(keys, {0, 2}, [regina, fortuna]) == {0}  # Regina was tried: the next one
+    assert plan_choice(keys, {0, 1, 2}, [LUCINA]) == {0, 1, 2}  # nothing of the plan offered
+    assert plan_choice(["chain.pass", f"chain.0.0.{regina}.0.2.1"], {0, 1}, [regina]) == {0, 1}
