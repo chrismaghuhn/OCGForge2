@@ -90,6 +90,10 @@ with `recv_batch`/`send` instead, so the policy only waits for the first `batch_
 ones with a value bootstrap; duels keep running across calls (only each seat's latest decision
 carries over), so memory does not depend on how long duels get.
 
+Install jemalloc (`sudo apt install libjemalloc2`): with glibc malloc the engine threads fragment
+memory and run ~25% slower. `python -m ocgforge.train` preloads it by itself; elsewhere use
+`LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2`.
+
 Memory: each env holds a duel engine (~3.5–5.5 MB, all engines share the card data) plus up to two
 open segments of ~6 KB per decision, so ~7 MB per env with the default segment; the collected
 segments (`steps` decisions) come on top.

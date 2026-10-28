@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 import time
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -35,6 +37,17 @@ SIZES = {
     "large": ModelConfig(d_model=384, heads=8, layers=8, ff=1536),
 }
 STATE_FILE = "trainer.pt"
+# glibc malloc fragments under many engine threads (RSS keeps growing) and is slower: with jemalloc
+# the engine runs ~25% faster and memory stays flat. `sudo apt install libjemalloc2`.
+JEMALLOC = Path("/usr/lib/x86_64-linux-gnu/libjemalloc.so.2")
+
+
+def use_jemalloc(argv: list[str]) -> None:
+    """Restart this process with jemalloc preloaded, if it is installed and not loaded yet."""
+    if not JEMALLOC.exists() or str(JEMALLOC) in os.environ.get("LD_PRELOAD", ""):
+        return
+    env = {**os.environ, "LD_PRELOAD": ":".join(p for p in (os.environ.get("LD_PRELOAD"), str(JEMALLOC)) if p)}
+    os.execve(sys.executable, [sys.executable, "-m", "ocgforge.train", *argv], env)
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -64,6 +77,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--resume", action="store_true")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--fp32", action="store_true", help="no bf16 autocast (slower, exact)")
+    p.add_argument("--no-jemalloc", action="store_true", help="keep glibc malloc")
     return p.parse_args(argv)
 
 
@@ -120,11 +134,15 @@ def arena(model: Model, opponent: Model | None, args: argparse.Namespace, iterat
     if opponent is not None:
         previous = rollout.ModelPolicy(opponent, args.device, seed=iteration + 1, bf16=not args.fp32)
         results += rollout.match(env, me, previous, args.arena_duels, name, "previous", names)
-    summary = {}
+    # Duels cut off (loop protection, Lua budget) are not counted, so a matchup can have no games.
+    summary: dict = {"vs_random": None, "games_random": 0}
+    if opponent is not None:
+        summary.update(vs_previous=None, games_previous=0)
     for (a, b), stats in ladder.matchups(results).items():
         if a == name:
             summary[f"vs_{b}"] = round(stats.win_rate, 4)
-    summary["elo"] = round(ladder.elo(results, anchor="random").get(name, 0.0), 1)
+            summary[f"games_{b}"] = stats.games
+    summary["elo"] = round(ladder.elo(results, anchor="random").get(name, 0.0), 1) if results else None
     return summary
 
 
@@ -204,4 +222,6 @@ def main(argv=None) -> None:
 
 
 if __name__ == "__main__":
+    if "--no-jemalloc" not in sys.argv[1:]:
+        use_jemalloc(sys.argv[1:])
     main()
