@@ -33,7 +33,7 @@ PHASE_END = re.compile(r"^idle\.[6-9]\.\d+$")  # to Battle Phase / End Phase (no
 
 
 def scenario_script(combo: cb.Combo, decklist: tuple[list[int], list[int]], opponent: list[int], is_extra,
-                    rng: random.Random, hand_size: int = 5) -> str:
+                    rng: random.Random, hand_size: int = 5, hand: list[int] | None = None) -> str:
     """The puzzle: our hand (the combo's starting cards, filled up from the decklist), our deck and
     Extra Deck (the decklist plus the combo's cards it lacks), an opponent with a deck and a hand it
     never plays (effects like PSY-Framelord Omega's need one)."""
@@ -42,11 +42,12 @@ def scenario_script(combo: cb.Combo, decklist: tuple[list[int], list[int]], oppo
         target = extra if is_extra(code) else main
         if code not in target:
             target.append(code)
+    wanted = list(hand) if hand is not None else [e.code for e in combo.starting if e.code is not None]
     hand = []
-    for entry in combo.starting:
-        if entry.code is not None and entry.code in main:
-            main.remove(entry.code)
-            hand.append(entry.code)
+    for code in wanted:
+        if code in main:
+            main.remove(code)
+        hand.append(code)
     rng.shuffle(main)
     while len(hand) < hand_size and main:
         hand.append(main.pop())
@@ -84,7 +85,7 @@ VERBS = [
     (("add", "search", "hand", "draw", "return"), worlds.LOCATION_HAND),
     (("send", "gy", "grave", "tribute", "discard", "material", "detach", "mill", "dump"), worlds.LOCATION_GRAVE),
     (("banish",), worlds.LOCATION_REMOVED),
-    (("place", "set", "scale", "field"), worlds.LOCATION_SZONE),
+    (("place", "set", "scale", "field", "szone"), worlds.LOCATION_SZONE),
 ]
 
 
@@ -143,6 +144,7 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
     of the book's end-board cards are on the field, then by the model's log-probabilities."""
     targets = [(e.code, expected_location(e.action)) for step in combo.steps for e in step if e.code is not None]
     key_cards = Counter(combo.end_board)
+    plan = {code for code, _ in targets} | set(key_cards)
     rank = lambda l: (l.progress + 2 * l.key_cards, l.score)  # noqa: E731
     first = start()
     lines = [Line(board=board(first) if first is not None else Counter())]
@@ -187,6 +189,8 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
                 value = lp[i]
                 if ref is not None and int(ref[1]) in upcoming:
                     value += 5.0  # likely to move the combo on; the board decides next round
+                elif ref is not None and int(ref[1]) not in plan and line.progress < len(targets):
+                    value -= 8.0  # off-plan card (a hand trap fired at nothing, a wrong Synchro, ...)
                 elif line.progress < len(targets) and PHASE_END.match(key):
                     value -= 20.0  # leaving Main Phase 1 with the combo unfinished
                 options.append((value, i))
@@ -220,6 +224,9 @@ def main(argv=None) -> None:
     parser.add_argument("--beam", type=int, default=12)
     parser.add_argument("--branch", type=int, default=4, help="answers tried per line and decision")
     parser.add_argument("--title", help="only combos whose title contains this")
+    parser.add_argument("--precise", type=Path,
+                        help="hand-written engine steps (JSON list of {title, hand, steps: [[card, action]], "
+                             "end_board}): replace the community steps, starting hand and end board of those combos")
     parser.add_argument("--limit", type=int, default=0, help="check only the best-voted N combos")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--out", type=Path, help="combo book (JSON lines)")
@@ -235,6 +242,16 @@ def main(argv=None) -> None:
     opponent = worlds.read_decklist(args.opponent)[0]
     combos = sorted((c for c in cb.load(args.deck_type, names) if c.usable and c.steps),
                     key=lambda c: -c.votes)
+    hands: dict[str, list[int]] = {}
+    if args.precise:
+        code_of = lambda name: names.get(cb.normalize(name), names.get(cb.loose(name)))  # noqa: E731
+        specs = {spec["title"]: spec for spec in json.loads(args.precise.read_text(encoding="utf-8"))}
+        combos = [c for c in combos if c.title in specs]
+        for combo in combos:
+            spec = specs[combo.title]
+            combo.steps = [[cb.Entry(code_of(card), card, action)] for card, action in spec["steps"]]
+            combo.end_board = [code_of(card) for card in spec.get("end_board", [])]
+            hands[combo.id] = [code_of(card) for card in spec["hand"]]
     if args.title:
         combos = [c for c in combos if args.title in c.title]
     if args.limit:
@@ -249,7 +266,7 @@ def main(argv=None) -> None:
         best = None
         for shuffle in range(args.shuffles):
             rng = random.Random(f"{combo.id}-{shuffle}")
-            script = scenario_script(combo, decklist, opponent, is_extra, rng)
+            script = scenario_script(combo, decklist, opponent, is_extra, rng, hand=hands.get(combo.id))
             seed = rng.getrandbits(32)
 
             def start(script=script, seed=seed):
