@@ -3,6 +3,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
+#include <nanobind/stl/optional.h>
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/unordered_map.h>
@@ -14,7 +15,9 @@
 #include <string>
 #include <vector>
 
+#include "ygo/client/client_duel.hpp"
 #include "ygo/encode/vector_env.hpp"
+#include "ygo/protocol/message_decoder.hpp"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -249,6 +252,44 @@ NB_MODULE(_core, m) {
         .def_prop_ro("start_failures", &VectorEnv::start_failures,
                      "Duels that failed to start and were replaced; nonzero usually means a deck problem.")
         .def_prop_ro("last_start_failure", &VectorEnv::last_start_failure);
+
+    using ygo::client::ClientDuel;
+    auto to_vector = [](const nb::bytes& bytes) {
+        const auto* data = static_cast<const std::uint8_t*>(bytes.data());
+        return std::vector<std::uint8_t>(data, data + bytes.size());
+    };
+    nb::class_<ClientDuel>(m, "ClientDuel",
+                           "One player's side of a duel run by an EDOPro server: game messages in, responses out.")
+        .def(nb::init<std::uint8_t>(), "player"_a)
+        .def("feed", [to_vector](ClientDuel& self, const nb::bytes& message) { return self.feed(to_vector(message)); },
+             "message"_a, "One STOC_GAME_MSG payload; True when it asks this player for a decision.")
+        .def_prop_ro("pending", &ClientDuel::pending)
+        .def("request",
+             [](const ClientDuel& self) {
+                 const auto& request = self.request();
+                 nb::dict out;
+                 out["kind"] = ygo::protocol::decision_kind_name(request.kind);
+                 out["player"] = request.player;
+                 std::vector<std::string> keys;
+                 for (const auto& candidate : request.candidates) {
+                     keys.push_back(candidate.semantic_key);
+                 }
+                 out["candidates"] = keys;
+                 return out;
+             })
+        .def("act",
+             [](ClientDuel& self, const std::string& key) -> std::optional<nb::bytes> {
+                 auto response = self.act(key);
+                 if (!response) {
+                     return std::nullopt;
+                 }
+                 return nb::bytes(reinterpret_cast<const char*>(response->data()), response->size());
+             },
+             "semantic_key"_a, "The response bytes, or None when a multi-step selection continues.")
+        .def_prop_ro("finished", &ClientDuel::finished)
+        .def_prop_ro("winner", &ClientDuel::winner)
+        .def_prop_ro("messages", &ClientDuel::messages)
+        .def_prop_ro("skipped", &ClientDuel::skipped);
 
     m.def("decision_names", &ygo::encode::decision_names);
     m.def("zone_names", &ygo::encode::zone_names);

@@ -57,6 +57,7 @@ add_library(ygo STATIC
     src/observation/query_decoder.cpp
     src/observation/serialization.cpp
     src/observation/zone_projection.cpp
+    src/client/client_duel.cpp
     src/duel/duel.cpp
     src/encode/encoder.cpp
     src/encode/vector_env.cpp
