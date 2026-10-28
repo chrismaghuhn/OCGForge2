@@ -196,7 +196,7 @@ ProcessResult CoreHost::process() {
     if (OCG_DuelLuaBudgetExceeded(impl_->duel) != 0) {
         // A card script searched too many combinations and was cut off (our ocgcore
         // patch 0004); the duel state can no longer be trusted.
-        throw CoreError(CoreErrorCode::Lifecycle, "OCG_DuelProcess", "Lua instruction budget exceeded");
+        throw CoreError(CoreErrorCode::Lifecycle, "OCG_DuelProcess", "Lua call budget exceeded");
     }
     std::uint32_t length = 0;
     auto* raw = static_cast<const std::uint8_t*>(OCG_DuelGetMessage(impl_->duel, &length));

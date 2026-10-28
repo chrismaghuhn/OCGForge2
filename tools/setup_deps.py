@@ -51,6 +51,7 @@ def apply_patches(path: Path, patches: list[str]) -> None:
     if marker.exists() and marker.read_text(encoding="utf-8") == expected:
         return
     git("checkout", "--force", "--", ".", cwd=path)
+    git("submodule", "foreach", "--recursive", "git checkout --force -- .", cwd=path)  # patches reach into lua/src
     for patch in files:
         git("apply", str(patch), cwd=path)
     marker.write_text(expected, encoding="utf-8")

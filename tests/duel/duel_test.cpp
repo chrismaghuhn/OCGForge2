@@ -124,7 +124,7 @@ TEST_CASE("select/unselect ping-pong is detected as stuck") {
 }
 
 // Every deck in decks/ (training and hold-out) against every other, random play. Slow; run with
-// "[slow]". Duels cut off by the Lua instruction budget count as finished but are reported.
+// "[slow]". Duels cut off by the Lua call budget count as finished but are reported.
 TEST_CASE("random duels across all deck pairings finish", "[.][slow]") {
     std::vector<std::filesystem::path> paths;
     for (const auto& entry : std::filesystem::recursive_directory_iterator(OCGFORGE_SOURCE_DIR "/decks")) {
@@ -149,10 +149,10 @@ TEST_CASE("random duels across all deck pairings finish", "[.][slow]") {
                     duel.act(candidates[rng() % candidates.size()].semantic_key);
                 }
             } catch (const DuelError& error) {
-                REQUIRE_THAT(error.what(), Catch::Matchers::ContainsSubstring("Lua instruction budget exceeded"));
+                REQUIRE_THAT(error.what(), Catch::Matchers::ContainsSubstring("Lua call budget exceeded"));
                 ++budget_failures;
             }
         }
     }
-    WARN(budget_failures << " of " << paths.size() * paths.size() << " duels hit the Lua instruction budget");
+    WARN(budget_failures << " of " << paths.size() * paths.size() << " duels hit the Lua call budget");
 }

@@ -1,0 +1,171 @@
+--- a/duel.h
++++ b/duel.h
+@@ -125,6 +125,10 @@
+ 	void* read_card_done_payload;
+ 	uint8_t starting_player_{ 0 };
+ 	bool started_{ false };
++public:
++	// Lua function calls allowed per OCG_DuelProcess call, so a script searching an exploding
++	// number of combinations fails the call instead of never returning.
++	static constexpr uint64_t LUA_CALL_BUDGET = 15000000;
+ };
+ 
+ #endif /* DUEL_H_ */
+--- a/ocgapi.cpp
++++ b/ocgapi.cpp
+@@ -109,6 +109,14 @@
+ 	pduel->game_field->emplace_process<Processors::Startup>();
+ }
+ 
++int OCG_DuelLuaBudgetExceeded(OCG_Duel ocg_duel) {
++	return lua_callbudgetexceeded(static_cast<duel*>(ocg_duel)->lua->lua_state);
++}
++
++uint64_t OCG_DuelLuaCalls(OCG_Duel ocg_duel) {
++	return lua_callcount(static_cast<duel*>(ocg_duel)->lua->lua_state);
++}
++
+ int OCG_DuelSetStartingPlayer(OCG_Duel ocg_duel, uint8_t player) {
+ 	if(ocg_duel == nullptr)
+ 		return 0;
+@@ -118,6 +126,7 @@
+ int OCG_DuelProcess(OCG_Duel ocg_duel) {
+ 	auto* pduel = static_cast<duel*>(ocg_duel);
+ 	pduel->buff.clear();
++	lua_setcallbudget(pduel->lua->lua_state, duel::LUA_CALL_BUDGET);
+ 	auto flag = OCG_DUEL_STATUS_END;
+ 	do {
+ 		flag = pduel->game_field->process();
+--- a/ocgapi.h
++++ b/ocgapi.h
+@@ -33,6 +33,10 @@
+ OCGAPI void OCG_DuelNewCard(OCG_Duel ocg_duel, const OCG_NewCardInfo* info_ptr);
+ OCGAPI void OCG_StartDuel(OCG_Duel ocg_duel);
+ OCGAPI int OCG_DuelSetStartingPlayer(OCG_Duel ocg_duel, uint8_t player);
++/* Nonzero once the Lua call budget of a process call was exceeded; the duel's state is then unreliable. */
++OCGAPI int OCG_DuelLuaBudgetExceeded(OCG_Duel ocg_duel);
++/* Lua function calls made by the last process call. */
++OCGAPI uint64_t OCG_DuelLuaCalls(OCG_Duel ocg_duel);
+ 
+ /*** DUEL PROCESSING AND QUERYING ***/
+ OCGAPI int OCG_DuelProcess(OCG_Duel ocg_duel);
+diff --git a/lua/src/lapi.c b/lua/src/lapi.c
+index 04e09cff..079ecb9c 100644
+--- a/lua/src/lapi.c
++++ b/lua/src/lapi.c
+@@ -1461,3 +1461,21 @@ LUA_API void lua_upvaluejoin (lua_State *L, int fidx1, int n1,
+ }
+ 
+ 
++
++
++LUA_API void lua_setcallbudget (lua_State *L, lua_Unsigned budget) {
++  global_State *g = G(L);
++  g->callcount = 0;
++  g->callbudget = budget;
++  g->callbudgetexceeded = 0;
++}
++
++
++LUA_API lua_Unsigned lua_callcount (lua_State *L) {
++  return G(L)->callcount;
++}
++
++
++LUA_API int lua_callbudgetexceeded (lua_State *L) {
++  return G(L)->callbudgetexceeded;
++}
+diff --git a/lua/src/ldo.c b/lua/src/ldo.c
+index c92573d6..eecc5ffa 100644
+--- a/lua/src/ldo.c
++++ b/lua/src/ldo.c
+@@ -520,10 +520,29 @@ l_sinline CallInfo *prepCallInfo (lua_State *L, StkId func, int nret,
+ /*
+ ** precall for C functions
+ */
++/*
++** Call budget (lua_setcallbudget): every function call counts, and past the
++** budget calls raise an error, so a script searching an exploding number of
++** combinations fails instead of running for hours. Cheaper than a count hook,
++** which makes the VM check every instruction. After an error the next few
++** calls still pass, so error handlers can run.
++*/
++static void callbudgeterror (lua_State *L) {
++  global_State *g = G(L);
++  g->callbudgetexceeded = 1;
++  g->callbudget = g->callcount + 64;
++  luaG_runerror(L, "Lua call budget exceeded");
++}
++
++#define countcall(L) \
++  { if (l_unlikely(++G(L)->callcount > G(L)->callbudget)) callbudgeterror(L); }
++
++
+ l_sinline int precallC (lua_State *L, StkId func, int nresults,
+                                             lua_CFunction f) {
+   int n;  /* number of returns */
+   CallInfo *ci;
++  countcall(L);
+   checkstackGCp(L, LUA_MINSTACK, func);  /* ensure minimum stack size */
+   L->ci = ci = prepCallInfo(L, func, nresults, CIST_C,
+                                L->top.p + LUA_MINSTACK);
+@@ -560,6 +579,7 @@ int luaD_pretailcall (lua_State *L, CallInfo *ci, StkId func,
+       int fsize = p->maxstacksize;  /* frame size */
+       int nfixparams = p->numparams;
+       int i;
++      countcall(L);
+       checkstackGCp(L, fsize - delta, func);
+       ci->func.p -= delta;  /* restore 'func' (if vararg) */
+       for (i = 0; i < narg1; i++)  /* move down function and arguments */
+@@ -604,6 +624,7 @@ CallInfo *luaD_precall (lua_State *L, StkId func, int nresults) {
+     case LUA_VLCL: {  /* Lua function */
+       CallInfo *ci;
+       Proto *p = clLvalue(s2v(func))->p;
++      countcall(L);
+       int narg = cast_int(L->top.p - func) - 1;  /* number of real arguments */
+       int nfixparams = p->numparams;
+       int fsize = p->maxstacksize;  /* frame size */
+diff --git a/lua/src/lstate.c b/lua/src/lstate.c
+index f3f2ccfd..76366cf9 100644
+--- a/lua/src/lstate.c
++++ b/lua/src/lstate.c
+@@ -400,6 +400,9 @@ LUA_API lua_State *lua_newstate (lua_Alloc f, void *ud) {
+   g->totalbytes = sizeof(LG);
+   g->GCdebt = 0;
+   g->lastatomic = 0;
++  g->callcount = 0;
++  g->callbudget = ~(lua_Unsigned)0;
++  g->callbudgetexceeded = 0;
+   setivalue(&g->nilvalue, 0);  /* to signal that state is not yet built */
+   setgcparam(g->gcpause, LUAI_GCPAUSE);
+   setgcparam(g->gcstepmul, LUAI_GCMUL);
+diff --git a/lua/src/lstate.h b/lua/src/lstate.h
+index 007704c8..a40a509e 100644
+--- a/lua/src/lstate.h
++++ b/lua/src/lstate.h
+@@ -252,6 +252,9 @@ struct CallInfo {
+ ** 'global state', shared by all threads of this state
+ */
+ typedef struct global_State {
++  lua_Unsigned callcount;  /* function calls since lua_setcallbudget */
++  lua_Unsigned callbudget;  /* error once callcount passes this */
++  int callbudgetexceeded;
+   lua_Alloc frealloc;  /* function to reallocate memory */
+   void *ud;         /* auxiliary data to 'frealloc' */
+   l_mem totalbytes;  /* number of bytes currently allocated - GCdebt */
+diff --git a/lua/src/lua.h b/lua/src/lua.h
+index f3ea590d..ac98840a 100644
+--- a/lua/src/lua.h
++++ b/lua/src/lua.h
+@@ -466,6 +466,11 @@ LUA_API void  (lua_upvaluejoin) (lua_State *L, int fidx1, int n1,
+                                                int fidx2, int n2);
+ 
+ LUA_API void (lua_sethook) (lua_State *L, lua_Hook func, int mask, int count);
++
++/* Call budget: reset the call count; calls past `budget` raise errors. */
++LUA_API void (lua_setcallbudget) (lua_State *L, lua_Unsigned budget);
++LUA_API lua_Unsigned (lua_callcount) (lua_State *L);
++LUA_API int (lua_callbudgetexceeded) (lua_State *L);
+ LUA_API lua_Hook (lua_gethook) (lua_State *L);
+ LUA_API int (lua_gethookmask) (lua_State *L);
+ LUA_API int (lua_gethookcount) (lua_State *L);

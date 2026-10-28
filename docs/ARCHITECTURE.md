@@ -69,10 +69,12 @@ question in the same field state comes up again and again. Both throw
 
 Some card scripts search combinations of materials (Synchro, Ritual, ...)
 and, in unusual board states, never finish. Patch 0004 gives each
-`OCG_DuelProcess` call a Lua instruction budget (about 30M instructions, a
-few seconds); a call that exceeds it makes `CoreHost::process` throw, so that
-duel fails instead of blocking. In random self-play across all deck pairings
-this cuts off roughly 4% of duels.
+`OCG_DuelProcess` call a budget of 15M Lua function calls (about 3 seconds;
+the slowest legitimate calls seen take about 2); a call that exceeds it makes
+`CoreHost::process` throw, so that duel fails instead of blocking. In random
+self-play across all deck pairings this cuts off roughly 3% of duels. The
+budget is counted in Lua's call path (`lua/src/ldo.c`) rather than with a
+count hook, which would make the VM check every instruction (~10% slower).
 
 `VectorEnv::info(env)` shows the seed, decks and actions of an env's current
 duel (also while `step` runs), which is enough to replay a stuck duel with
@@ -90,8 +92,9 @@ Fixed inputs live in `third_party/deps.json` (exact commits) and
 - `0003-memoize-sum-greater-check.patch`: the "at least N levels" material
   check (Ritual Summons) tried every subset when there was no solution; it now
   remembers partial results (same answers, polynomial time).
-- `0004-lua-instruction-budget.patch`: the per-call Lua instruction budget
-  above, with `OCG_DuelLuaBudgetExceeded`.
+- `0004-lua-call-budget.patch`: the per-call Lua call budget above, with
+  `OCG_DuelLuaBudgetExceeded` and `OCG_DuelLuaCalls`; it also patches the
+  bundled Lua (`lua/src`), so `setup_deps.py` resets that submodule too.
 
 `tools/setup_deps.py` applies the patches in order to a clean checkout and
 records their hashes in `.cache/ocgcore/.ocgforge-patches`.
