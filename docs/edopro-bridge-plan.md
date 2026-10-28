@@ -135,3 +135,19 @@ Gebaut: `ClientDuel` (C++, `src/client/`, Binding `ocgforge._core.ClientDuel`) u
 
 Damit ist das größte Risiko weg: Unser Decoder versteht EDOPro vollständig. Nächster Schritt ist M1
 (`QuerySource`/`ClientView`, damit das Modell statt des Zufalls entscheidet).
+
+## Ergebnis M1 (2026-10-28)
+
+- Statt eines `QuerySource` auf Byte-Ebene liest der Beobachtungsaufbau jetzt über
+  `detail::DecodedQueries` (dekodierte Abfragen); die Engine antwortet über einen Adapter um
+  `CoreHost`, der Client über `ClientView` (`src/client/client_view.cpp`).
+- `ClientView` führt das Feld aus den Servernachrichten: Updates, Moves, Draws, Swaps,
+  Positionswechsel, Zählmarken, LP, Kette. Ergänzt Besitzer, Xyz-Material und Zählmarken aus den
+  Ereignissen, Link-Wert/-Marker im Friedhof/Extra Deck aus der Kartendatenbank, verfolgt die Karten
+  offener Kettenglieder und vergisst „negiert“ außerhalb des Feldes.
+- `tests/client/client_view_test.cpp`: ein nachgebauter EDOPro-Server (Updates zum selben Zeitpunkt
+  wie `generic_duel.cpp`, für den Gegner nur die öffentlichen Daten wie `Query::GenerateBuffer`).
+  Bei 2379 Fragen in 12 Duellen ist die Modelleingabe exakt gleich der des Trainings.
+- Die echten Aufzeichnungen (642 Fragen) baut `ClientDuel` fehlerfrei zu Modelleingaben.
+- `ocgforge.edopro.client --checkpoint …` lässt das Modell spielen (Standard: wahrscheinlichste
+  Antwort); die Regeln kommen aus dem Raum, Abweichung von Master Rule 2020 wird gemeldet.

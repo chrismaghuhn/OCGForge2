@@ -260,7 +260,14 @@ NB_MODULE(_core, m) {
     };
     nb::class_<ClientDuel>(m, "ClientDuel",
                            "One player's side of a duel run by an EDOPro server: game messages in, responses out.")
-        .def(nb::init<std::uint8_t>(), "player"_a)
+        .def(
+            "__init__",
+            [](ClientDuel* self, std::uint8_t player, std::uint64_t duel_flags, const std::string& card_data_tsv,
+               std::vector<std::uint32_t> main_deck) {
+                new (self) ClientDuel(player, duel_flags, card_data_tsv, std::move(main_deck));
+            },
+            "player"_a, "duel_flags"_a = 0, "card_data_tsv"_a = "", "main_deck"_a = std::vector<std::uint32_t>{},
+            "duel_flags 0 = Master Rule 2020; without card_data_tsv no observations are built.")
         .def("feed", [to_vector](ClientDuel& self, const nb::bytes& message) { return self.feed(to_vector(message)); },
              "message"_a, "One STOC_GAME_MSG payload; True when it asks this player for a decision.")
         .def_prop_ro("pending", &ClientDuel::pending)
@@ -277,6 +284,15 @@ NB_MODULE(_core, m) {
                  out["candidates"] = keys;
                  return out;
              })
+        .def(
+            "encode",
+            [](const ClientDuel& self, const ygo::encode::CardIndex& card_index) {
+                if (self.observation() == nullptr) {
+                    throw std::logic_error("ClientDuel.encode needs a pending question and card data");
+                }
+                return to_dict(ygo::encode::encode(*self.observation(), self.request(), card_index));
+            },
+            "card_index"_a, "The pending question as model input (one row, like features.row).")
         .def("act",
              [](ClientDuel& self, const std::string& key) -> std::optional<nb::bytes> {
                  auto response = self.act(key);

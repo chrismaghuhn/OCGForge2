@@ -56,6 +56,8 @@ MSG_RETRY = 1
 MSG_START = 4
 MSG_WIN = 5
 
+DUEL_MODE_MR5 = 0x2E800  # Master Rule 2020: the rules the model is trained on
+
 ERRORS = {1: "join error", 2: "deck error", 3: "side error", 4: "version error", 5: "version error"}
 
 
@@ -111,6 +113,12 @@ def tp_result(go_first: bool) -> bytes:
 
 def response(data: bytes) -> bytes:
     return packet(CTOS_RESPONSE, data)
+
+
+def duel_flags(host_info: bytes) -> int:
+    """The room's duel flags from STOC_JOIN_GAME's HostInfo (duel_flag_high at 20, duel_flag_low at 44)."""
+    high, low = struct.unpack_from("<I", host_info, 20)[0], struct.unpack_from("<I", host_info, 44)[0]
+    return high << 32 | low
 
 
 def read_ydk(path: Path) -> tuple[list[int], list[int]]:

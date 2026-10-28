@@ -1,12 +1,13 @@
 """Join an EDOPro room as a duelist and play one duel.
 
-    python -m ocgforge.edopro.client --host 127.0.0.1 --port 7911 --deck decks/elfnote.ydk \\
+    python -m ocgforge.edopro.client --deck decks/elfnote.ydk --checkpoint runs/focus-large-s0/latest \\
         --record runs/edopro/duel.bin
 
-The room is created in EDOPro (LAN/host). The bot sends its deck, gets ready, and once the host
-starts, plays rock paper scissors, goes first if it may, and answers every question. For now it
-picks uniformly at random among the legal answers (the model comes with the observation bridge).
---record writes every packet, both directions, for offline replay: per packet u8 direction
+The room is created in EDOPro (LAN/host, Master Rule 2020: the rules the model is trained on). The
+bot sends its deck, gets ready, and once the host starts, plays rock paper scissors, goes first if it
+may, and answers every question: with --checkpoint the model's most likely answer (--sample samples
+instead), without it a uniformly random legal answer. It sees the duel as in training: ClientDuel
+builds the same observation from what the server sends this player. --record writes every packet, both directions, for offline replay: per packet u8 direction
 (0 = from the server, 1 = to it), u16 length, then the packet without its length prefix.
 """
 
@@ -20,15 +21,38 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+from .. import rollout
 from . import protocol as p
 
 
+def main_deck(path: Path) -> list[int]:
+    """The main deck passcodes of a .ydk file (without extra and side deck)."""
+    codes, section = [], None
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line.startswith(("#", "!")):
+            section = line if line in ("#main", "#extra", "!side") else section
+        elif line.isdigit() and section == "#main":
+            codes.append(int(line))
+    return codes
+
+
 class Bot:
-    def __init__(self, deck: Path, name: str, password: str, seed: int, record: Path | None):
+    def __init__(self, deck: Path, name: str, password: str, seed: int, record: Path | None,
+                 checkpoint: Path | None = None, sample: bool = False, device: str = "cpu"):
         from .._core import ClientDuel
 
         self.ClientDuel = ClientDuel
         self.deck = p.read_ydk(deck)
+        self.main_deck = main_deck(deck)
+        self.flags = 0
+        self.policy = self.index = None
+        if checkpoint is not None:
+            from ..model import load_checkpoint
+
+            model = load_checkpoint(checkpoint, device, dropout=0.0)
+            self.policy = rollout.ModelPolicy(model, device, sample=sample, seed=seed)
+            self.index = model.card_features.index_map()
         self.name, self.password = name, password
         self.rng = random.Random(seed)
         self.record = open(record, "wb") if record else None
@@ -67,7 +91,9 @@ class Bot:
     def on_packet(self, kind: int, payload: bytes) -> None:
         self.stats[p.STOC_NAMES.get(kind, hex(kind))] += 1
         if kind == p.STOC_JOIN_GAME:
-            print("joined the room", flush=True)
+            self.flags = p.duel_flags(payload)
+            rules = "Master Rule 2020" if self.flags == p.DUEL_MODE_MR5 else f"duel flags {self.flags:#x}, not Master Rule 2020"
+            print(f"joined the room ({rules})", flush=True)
             self.send(p.update_deck(*self.deck))
             self.send(p.packet(p.CTOS_HS_READY))
         elif kind == p.STOC_TYPE_CHANGE:
@@ -93,7 +119,8 @@ class Bot:
             return
         if message[0] == p.MSG_START:
             seat = message[1] & 0xF
-            self.duel = self.ClientDuel(seat)
+            card_data = str(rollout.REPO / ".cache" / "card_data.tsv") if self.policy else ""
+            self.duel = self.ClientDuel(seat, self.flags & 0xFFFFFFFF, card_data, self.main_deck)
             print(f"duel started, we are player {seat}", flush=True)
         if self.duel is None:
             return
@@ -114,11 +141,24 @@ class Bot:
             return
         while True:
             keys = self.duel.request()["candidates"]
-            answer = self.duel.act(self.rng.choice(keys))
+            answer = self.duel.act(keys[self.choose(len(keys))])
             if answer is not None:
                 self.stats["responses"] += 1
                 self.send(p.response(answer))
                 return
+
+
+    def choose(self, count: int) -> int:
+        """Index of the answer: the model's, or random without a model or when it fails."""
+        if self.policy is not None:
+            try:
+                choices, _, _ = self.policy([self.duel.encode(self.index)])
+                self.stats["model answers"] += 1
+                return choices[0]
+            except Exception as error:  # e.g. a question the encoder cannot represent
+                self.stats["random answers"] += 1
+                print(f"model could not answer ({error}); answering randomly", flush=True)
+        return self.rng.randrange(count)
 
 
 def main(argv=None) -> None:
@@ -130,10 +170,13 @@ def main(argv=None) -> None:
     parser.add_argument("--deck", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--record", type=Path)
+    parser.add_argument("--checkpoint", type=Path, help="model checkpoint directory, e.g. runs/x/latest")
+    parser.add_argument("--sample", action="store_true", help="sample answers instead of the most likely")
+    parser.add_argument("--device", default="cpu")
     args = parser.parse_args(argv)
     if args.record:
         args.record.parent.mkdir(parents=True, exist_ok=True)
-    bot = Bot(args.deck, args.name, args.password, args.seed, args.record)
+    bot = Bot(args.deck, args.name, args.password, args.seed, args.record, args.checkpoint, args.sample, args.device)
     try:
         asyncio.run(bot.run(args.host, args.port))
     finally:

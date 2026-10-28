@@ -58,11 +58,12 @@ add_library(ygo STATIC
     src/observation/serialization.cpp
     src/observation/zone_projection.cpp
     src/client/client_duel.cpp
+    src/client/client_view.cpp
     src/duel/duel.cpp
     src/encode/encoder.cpp
     src/encode/vector_env.cpp
 )
-target_include_directories(ygo PUBLIC include PRIVATE src/core src/observation)
+target_include_directories(ygo PUBLIC include PRIVATE src/core src/observation src/client)
 target_link_libraries(ygo PUBLIC ocgcore)
 target_compile_options(ygo PRIVATE -Wall -Wextra -Wpedantic)
 find_package(Threads REQUIRED)

@@ -14,6 +14,7 @@
 #include "common.h"
 #include "ocgapi_types.h"
 #include "query_decoder.hpp"
+#include "decoded_queries.hpp"
 #include "ygo/core/core_host.hpp"
 #include "ygo/observation/serialization.hpp"
 #include "zone_projection.hpp"
@@ -87,31 +88,11 @@ EntityKey entity_key(std::uint8_t controller, SemanticZone zone, std::uint32_t s
     return {controller, zone, sequence, overlay_sequence};
 }
 
-detail::RawCardQuery query_card_impl(const ygo::core::CoreHost& host, std::uint32_t flags, std::uint8_t controller,
-                                     std::uint32_t location, std::uint32_t sequence,
-                                     std::optional<std::uint32_t> overlay_sequence
-                                     ) {
-    OCG_QueryInfo info{};
-    info.flags = flags;
-    info.con = controller;
-    info.loc = location;
-    info.seq = sequence;
-    if (overlay_sequence.has_value()) {
-        info.loc |= LOCATION_OVERLAY;
-        info.overlay_seq = *overlay_sequence;
-    }
-
-    const auto bytes = host.query(info);
-    return bytes.empty() ? detail::RawCardQuery{} : detail::decode_card_query(bytes);
-}
-
-detail::RawCardQuery query_card(const ygo::core::CoreHost& host, std::uint32_t flags, std::uint8_t controller,
+detail::RawCardQuery query_card(const detail::DecodedQueries& host, std::uint32_t flags, std::uint8_t controller,
                                 std::uint32_t location, std::uint32_t sequence,
                                 std::optional<std::uint32_t> overlay_sequence = std::nullopt) {
-    return query_card_impl(host, flags, controller, location, sequence, overlay_sequence
-    );
+    return host.card(controller, location, sequence, overlay_sequence, flags);
 }
-
 
 std::string locator_for(std::uint8_t controller, SemanticZone zone, std::uint32_t sequence,
                         const detail::RawCardQuery& query, bool sequence_visible,
@@ -142,7 +123,7 @@ bool sequence_is_visible(SemanticZone zone, std::uint8_t owner, std::uint8_t per
     return false;
 }
 
-void add_zone_counts(PlayerObservation& observation, const ygo::core::CoreHost& host, std::uint32_t flags,
+void add_zone_counts(PlayerObservation& observation, const detail::DecodedQueries& host, std::uint32_t flags,
                      const detail::RawFieldSnapshot& field, std::uint8_t perspective
                      ) {
     for (std::uint8_t player = 0; player < 2; ++player) {
@@ -240,7 +221,7 @@ void add_zone_counts(PlayerObservation& observation, const ygo::core::CoreHost& 
 }
 
 std::optional<ObservationLocator> add_card_entity(
-    PlayerObservation& observation, const ygo::core::CoreHost& host,
+    PlayerObservation& observation, const detail::DecodedQueries& host,
     const detail::RawCardQuery& query, std::uint8_t owner, std::uint8_t controller,
     SemanticZone zone, std::uint32_t sequence, std::uint8_t perspective,
     std::map<std::pair<std::uint8_t, std::uint32_t>, std::uint32_t>& ordinals,
@@ -262,7 +243,7 @@ std::optional<ObservationLocator> add_card_entity(
     input.current_features_visible = identity_visible;
     input.sequence_visible = sequence_is_visible(zone, owner, perspective);
     if (identity_visible && query.code.has_value()) {
-        input.printed = host.static_card_data(*query.code);
+        input.printed = host.printed(*query.code);
     }
     auto projected = detail::project_card(input);
     locator_index[entity_key(controller, zone, sequence)] = projected.locator;
@@ -284,7 +265,7 @@ std::optional<ObservationLocator> find_locator(
 }
 
 std::optional<ObservationLocator> add_overlay_material(
-    PlayerObservation& observation, const ygo::core::CoreHost& host, std::uint32_t flags, std::uint8_t controller,
+    PlayerObservation& observation, const detail::DecodedQueries& host, std::uint32_t flags, std::uint8_t controller,
     std::uint32_t parent_location, std::uint32_t parent_sequence, std::uint32_t overlay_sequence,
     bool parent_identity_visible, std::map<EntityKey, ObservationLocator>& locator_index
     ) {
@@ -303,7 +284,7 @@ std::optional<ObservationLocator> add_overlay_material(
     input.current_features_visible = input.identity_visible;
     input.sequence_visible = true;
     if (input.identity_visible && query.code.has_value()) {
-        input.printed = host.static_card_data(*query.code);
+        input.printed = host.printed(*query.code);
     }
     auto projected = detail::project_card(input);
     locator_index[entity_key(controller, SemanticZone::Overlay, parent_sequence, overlay_sequence)] = projected.locator;
@@ -326,13 +307,12 @@ void project_event_globals(PlayerObservation& observation, const EventSummary& s
 
 }  // namespace
 
-PlayerObservation build_player_observation(const ygo::core::CoreHost& host,
-                                           std::uint8_t perspective_player,
-                                           ObservationBuildConfig config) {
+PlayerObservation detail::build_player_observation(const DecodedQueries& host, std::uint8_t perspective_player,
+                                                   ObservationBuildConfig config) {
     if (perspective_player > 1) {
         throw std::invalid_argument("observation perspective must be player 0 or 1");
     }
-    const auto field = detail::decode_field_query(host.query_field());
+    const auto field = host.field();
     PlayerObservation observation;
     observation.perspective_player = perspective_player;
     observation.decision_index = config.decision_index;
@@ -383,11 +363,7 @@ PlayerObservation build_player_observation(const ygo::core::CoreHost& host,
     std::vector<PendingRelationship> pending_relationships;
     for (std::uint8_t player = 0; player < 2; ++player) {
         for (const auto location : locations) {
-            OCG_QueryInfo info{};
-            info.flags = flags;
-            info.con = player;
-            info.loc = location;
-            const auto decoded = detail::decode_location_query(host.query_location(info));
+            const auto decoded = host.location(player, location, flags);
             for (std::uint32_t sequence = 0; sequence < decoded.entries.size(); ++sequence) {
                 if (!decoded.entries[sequence].has_value()) {
                     continue;
@@ -426,11 +402,7 @@ PlayerObservation build_player_observation(const ygo::core::CoreHost& host,
             }
         }
 
-        OCG_QueryInfo extra_info{};
-        extra_info.flags = flags;
-        extra_info.con = player;
-        extra_info.loc = LOCATION_EXTRA;
-        const auto extra = detail::decode_location_query(host.query_location(extra_info));
+        const auto extra = host.location(player, LOCATION_EXTRA, flags);
         for (std::uint32_t sequence = 0; sequence < extra.entries.size(); ++sequence) {
             if (!extra.entries[sequence].has_value()) {
                 continue;
@@ -480,6 +452,54 @@ PlayerObservation build_player_observation(const ygo::core::CoreHost& host,
     }
 
     return observation;
+}
+
+namespace {
+
+// The engine path: CoreHost's query buffers, decoded.
+class EngineQueries final : public detail::DecodedQueries {
+public:
+    explicit EngineQueries(const ygo::core::CoreHost& host) : host_(host) {}
+
+    detail::RawFieldSnapshot field() const override { return detail::decode_field_query(host_.query_field()); }
+
+    detail::RawLocationSnapshot location(std::uint8_t controller, std::uint32_t location,
+                                         std::uint32_t flags) const override {
+        OCG_QueryInfo info{};
+        info.flags = flags;
+        info.con = controller;
+        info.loc = location;
+        return detail::decode_location_query(host_.query_location(info));
+    }
+
+    detail::RawCardQuery card(std::uint8_t controller, std::uint32_t location, std::uint32_t sequence,
+                              std::optional<std::uint32_t> overlay_sequence, std::uint32_t flags) const override {
+        OCG_QueryInfo info{};
+        info.flags = flags;
+        info.con = controller;
+        info.loc = location;
+        info.seq = sequence;
+        if (overlay_sequence.has_value()) {
+            info.loc |= LOCATION_OVERLAY;
+            info.overlay_seq = *overlay_sequence;
+        }
+        const auto bytes = host_.query(info);
+        return bytes.empty() ? detail::RawCardQuery{} : detail::decode_card_query(bytes);
+    }
+
+    std::optional<ygo::core::StaticCardData> printed(std::uint32_t code) const override {
+        return host_.static_card_data(code);
+    }
+
+private:
+    const ygo::core::CoreHost& host_;
+};
+
+}  // namespace
+
+PlayerObservation build_player_observation(const ygo::core::CoreHost& host, std::uint8_t perspective_player,
+                                           ObservationBuildConfig config) {
+    return detail::build_player_observation(EngineQueries(host), perspective_player, std::move(config));
 }
 
 }  // namespace ygo::observation
