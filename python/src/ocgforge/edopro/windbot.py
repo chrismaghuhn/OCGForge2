@@ -33,10 +33,11 @@ def windbot_decks(directory: Path) -> list[str]:
 async def pairing(args, deck: Path, windbot_deck: str, room: int) -> dict:
     """`args.duels` duels of our bot with `deck` against WindBot with `windbot_deck`."""
     password = f"bench{os.getpid() % 10000}{room}"
+    env = {**os.environ, "OMP_NUM_THREADS": str(args.torch_threads)}  # many bots share the CPU
     client = await asyncio.create_subprocess_exec(
         sys.executable, "-m", "ocgforge.edopro.client", "--port", str(args.port), "--create", "--password", password,
         "--deck", str(deck), "--checkpoint", str(args.checkpoint), "--duels", str(args.duels), "--seed", str(room),
-        "--name", "OCGForge", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        "--name", "OCGForge", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env)
     windbot = None
     result = {"deck": deck.stem, "windbot": windbot_deck, "wins": 0, "losses": 0, "draws": 0, "errors": []}
     seat = None
@@ -75,17 +76,19 @@ async def pairing(args, deck: Path, windbot_deck: str, room: int) -> dict:
 
 
 async def run(args) -> list[dict]:
-    results = []
-    room = 0
-    for deck in args.decks:
-        for windbot_deck in args.windbot_decks:
-            room += 1
-            results.append(await pairing(args, deck, windbot_deck, room))
-            r = results[-1]
-            games = r["wins"] + r["losses"] + r["draws"]
-            print(f"{deck.stem} vs {windbot_deck}: {r['wins']}/{games} won"
-                  f"{', errors: ' + str(len(r['errors'])) if r['errors'] else ''}", flush=True)
-    return results
+    """Every pairing, --parallel at a time (each in its own room)."""
+    slots = asyncio.Semaphore(args.parallel)
+    pairs = [(deck, windbot_deck) for deck in args.decks for windbot_deck in args.windbot_decks]
+
+    async def one(room: int, deck: Path, windbot_deck: str) -> dict:
+        async with slots:
+            r = await pairing(args, deck, windbot_deck, room)
+        games = r["wins"] + r["losses"] + r["draws"]
+        print(f"{deck.stem} vs {windbot_deck}: {r['wins']}/{games} won"
+              f"{', errors: ' + str(len(r['errors'])) if r['errors'] else ''}", flush=True)
+        return r
+
+    return list(await asyncio.gather(*(one(room, deck, wb) for room, (deck, wb) in enumerate(pairs, 1))))
 
 
 def main(argv=None) -> None:
@@ -98,6 +101,8 @@ def main(argv=None) -> None:
     parser.add_argument("--windbot", type=Path, default=WINDBOT)
     parser.add_argument("--windbot-db", type=Path, default=WINDBOT.parent / "expansions" / "cards.cdb")
     parser.add_argument("--minutes-per-duel", type=float, default=10.0)
+    parser.add_argument("--parallel", type=int, default=6, help="pairings played at the same time")
+    parser.add_argument("--torch-threads", type=int, default=2, help="CPU threads for each bot's model")
     parser.add_argument("--out", type=Path, help="JSON file for the results")
     args = parser.parse_args(argv)
     args.windbot_decks = args.windbot_decks or windbot_decks(args.windbot)

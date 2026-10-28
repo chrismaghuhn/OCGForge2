@@ -164,3 +164,7 @@ auf Port 7920, Lobby 7921. WindBot (EDOPro-Installation, braucht mono) tritt per
 
 Unser Bot erstellt je Paarung einen Raum (`client --create`), WindBot spielt eines seiner 41
 Master-Rule-5-Decks, beide nehmen Revanchen an. Erster Test (Elfnote, 4 Duelle): 1 Sieg.
+Parallel: `--parallel 6` spielt sechs Paarungen gleichzeitig (je Bot 2 Torch-Threads), etwa
+10 Duelle pro Minute neben dem Training. Multirole braucht dafür `"lobbyMaxConnections": -1` (sonst
+4 Verbindungen pro IP). Nach einem Neustart von Multirole `run/sync` löschen: das Update aus den
+flachen lokalen Repos schlägt sonst fehl („object not found“).
