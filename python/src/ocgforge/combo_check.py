@@ -4,8 +4,11 @@
 
 Each combo becomes a solo puzzle: we go first with its starting cards (filled up to 5 from the
 decklist), the opponent holds a hand but never acts. A beam search over the engine's answers follows the combo's
-steps: answers that use the next step's card advance the combo, the model ranks everything else
-(materials, zones, targets). A combo counts as checked when every step card was used in order. The
+steps. A step is done when its card got where the step's action text says (summoned, added to hand,
+sent to the GY, ...; or, for a bare "use", named by an answer), checked on the board after each
+answer; the model ranks everything the steps do not decide (materials, zones, targets), and the
+book's end-board cards on the field rank lines too. A combo counts as checked when every step is
+done in order and at least 80 % of the book's end-board cards are on our field. The
 end board and the line (semantic keys) go into the combo book. Several deck shuffles per combo
 (--shuffles) keep draws and excavations honest: a combo only counts if it works in all of them.
 """
@@ -74,20 +77,75 @@ def candidate_logprobs(model, rows: list[dict], device: str) -> list[list[float]
     return [logprobs[i, : len(r["candidate_kind"])].tolist() for i, r in enumerate(rows)]
 
 
+# What a step's action text says happened to its card, as the location the card has to reach. None
+# means "the card was used" (its effect activated, it was selected, ...): any answer naming it.
+VERBS = [
+    (("synchro", "xyz", "link", "fusion", "ritual", "summon", "revive", "special"), worlds.LOCATION_MZONE),
+    (("add", "search", "hand", "draw", "return"), worlds.LOCATION_HAND),
+    (("send", "gy", "grave", "tribute", "discard", "material", "detach", "mill", "dump"), worlds.LOCATION_GRAVE),
+    (("banish",), worlds.LOCATION_REMOVED),
+    (("place", "set", "scale", "field"), worlds.LOCATION_SZONE),
+]
+
+
+def expected_location(action: str) -> int | None:
+    text = action.lower()
+    for words, location in VERBS:
+        if any(w in text for w in words):
+            return location
+    return None
+
+
+def board(duel) -> Counter:
+    """(passcode, location) -> count of our cards, for telling what an answer did."""
+    return Counter((c["code"], c["location"]) for c in duel.snapshot()["cards"] if c["controller"] == 0)
+
+
 @dataclass
 class Line:
     keys: list[str] = field(default_factory=list)  # every answer, both players
-    progress: int = 0  # step cards used so far
-    score: float = 0.0  # 10 per step card, plus the model's log-probabilities
-    used: list[int] = field(default_factory=list)  # index of the decision that used each step card
+    progress: int = 0  # steps done so far
+    score: float = 0.0  # the model's log-probabilities, plus bonuses
+    board: Counter = field(default_factory=Counter)  # our cards after the last answer
+    key_cards: int = 0  # book end-board cards on our field now
+    tried: frozenset = frozenset()  # (board, answer) pairs this line already played: no loops
+
+
+def advance(line: Line, targets: list[tuple[int, int | None]], last_key: str | None, now: Counter,
+            lookahead: int) -> int:
+    """How many steps the last answer completed: a step with a location is done when its card arrived
+    there; one without, when the answer named its card. A few steps may be skipped (the combo text
+    names cards the engine never acts on)."""
+    arrived = {code_loc for code_loc, n in (now - line.board).items() if n > 0}
+    named = worlds.card_ref(last_key) if last_key else None
+    progress = line.progress
+    for _ in range(4):  # one answer can complete several steps (a summon that is also a material)
+        for skip in range(lookahead):
+            i = progress + skip
+            if i >= len(targets):
+                break
+            code, location = targets[i]
+            if (location is not None and (code, location) in arrived) or (
+                    location is None and named is not None and int(named[1]) == code):
+                progress = i + 1
+                if location is not None:
+                    arrived.discard((code, location))
+                break
+        else:
+            break
+    return progress - line.progress
 
 
 def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12, branch: int = 4,
-          max_decisions: int = 150, lookahead: int = 3) -> tuple[Line, list[int]]:
+          max_decisions: int = 150, lookahead: int = 3) -> tuple[Line, list[tuple[int, int | None]]]:
     """Beam search through the combo from a fresh puzzle duel (`start()`); returns the best line and
-    the step cards (codes, in order) it had to follow."""
-    targets = [e.code for step in combo.steps for e in step if e.code is not None]
-    lines = [Line()]
+    the steps (card, expected location) it had to follow. Lines rank by steps done, then by how many
+    of the book's end-board cards are on the field, then by the model's log-probabilities."""
+    targets = [(e.code, expected_location(e.action)) for step in combo.steps for e in step if e.code is not None]
+    key_cards = Counter(combo.end_board)
+    rank = lambda l: (l.progress + 2 * l.key_cards, l.score)  # noqa: E731
+    first = start()
+    lines = [Line(board=board(first) if first is not None else Counter())]
     done: list[Line] = []
     for _ in range(max_decisions):
         expanded: list[tuple[Line, object]] = []
@@ -101,7 +159,15 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
                 key = worlds.decline(duel.keys())
                 duel.act(key)
                 line.keys.append(key)
-            if duel.finished or duel.turn > 1 or line.progress == len(targets):
+            now = board(duel)
+            mine = next((k for k in reversed(line.keys) if not k.startswith(("chain.pass", "yes_no.no"))), None)
+            line.progress += advance(line, targets, mine, now, lookahead)
+            line.board = now
+            field_now = Counter({code: n for (code, loc), n in now.items()
+                                 if loc in (worlds.LOCATION_MZONE, worlds.LOCATION_SZONE)})
+            line.key_cards = sum((key_cards & field_now).values())
+            if duel.finished or duel.turn > 1 or (line.progress == len(targets) and
+                                                  line.key_cards >= sum(key_cards.values())):
                 done.append(line)
             else:
                 expanded.append((line, duel))
@@ -111,27 +177,24 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
         children = []
         for (line, duel), lp in zip(expanded, logprobs):
             keys = duel.keys()
+            state = hash(tuple(sorted(line.board.items())))
+            upcoming = {code for code, _ in targets[line.progress:line.progress + lookahead]} | set(key_cards)
             options = []
             for i, key in enumerate(keys):
+                if (state, key) in line.tried and len(keys) > 1:
+                    continue  # same answer on the same board again: a summon cancelled and retried
                 ref = worlds.card_ref(key)
-                advance, value = 0, lp[i]
-                if ref is not None:
-                    code = int(ref[1])
-                    # The next step card, or one a little later: the combo text names cards the
-                    # engine never asks about (an effect that just resolves), so steps may be skipped.
-                    for skip in range(lookahead):
-                        if line.progress + skip < len(targets) and code == targets[line.progress + skip]:
-                            advance, value = skip + 1, value + 10.0 - 3.0 * skip
-                            break
+                value = lp[i]
+                if ref is not None and int(ref[1]) in upcoming:
+                    value += 5.0  # likely to move the combo on; the board decides next round
                 elif line.progress < len(targets) and PHASE_END.match(key):
                     value -= 20.0  # leaving Main Phase 1 with the combo unfinished
-                options.append((value, i, advance))
-            for value, i, advance in sorted(options, reverse=True)[:branch]:
-                child = Line(line.keys + [keys[i]], line.progress + advance, line.score + value,
-                             line.used + [len(line.keys)] * advance)
-                children.append(child)
-        lines = sorted(children, key=lambda l: (l.progress, l.score), reverse=True)[:beam]
-    best = max(done + lines, key=lambda l: (l.progress, l.score))
+                options.append((value, i))
+            for value, i in sorted(options, reverse=True)[:branch]:
+                children.append(Line(line.keys + [keys[i]], line.progress, line.score + value, line.board,
+                                     line.key_cards, line.tried | {(state, keys[i])}))
+        lines = sorted(children, key=rank, reverse=True)[:beam]
+    best = max(done + lines, key=rank)
     return best, targets
 
 
@@ -155,6 +218,8 @@ def main(argv=None) -> None:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--shuffles", type=int, default=3, help="deck orders a combo must work in")
     parser.add_argument("--beam", type=int, default=12)
+    parser.add_argument("--branch", type=int, default=4, help="answers tried per line and decision")
+    parser.add_argument("--title", help="only combos whose title contains this")
     parser.add_argument("--limit", type=int, default=0, help="check only the best-voted N combos")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--out", type=Path, help="combo book (JSON lines)")
@@ -170,11 +235,14 @@ def main(argv=None) -> None:
     opponent = worlds.read_decklist(args.opponent)[0]
     combos = sorted((c for c in cb.load(args.deck_type, names) if c.usable and c.steps),
                     key=lambda c: -c.votes)
+    if args.title:
+        combos = [c for c in combos if args.title in c.title]
     if args.limit:
         combos = combos[: args.limit]
     cache = rollout.REPO / ".cache"
     verbs = Counter()  # action text -> [used, total]
     verbs_used = Counter()
+    located = Counter()  # step texts mapped to a location (True) or only "card named" (False)
     results = []
     for n, combo in enumerate(combos):
         checked = 0
@@ -193,8 +261,9 @@ def main(argv=None) -> None:
                     duel.act(worlds.decline(duel.keys()))
                 return None if duel.finished else duel
 
-            line, targets = check(combo, start, model, card_index, args.device, beam=args.beam)
-            ok = bool(targets) and line.progress == len(targets)
+            line, targets = check(combo, start, model, card_index, args.device, beam=args.beam, branch=args.branch)
+            ok = bool(targets) and line.progress == len(targets) and (
+                not combo.end_board or line.key_cards >= 0.8 * len(combo.end_board))
             checked += ok
             if best is None or line.progress > best[0].progress:
                 best = (line, targets, start)
@@ -204,6 +273,7 @@ def main(argv=None) -> None:
             verb = e.action.strip().lower() or "(use)"
             verbs[verb] += 1
             verbs_used[verb] += i < line.progress
+            located[expected_location(e.action) is not None] += 1
         duel = start()
         for key in line.keys:
             duel.act(key)
@@ -218,6 +288,7 @@ def main(argv=None) -> None:
               f"steps, {checked}/{args.shuffles} shuffles  {combo.title[:60]}", flush=True)
     passed = sum(r["checked"] for r in results)
     print(f"checked: {passed}/{len(results)} combos ({passed / max(1, len(results)):.0%})")
+    print(f"steps with a location: {located[True]}, only named: {located[False]}")
     print("verb coverage (used/total):", {v: f"{verbs_used[v]}/{verbs[v]}" for v, _ in verbs.most_common(20)})
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
