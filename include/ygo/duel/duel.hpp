@@ -8,6 +8,8 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "ygo/core/deck.hpp"
 #include "ygo/observation/player_observation.hpp"
@@ -41,6 +43,10 @@ struct DuelConfig {
     // Questions with a single candidate are not counted; multi-step (continuation) questions only
     // count towards max_repeats. block_after = 0 turns blocking off: visit max_repeats + 1 then
     // throws a "stuck" DuelError (the old behaviour also had max_repeats = 16).
+    // When set, the decks are not loaded: this Lua script (a puzzle: Debug.ReloadFieldBegin, AddCard,
+    // ReloadFieldEnd) builds the whole field before the duel starts, e.g. a sampled world for search.
+    // deck0/deck1 then only list the cards whose scripts to preload.
+    std::string fixture_script;
     std::uint64_t max_decisions = 5000;
     std::uint32_t block_after = 8;
     std::uint32_t max_repeats = 64;
@@ -48,6 +54,25 @@ struct DuelConfig {
 
 // DuelResult::reason of a duel lost by looping (see DuelConfig::block_after).
 constexpr std::uint8_t kLoopLoss = 0xF0;
+
+// Every card of a duel as the engine knows it (hidden ones included): what search needs to build
+// worlds from, after hiding what the searching player cannot see.
+struct CardState {
+    std::uint8_t controller = 0;
+    std::uint8_t owner = 0;
+    std::uint32_t location = 0;
+    std::uint32_t sequence = 0;
+    std::uint32_t code = 0;
+    std::uint32_t position = 0;
+    bool is_public = false;
+    std::vector<std::uint32_t> materials;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> counters;  // type, count
+};
+
+struct DuelSnapshot {
+    std::uint32_t life_points[2] = {0, 0};
+    std::vector<CardState> cards;
+};
 
 struct DuelResult {
     std::uint8_t winner = 255;
@@ -89,6 +114,8 @@ public:
     void act(const std::string& semantic_key);
 
     std::uint64_t decision_count() const noexcept { return decision_count_; }
+    // Privileged: the full state, hidden cards included.
+    DuelSnapshot snapshot() const;
     // Answers removed so far by loop blocking.
     std::uint64_t blocked_answers() const noexcept { return blocked_answers_; }
 

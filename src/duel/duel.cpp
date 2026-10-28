@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "ocgapi_constants.h"
+#include "ocgapi_types.h"
 #include "ygo/core/core_host.hpp"
 #include "ygo/observation/decision_integration.hpp"
 #include "ygo/observation/observation_builder.hpp"
@@ -12,6 +13,7 @@
 #include "ygo/protocol/continuation.hpp"
 #include "ygo/protocol/message_decoder.hpp"
 #include "ygo/util/sha256.hpp"
+#include "query_decoder.hpp"
 
 namespace ygo::duel {
 namespace {
@@ -35,8 +37,12 @@ Duel::Duel(DuelConfig config) : config_(std::move(config)) {
     host_config.required_script_codes = core::card_codes(config_.deck0, config_.deck1);
 
     host_ = std::make_unique<core::CoreHost>(std::move(host_config));
-    host_->load_deck(0, config_.deck0);
-    host_->load_deck(1, config_.deck1);
+    if (config_.fixture_script.empty()) {
+        host_->load_deck(0, config_.deck0);
+        host_->load_deck(1, config_.deck1);
+    } else {
+        host_->load_script_text("world.lua", config_.fixture_script);
+    }
     host_->start_duel();
     for (std::uint8_t player = 0; player < 2; ++player) {
         sessions_[player] = std::make_unique<observation::ObservationSession>(player, DUEL_MODE_MR5);
@@ -229,6 +235,43 @@ void Duel::publish(protocol::DecisionRequest request) {
             fail("candidate refers to a card the player cannot see: " + candidate.semantic_key);
         }
     }
+}
+
+DuelSnapshot Duel::snapshot() const {
+    DuelSnapshot snapshot;
+    const auto field = observation::detail::decode_field_query(host_->query_field());
+    for (std::uint8_t player = 0; player < 2; ++player) {
+        snapshot.life_points[player] = field.players[player].life_points;
+        for (const auto location : {LOCATION_DECK, LOCATION_HAND, LOCATION_MZONE, LOCATION_SZONE, LOCATION_GRAVE,
+                                    LOCATION_REMOVED, LOCATION_EXTRA}) {
+            OCG_QueryInfo info{};
+            info.flags = QUERY_CODE | QUERY_POSITION | QUERY_OWNER | QUERY_IS_PUBLIC | QUERY_OVERLAY_CARD |
+                         QUERY_COUNTERS;
+            info.con = player;
+            info.loc = location;
+            const auto cards = observation::detail::decode_location_query(host_->query_location(info));
+            for (std::uint32_t sequence = 0; sequence < cards.entries.size(); ++sequence) {
+                const auto& query = cards.entries[sequence];
+                if (!query) {
+                    continue;
+                }
+                CardState card;
+                card.controller = player;
+                card.owner = query->owner.value_or(player);
+                card.location = location;
+                card.sequence = sequence;
+                card.code = query->code.value_or(0);
+                card.position = query->position.value_or(0);
+                card.is_public = query->is_public.value_or(0) != 0;
+                card.materials = query->overlay_codes;
+                for (const auto& counter : query->counters) {
+                    card.counters.emplace_back(counter.type, counter.count);
+                }
+                snapshot.cards.push_back(std::move(card));
+            }
+        }
+    }
+    return snapshot;
 }
 
 void Duel::fail(const std::string& message) const {

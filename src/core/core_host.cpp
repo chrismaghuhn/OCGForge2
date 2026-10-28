@@ -177,6 +177,13 @@ void CoreHost::load_fixture_script(const std::filesystem::path& path) {
     throw_if_callback_error("OCG_LoadScript");
 }
 
+void CoreHost::load_script_text(const std::string& name, const std::string& text) {
+    if (OCG_LoadScript(impl_->duel, text.data(), static_cast<std::uint32_t>(text.size()), name.c_str()) == 0) {
+        throw CoreError(CoreErrorCode::Callback, "OCG_LoadScript", "script rejected: " + name);
+    }
+    throw_if_callback_error("OCG_LoadScript");
+}
+
 void CoreHost::start_duel() {
     if (config_.starting_player.has_value()) {
         const int status = OCG_DuelSetStartingPlayer(impl_->duel, *config_.starting_player);

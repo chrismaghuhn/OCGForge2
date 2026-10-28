@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "ygo/core/card_data.hpp"
@@ -60,6 +61,8 @@ public:
     void load_fixture_card(std::uint8_t team, std::uint32_t code, std::uint32_t location,
                            std::uint32_t sequence, std::uint32_t position);
     void load_fixture_script(const std::filesystem::path& path);
+    // A Lua script run before the duel starts, e.g. a puzzle that builds the field (Debug.AddCard).
+    void load_script_text(const std::string& name, const std::string& text);
     void start_duel();
     ProcessResult process();
     void submit_response(const std::vector<std::uint8_t>& response);

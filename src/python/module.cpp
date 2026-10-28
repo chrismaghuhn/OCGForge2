@@ -5,6 +5,7 @@
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/pair.h>
+#include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/unordered_map.h>
 #include <nanobind/stl/vector.h>
@@ -276,6 +277,45 @@ NB_MODULE(_core, m) {
             },
             "card_scripts_root"_a, "card_data_tsv"_a, "deck0"_a, "deck1"_a, "seed"_a, "starting_player"_a,
             "max_decisions"_a = 5000)
+        .def_static(
+            "world",
+            [](const std::string& card_scripts_root, const std::string& card_data_tsv, const std::string& deck0,
+               const std::string& deck1, const std::string& script, std::uint64_t seed, std::uint8_t starting_player) {
+                ygo::duel::DuelConfig config;
+                config.card_scripts_root = card_scripts_root;
+                config.card_data_tsv = card_data_tsv;
+                config.deck0 = ygo::core::load_deck(deck0);
+                config.deck1 = ygo::core::load_deck(deck1);
+                config.fixture_script = script;
+                config.seed = seed;
+                config.starting_player = starting_player;
+                return std::make_unique<Duel>(std::move(config));
+            },
+            "card_scripts_root"_a, "card_data_tsv"_a, "deck0"_a, "deck1"_a, "script"_a, "seed"_a, "starting_player"_a,
+            "A duel whose field a puzzle script builds (search worlds); the decks give the decklists.")
+        .def("snapshot",
+             [](const Duel& d) {
+                 const auto snapshot = d.snapshot();
+                 nb::list cards;
+                 for (const auto& c : snapshot.cards) {
+                     nb::dict card;
+                     card["controller"] = c.controller;
+                     card["owner"] = c.owner;
+                     card["location"] = c.location;
+                     card["sequence"] = c.sequence;
+                     card["code"] = c.code;
+                     card["position"] = c.position;
+                     card["public"] = c.is_public;
+                     card["materials"] = c.materials;
+                     card["counters"] = c.counters;
+                     cards.append(card);
+                 }
+                 nb::dict out;
+                 out["life_points"] = nb::make_tuple(snapshot.life_points[0], snapshot.life_points[1]);
+                 out["cards"] = cards;
+                 return out;
+             },
+             "Privileged: every card, hidden ones included (for building search worlds after hiding).")
         .def("act", &Duel::act, "semantic_key"_a, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("finished", &Duel::finished)
         .def_prop_ro("winner", [](const Duel& d) -> std::optional<std::uint8_t> {
