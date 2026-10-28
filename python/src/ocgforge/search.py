@@ -100,7 +100,7 @@ def search_turn(spec: DuelSpec, actions: list[str], policy, card_index, k: int =
 
 def honest_search(spec: DuelSpec, duel, policy, card_index, lines: int = 8, worlds_per_line: int = 8,
                   max_decisions: int = 80, seed: int = 0, pool: ThreadPoolExecutor | None = None,
-                  make_world=None, segment: int = 0) -> SearchResult:
+                  make_world=None, segment: int = 0, deterministic: bool = True) -> SearchResult:
     """Search without peeking: from `duel` at the searching player's first idle command of its turn,
     build `worlds_per_line` worlds from what that player can see (ocgforge.worlds), generate `lines`
     candidate plans (rollout 0 the most likely answers, the others sampled, each in its own world),
@@ -124,7 +124,7 @@ def honest_search(spec: DuelSpec, duel, policy, card_index, lines: int = 8, worl
                    for _ in range(max(lines, worlds_per_line))]
         make_world = lambda i: w.start_world(spec, scripts[i], me, seed + i)  # noqa: E731
 
-    def run(plans: list[list[str] | None], world_ids: list[int], greedy_mine: list[bool]):
+    def run(plans: list[list[str] | None], world_ids: list[int], greedy_mine: list[bool], greedy_other: bool = False):
         """Play each (plan, world) to the end of the turn; returns per-run scores and my answers."""
         duels = list(pool.map(make_world, world_ids))
         n = len(duels)
@@ -156,7 +156,10 @@ def honest_search(spec: DuelSpec, duel, policy, card_index, lines: int = 8, worl
                     key = w.match(plans[i][steps[i]], keys)
                     steps[i] += 1
                 if key is None:
-                    choice = greedy[n_] if (d.player == me and (plans[i] is not None or greedy_mine[i])) else sampled[n_]
+                    if d.player == me:
+                        choice = greedy[n_] if plans[i] is not None or greedy_mine[i] else sampled[n_]
+                    else:
+                        choice = greedy[n_] if greedy_other else sampled[n_]
                     key = keys[choice]
                 if d.player == me:
                     mine[i].append(w.canonical(key))
@@ -178,10 +181,12 @@ def honest_search(spec: DuelSpec, duel, policy, card_index, lines: int = 8, worl
     unique = list(dict.fromkeys(tuple(p) for p in plans))
     if not unique:  # no world could be built (or the player had nothing to do)
         return SearchResult([], 0.0, 0.0, [])
-    # Every plan in every world.
+    # Every plan in every world, with common random numbers: world j is the same script and engine
+    # seed for every plan, and everyone answers deterministically (the opponent too), so two plans'
+    # scores in a world differ only by the plans, not by dice.
     grid_plans = [list(p) for p in unique for _ in range(worlds_per_line)]
     grid_worlds = [j for _ in unique for j in range(worlds_per_line)]
-    scores, _ = run(grid_plans, grid_worlds, [False] * len(grid_plans))
+    scores, _ = run(grid_plans, grid_worlds, [False] * len(grid_plans), greedy_other=deterministic)
     means = [sum(scores[k * worlds_per_line:(k + 1) * worlds_per_line]) / worlds_per_line for k in range(len(unique))]
     best = max(range(len(unique)), key=lambda k: means[k])
     greedy_k = unique.index(tuple(candidates[0])) if candidates[0] else best
