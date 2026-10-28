@@ -151,6 +151,57 @@ Nach dem Pilot mit Elfnote alle Trainingsdecks mit ausreichend Daten (siehe Zuor
 - K3: Combo-Abschluss steigt nicht, oder WindBot-Benchmark bzw. Arena fällt klar → Imitationsgewicht
   senken oder Szenarien aus dem Training nehmen.
 
+## K1-Befund: Lucina 1cc von Hand (2026-10-28)
+
+Ein lokales Skript (`runs/diagnose/drive.py`, nicht im Repo; `runs/` ist ignoriert) spielt die Combo
+mit expliziten Antworten komplett durch: 85 Antworten, Ende mit Baronne, Welcome Home,
+Rhapsodia auf dem Feld, Ecclesia and the Dark Dragon bis zur End Phase verbannt, Omega hat eine
+Gegnerkarte verbannt (Gegnerhand 5 → 4). Die 29 Planschritte reichen also; was fehlt, sind Regeln
+für die Fragen dazwischen. Aufteilung der 85 Antworten:
+
+| Art | Anzahl | Regel |
+|---|---|---|
+| Ziehen-/Standby-Fenster, eigene Ketten ohne Plan | 10 auto + 6 pass | Passen. Nie eigene Handtraps/Baronne/Regina auf die eigene Kette legen. |
+| Position | 11 | Offen angriff (deterministisch). |
+| Idle (Beschwören, Aktivieren, Synchro) | 11 | Nächster Planschritt (Verb + Karte). |
+| Kette mit Plankarte (Quick Effects, Fallen) | 5 | Aktivieren, wenn die Karte im nächsten Planschritt „activate“ hat. |
+| Karte wählen (Suche, Ziel, Beschwörung) | 13 | Die Karte des nächsten Planschritts; sonst die, die später im Plan vorkommt. |
+| Synchro-Material | 8 | Planbenannte Karten; nie Karten des Endboards (Baronne). Stufensumme muss passen. |
+| Zone | 15 | Siehe unten – hier scheitert die Suche bisher am meisten. |
+| Ja/Nein | 6 | Ja bei Auslösern, die zur nächsten Plankarte führen; sonst beide Zweige prüfen. |
+
+Regeln, die `combo_check.check()` dafür braucht:
+
+1. **Deterministisch statt Beam:** Passen, Position, Ziehen/Standby: keine Verzweigung (fast 40 % der
+   Antworten). Spart Beam-Breite für die echten Entscheidungen.
+2. **Mittlere Zone:** Elfnote-Hauptdeck-Monster mit „center“-Effekten (Lucina, Tinia, Regina) und
+   Strelitzia (3000 ATK nur in der Mitte) in `place.0.4.2`. Vorher die Mitte freihalten: Hilfsmonster
+   (Power Patron, Fortuna, Fallen, Incredible Ecclesia) in Seitenzonen.
+3. **Extra Monster Zone** für Extra-Deck-Monster, die nicht in die Mitte gehören (Baronne →
+   `place.0.4.5`); sonst blockiert sie später eine Hauptzone.
+4. **Zone frei lassen** für Karten, die zurückkehren (Ecclesia kommt in der End Phase zurück).
+5. **Optionale Ja/Nein-Fragen, die keine Plankarte betreffen, mit Vorausschau entscheiden:**
+   Strelitzias Stufensenkung muss „nein“ sein (Power Patron 1 + Strelitzia 7 = 8 für Ecclesia);
+   die Synchro-Frage nach Power Patrons Effekt muss „nein“ sein, weil der Plan Baronne aus dem
+   Idle will. Regel: beide Zweige ein paar Schritte weit spielen, den nehmen, in dem der nächste
+   Planschritt als Antwort existiert.
+6. **Einmal pro Zug beachten:** Power Patrons Suche als Synchro-Material greift beim zweiten Mal
+   nicht; der Plan darf so einen Schritt nicht als Pflicht verlangen (Schritt überspringen, wenn
+   die Engine ihn nicht anbietet).
+7. **Endboard-Karten schützen:** keine Karte als Material/Kosten verwenden, die im Endboard steht.
+
+Umgesetzt in `combo_check.check()`: feste Position und Zone (`forced`), Ketten nur mit Karten der
+nächsten Schritte (sonst passen), Ja/Nein ohne Modell (beide Zweige bleiben im Beam), Endboard-Karten
+nicht als Material, Bonus nach Nähe zum nächsten Schritt, Rang nach erledigten Schritten (ein
+übersprungener Schritt zählt nicht; „geprüft“ erlaubt höchstens 2), doppelte Zustände raus. Mit den
+festen Zonen läuft die Hand-Linie von Lucina 1cc weiter komplett.
+
+K1 danach (5 Elfnote-Combos, 1 Mischung): 0/5 geprüft. Schritte vorher → nachher: Lucina 1cc 6 → 25/29,
+Lucina 1.5 5 → 28/29, Tinia 5 → 12/27, Regina 7 → 7/20, Welcome Home 2 → 10/24 – aber mit 2–11
+übersprungenen Schritten. Die Suche weicht noch an Stellen ab, an denen das Modell eine andere,
+ebenso legale Karte bevorzugt (Welcome Home ruft Fortuna statt Regina). Nächster Hebel: an solchen
+Stellen nur die Karte des nächsten Schritts zulassen, wenn sie angeboten wird.
+
 ## Risiken und offene Fragen
 
 - **Master Duel ≠ TCG:** andere Banlist, einige Karten fehlen oder sind anders; die Engine-Prüfung
