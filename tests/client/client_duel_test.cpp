@@ -119,3 +119,40 @@ TEST_CASE("ClientDuel stops offering an answer given 8 times to the same questio
     }
     CHECK(client.blocked_answers() == 1);
 }
+
+TEST_CASE("ClientDuel asks the last question again after MSG_RETRY, without the rejected answer") {
+    const auto config = test::duel_config(3);
+    ygo::core::CoreHostConfig host_config;
+    host_config.card_scripts_root = config.card_scripts_root;
+    host_config.card_data_tsv = config.card_data_tsv;
+    host_config.seed = ygo::core::derive_seed_bundle(3);
+    host_config.duel_flags = DUEL_MODE_MR5;
+    host_config.starting_player = 0;
+    host_config.required_script_codes = ygo::core::card_codes(config.deck0, config.deck1);
+    ygo::core::CoreHost host(host_config);
+    host.load_deck(0, config.deck0);
+    host.load_deck(1, config.deck1);
+    host.start_duel();
+    ygo::client::ClientDuel client(0, DUEL_MODE_MR5, config.card_data_tsv, config.deck0.main_deck);
+    CHECK_FALSE(client.feed({MSG_RETRY}));  // nothing asked yet
+    bool idle = false;
+    while (!idle) {
+        for (const auto& message : split(host.process().message)) {
+            if (client.feed(message) && message[0] == MSG_SELECT_IDLECMD) {
+                idle = true;
+            } else if (client.pending()) {
+                host.submit_response(*client.act(client.request().candidates.front().semantic_key));
+            }
+        }
+    }
+    const auto rejected = client.request().candidates.front().semantic_key;
+    const auto offered = client.request().candidates.size();
+    REQUIRE(client.act(rejected).has_value());
+    CHECK_FALSE(client.pending());
+    REQUIRE(client.feed({MSG_RETRY}));
+    CHECK(client.request().candidates.size() == offered - 1);
+    for (const auto& candidate : client.request().candidates) {
+        CHECK(candidate.semantic_key != rejected);
+    }
+    CHECK(client.observation() != nullptr);
+}

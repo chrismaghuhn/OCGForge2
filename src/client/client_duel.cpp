@@ -87,6 +87,25 @@ bool ClientDuel::feed(const std::vector<std::uint8_t>& message) {
     if (decoded.terminal) {
         winner_ = decoded.winner;
     }
+    if (decoded.retry) {
+        // The server rejected our last response and does not ask again: ask the last root question
+        // again, without the rejected answer.
+        if (!last_root_) {
+            return false;
+        }
+        auto retry = *last_root_;
+        if (!retry.continuation && retry.candidates.size() > 1) {
+            std::erase_if(retry.candidates, [&](const protocol::ActionCandidate& candidate) {
+                return candidate.semantic_key == last_answer_;
+            });
+        }
+        state_.clear();
+        last_root_ = retry;
+        last_answer_.clear();
+        request_ = std::move(retry);
+        observe();
+        return true;
+    }
     if (!decoded.interactive) {
         return false;
     }
@@ -111,6 +130,8 @@ bool ClientDuel::feed(const std::vector<std::uint8_t>& message) {
             }
         }
     }
+    last_root_ = request;
+    last_answer_.clear();
     request_ = std::move(request);
     observe();
     return true;
@@ -140,6 +161,9 @@ void ClientDuel::observe() {
 std::optional<std::vector<std::uint8_t>> ClientDuel::act(const std::string& semantic_key) {
     const auto& candidate = protocol::select_candidate(request(), semantic_key);
     ++decisions_;
+    if (last_answer_.empty()) {
+        last_answer_ = candidate.semantic_key;  // the root question's answer, for a retry
+    }
     if (!state_.empty() && ++answers_[state_][candidate.semantic_key] == block_after_) {
         ++blocked_answers_;
     }

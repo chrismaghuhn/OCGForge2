@@ -341,6 +341,9 @@ NB_MODULE(_core, m) {
             return o && o->globals.turn_player ? *o->globals.turn_player : 255;
         })
         .def("encode", [](const Duel& d, const ygo::encode::CardIndex& card_index) {
+            if (d.observation() == nullptr) {
+                throw std::logic_error("Duel.encode needs a pending decision (the duel is over)");
+            }
             return to_dict(ygo::encode::encode(*d.observation(), d.request(), card_index));
         }, "card_index"_a, "The pending decision as model input (one row, like features.row).");
 

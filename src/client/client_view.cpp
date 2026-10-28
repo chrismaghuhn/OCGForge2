@@ -130,8 +130,10 @@ void ClientView::put(const Location& to, Card card) {
         }
         return;
     }
-    card.materials.clear();  // an Xyz Monster's materials are detached by their own moves
-    card.counters.clear();
+    if (!(to.location & (LOCATION_MZONE | LOCATION_SZONE))) {
+        card.materials.clear();  // materials and counters stay with a card moving on the field
+        card.counters.clear();
+    }
     if (to.location == LOCATION_DECK) {
         ++sides_.at(to.controller & 1).deck;
         return;

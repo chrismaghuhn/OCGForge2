@@ -62,11 +62,14 @@ def match(key: str, keys: list[str]) -> str | None:
 
 def card_ref(key: str):
     """(answer kind, passcode, controller, location) of an answer about a card, else None. Keys that
-    name a card end in passcode, controller, location, sequence."""
+    name a card end in passcode, controller, location, sequence; for idle and battle commands the kind
+    keeps the command, so summoning a card never matches setting it."""
     parts = key.split(".")
     if len(parts) < 5 or not all(p.isdigit() for p in parts[-4:]) or int(parts[-4]) < 1000:
         return None
     kind = tuple(p for p in parts[:-4] if not p.isdigit())
+    if parts[0] in ("idle", "battle"):
+        kind += (parts[1],)  # the command (summon, set, activate, ...), not the list index
     return kind, parts[-4], parts[-3], parts[-2]
 
 
@@ -115,15 +118,18 @@ def start_world(spec, script: str, me: int, seed: int, max_steps: int = 50):
     from . import rollout
 
     cache = rollout.REPO / ".cache"
-    duel = Duel.world(str(cache / "cardscripts"), str(cache / "card_data.tsv"), str(spec.deck0), str(spec.deck1),
-                      script, seed, me)
-    for _ in range(max_steps):
-        if duel.finished:
-            return None
-        keys = duel.keys()
-        if duel.player == me and keys[0].startswith("idle"):
-            return duel
-        duel.act(decline(keys))
+    try:
+        duel = Duel.world(str(cache / "cardscripts"), str(cache / "card_data.tsv"), str(spec.deck0),
+                          str(spec.deck1), script, seed, me)
+        for _ in range(max_steps):
+            if duel.finished:
+                return None
+            keys = duel.keys()
+            if duel.player == me and keys[0].startswith("idle"):
+                return duel
+            duel.act(decline(keys))
+    except Exception:  # a script the engine rejects, an engine error: this world went wrong
+        return None
     return None
 
 
@@ -153,23 +159,31 @@ def world_now(spec, start: dict, now: dict, history: list[str], me: int, decklis
         duel = start_world(spec, script, me, seed + attempt)
         if duel is None:
             continue
-        for key in history:
-            found = None
-            for _ in range(8):  # questions the real duel did not ask (a sampled card's window): decline
-                if duel.finished:
-                    break
-                keys = duel.keys()
-                found = match(key, keys)
-                if found is not None or decline(keys) == keys[0] and keys[0] not in ("chain.pass", "yes_no.no"):
-                    break
-                duel.act(decline(keys))
-            if found is None:
-                duel = None
-                break
-            duel.act(found)
+        try:
+            duel = replay(duel, history)
+        except Exception:  # the engine failed on a sampled card
+            duel = None
         if duel is not None and not duel.finished:
             return duel
     return None
+
+
+def replay(duel, history: list[str]):
+    """`history` replayed into a world; None when the world cannot follow it."""
+    for key in history:
+        found = None
+        for _ in range(8):  # questions the real duel did not ask (a sampled card's window): decline
+            if duel.finished:
+                break
+            keys = duel.keys()
+            found = match(key, keys)
+            if found is not None or decline(keys) == keys[0] and keys[0] not in ("chain.pass", "yes_no.no"):
+                break
+            duel.act(decline(keys))
+        if found is None:
+            return None
+        duel.act(found)
+    return duel
 
 
 def read_decklist(path: Path) -> tuple[list[int], list[int]]:
@@ -239,14 +253,15 @@ def sample_world(snapshot: dict, me: int, decklists: dict[int, tuple[list[int], 
                         if code in pool:
                             pool.remove(code)
                             break
-        for c in cards:
+        # Hand, field and Extra Deck first, the deck last: `revealed` cards (dealt first) belong where
+        # the opponent played them from, not in its deck.
+        for c in sorted(cards, key=lambda c: c["location"] == LOCATION_DECK):
             if c["owner"] != opponent or visible(c, me) or c.get("forced"):
                 continue
             from_extra = c["location"] == LOCATION_EXTRA
             source = extra_left if from_extra else main_left
-            if source:
-                c["code"] = source.pop()
-            c["materials"] = [m if m else (main_left.pop() if main_left else m) for m in c["materials"]]
+            c["code"] = source.pop() if source else 0  # no card left to deal: leave it out, never the truth
+            c["materials"] = [main_left.pop() if main_left else 0 for _ in c["materials"]]
     lines = [f"Debug.ReloadFieldBegin({DUEL_ATTACK_FIRST_TURN},5)", "local c"]
     for player in (0, 1):
         lines.append(f"Debug.SetPlayerInfo({player},{snapshot['life_points'][player]},0,0)")  # only this turn is played

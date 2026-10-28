@@ -127,6 +127,14 @@ def honest_search(spec: DuelSpec, duel, policy, card_index, lines: int = 8, worl
     def run(plans: list[list[str] | None], world_ids: list[int], greedy_mine: list[bool], greedy_other: bool = False):
         """Play each (plan, world) to the end of the turn; returns per-run scores and my answers."""
         duels = list(pool.map(make_world, world_ids))
+
+        def act_safely(move):
+            try:
+                duels[move[0]].act(move[1])
+            except Exception:
+                return move[0]
+            return None
+
         n = len(duels)
         mine: list[list[str]] = [[] for _ in range(n)]
         steps = [0] * n
@@ -164,7 +172,9 @@ def honest_search(spec: DuelSpec, duel, policy, card_index, lines: int = 8, worl
                 if d.player == me:
                     mine[i].append(w.canonical(key))
                 moves.append((i, key))
-            list(pool.map(lambda move: duels[move[0]].act(move[1]), moves))
+            for i in pool.map(act_safely, moves):
+                if i is not None:  # the engine failed in this (sampled) world: it counts for nobody
+                    scores[i] = 0.0
         for i in range(n):
             if scores[i] is None:
                 d = duels[i]

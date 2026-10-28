@@ -41,7 +41,8 @@ public:
     ~ClientDuel();
 
     // One game message (type byte + payload, as in STOC_GAME_MSG). Returns true when it asks this
-    // player for a decision; request() then holds it.
+    // player for a decision; request() then holds it. After MSG_RETRY (the server rejected our
+    // response) that is the last question again, without the rejected answer.
     bool feed(const std::vector<std::uint8_t>& message);
 
     bool pending() const noexcept { return request_.has_value(); }
@@ -77,6 +78,8 @@ private:
     std::uint64_t blocked_answers_ = 0;
     std::unique_ptr<observation::ObservationSession> session_;
     std::optional<protocol::DecisionRequest> request_;
+    std::optional<protocol::DecisionRequest> last_root_;  // asked again after MSG_RETRY
+    std::string last_answer_;  // our answer to last_root_ (the first step of a multi-step one)
     std::optional<std::uint8_t> winner_;
     std::vector<std::string> skipped_;
 };
