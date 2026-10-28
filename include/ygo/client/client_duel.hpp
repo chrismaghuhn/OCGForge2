@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -24,6 +25,10 @@ namespace ygo::client {
 // Messages it cannot read are recorded in skipped() and ignored, never fatal: a server may send
 // messages (or variants) the training engine never produced. Only a question it cannot decode is
 // an error, reported by feed().
+//
+// Loop protection as in training (duel::DuelConfig::block_after): an answer given block_after
+// times to the same question in the same field state is no longer offered there, unless that
+// would leave no answer at all. Needs card data (the field state comes from ClientView).
 class ClientView;
 
 class ClientDuel final {
@@ -51,6 +56,8 @@ public:
     bool finished() const noexcept { return winner_.has_value(); }
     std::optional<std::uint8_t> winner() const noexcept { return winner_; }
     std::uint64_t messages() const noexcept { return messages_; }
+    // Answers no longer offered by the loop protection.
+    std::uint64_t blocked_answers() const noexcept { return blocked_answers_; }
     // "type: reason" for every message that could not be read.
     const std::vector<std::string>& skipped() const noexcept { return skipped_; }
 
@@ -64,6 +71,10 @@ private:
     std::optional<observation::PlayerObservation> observation_;
     std::uint64_t messages_ = 0;
     std::uint64_t decisions_ = 0;
+    std::uint32_t block_after_ = 8;
+    std::map<std::string, std::map<std::string, std::uint32_t>> answers_;
+    std::string state_;  // hash of the pending root question and field; empty during a continuation
+    std::uint64_t blocked_answers_ = 0;
     std::unique_ptr<observation::ObservationSession> session_;
     std::optional<protocol::DecisionRequest> request_;
     std::optional<std::uint8_t> winner_;

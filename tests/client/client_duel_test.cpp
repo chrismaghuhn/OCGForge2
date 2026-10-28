@@ -82,3 +82,40 @@ TEST_CASE("ClientDuel answers every question of an engine's message stream") {
     }
     CHECK(finished >= 15);
 }
+
+TEST_CASE("ClientDuel stops offering an answer given 8 times to the same question in the same state") {
+    const auto config = test::duel_config(3);
+    ygo::core::CoreHostConfig host_config;
+    host_config.card_scripts_root = config.card_scripts_root;
+    host_config.card_data_tsv = config.card_data_tsv;
+    host_config.seed = ygo::core::derive_seed_bundle(3);
+    host_config.duel_flags = DUEL_MODE_MR5;
+    host_config.starting_player = 0;
+    host_config.required_script_codes = ygo::core::card_codes(config.deck0, config.deck1);
+    ygo::core::CoreHost host(host_config);
+    host.load_deck(0, config.deck0);
+    host.load_deck(1, config.deck1);
+    host.start_duel();
+    ygo::client::ClientDuel client(0, DUEL_MODE_MR5, config.card_data_tsv, config.deck0.main_deck);
+    std::vector<std::uint8_t> idle;
+    while (idle.empty()) {
+        for (const auto& message : split(host.process().message)) {
+            if (client.feed(message) && message[0] == MSG_SELECT_IDLECMD) {
+                idle = message;
+            } else if (client.pending()) {
+                host.submit_response(*client.act(client.request().candidates.front().semantic_key));
+            }
+        }
+    }
+    const auto looped = client.request().candidates.front().semantic_key;
+    const auto offered = client.request().candidates.size();
+    for (int answer = 1; answer <= 8; ++answer) {
+        (void)client.act(looped);  // the server would ask the same again, nothing changed
+        REQUIRE(client.feed(idle));
+    }
+    CHECK(client.request().candidates.size() == offered - 1);
+    for (const auto& candidate : client.request().candidates) {
+        CHECK(candidate.semantic_key != looped);
+    }
+    CHECK(client.blocked_answers() == 1);
+}

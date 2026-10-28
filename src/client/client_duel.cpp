@@ -13,6 +13,7 @@
 #include "ygo/protocol/continuation.hpp"
 #include "ygo/protocol/message_decoder.hpp"
 #include "ygo/protocol/protocol_error.hpp"
+#include "ygo/util/sha256.hpp"
 
 namespace ygo::client {
 namespace {
@@ -94,6 +95,22 @@ bool ClientDuel::feed(const std::vector<std::uint8_t>& message) {
         skipped_.push_back(type + ": question for the other player");
         return false;
     }
+    state_.clear();
+    if (view_ && !request.continuation && request.candidates.size() > 1) {
+        auto state = view_->digest();
+        state.insert(state.end(), message.begin(), message.end());
+        state_ = util::sha256_bytes(state);
+        if (const auto answers = answers_.find(state_); answers != answers_.end()) {
+            auto open = request.candidates;
+            std::erase_if(open, [&](const protocol::ActionCandidate& candidate) {
+                const auto given = answers->second.find(candidate.semantic_key);
+                return given != answers->second.end() && given->second >= block_after_;
+            });
+            if (!open.empty()) {
+                request.candidates = std::move(open);
+            }
+        }
+    }
     request_ = std::move(request);
     observe();
     return true;
@@ -123,6 +140,10 @@ void ClientDuel::observe() {
 std::optional<std::vector<std::uint8_t>> ClientDuel::act(const std::string& semantic_key) {
     const auto& candidate = protocol::select_candidate(request(), semantic_key);
     ++decisions_;
+    if (!state_.empty() && ++answers_[state_][candidate.semantic_key] == block_after_) {
+        ++blocked_answers_;
+    }
+    state_.clear();
     if (request_->continuation) {
         auto transition = protocol::apply_continuation_action(*request_, candidate.semantic_key);
         if (!transition.terminal) {

@@ -305,6 +305,7 @@ NB_MODULE(_core, m) {
         .def_prop_ro("finished", &ClientDuel::finished)
         .def_prop_ro("winner", &ClientDuel::winner)
         .def_prop_ro("messages", &ClientDuel::messages)
+        .def_prop_ro("blocked_answers", &ClientDuel::blocked_answers)
         .def_prop_ro("skipped", &ClientDuel::skipped);
 
     m.def("decision_names", &ygo::encode::decision_names);

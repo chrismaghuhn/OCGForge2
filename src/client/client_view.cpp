@@ -443,6 +443,40 @@ RawCardQuery ClientView::card(std::uint8_t controller, std::uint32_t location, s
     return {};
 }
 
+std::vector<std::uint8_t> ClientView::digest() const {
+    std::vector<std::uint8_t> out;
+    const auto put32 = [&out](std::uint32_t value) {
+        for (int shift = 0; shift < 32; shift += 8) {
+            out.push_back(static_cast<std::uint8_t>(value >> shift));
+        }
+    };
+    const auto put_card = [&](const Card& card) {
+        put32(card.query.code.value_or(0));
+        put32(card.query.position.value_or(0));
+        put32(static_cast<std::uint32_t>(card.materials.size()));
+    };
+    for (const auto& side : sides_) {
+        put32(side.life_points);
+        put32(side.deck);
+        for (const auto& slot : side.monsters) {
+            slot ? put_card(*slot) : put32(0xFFFFFFFF);
+        }
+        for (const auto& slot : side.spells) {
+            slot ? put_card(*slot) : put32(0xFFFFFFFF);
+        }
+        for (const auto* cards : {&side.hand, &side.graveyard, &side.banished, &side.extra}) {
+            put32(static_cast<std::uint32_t>(cards->size()));
+            for (const auto& card : *cards) {
+                put_card(card);
+            }
+        }
+    }
+    for (const auto& link : chain_) {
+        put32(link.source_code);
+    }
+    return out;
+}
+
 std::optional<core::StaticCardData> ClientView::printed(std::uint32_t code) const {
     return cards_ ? cards_->snapshot(code) : std::nullopt;
 }

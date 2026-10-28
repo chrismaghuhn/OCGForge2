@@ -55,7 +55,7 @@ class Bot:
             self.index = model.card_features.index_map()
         self.name, self.password = name, password
         self.rng = random.Random(seed)
-        self.record = open(record, "wb") if record else None
+        self.record = open(record, "wb", buffering=0) if record else None  # complete even after a crash
         self.duel = None
         self.writer: asyncio.StreamWriter | None = None
         self.stats = Counter()
@@ -97,7 +97,13 @@ class Bot:
             self.send(p.update_deck(*self.deck))
             self.send(p.packet(p.CTOS_HS_READY))
         elif kind == p.STOC_TYPE_CHANGE:
-            print(f"seat {payload[0] & 0xF}{' (host)' if payload[0] & 0x10 else ''}", flush=True)
+            seat = payload[0] & 0xF
+            if seat == 7:  # NETPLAYER_TYPE_OBSERVER: the duelist seats are taken or a duel is running
+                print("joined as a spectator: no free duelist seat (or a duel is running); leaving", flush=True)
+                self.send(p.packet(p.CTOS_LEAVE_GAME))
+                self.done = True
+                return
+            print(f"seat {seat}{' (host)' if payload[0] & 0x10 else ''}", flush=True)
         elif kind == p.STOC_ERROR_MSG:
             code = struct.unpack_from("<I", payload, 4)[0] if len(payload) >= 8 else 0  # u8 type, 3 padding, u32
             card = f", card {struct.unpack_from('<I', payload, 20)[0]}" if len(payload) >= 24 else ""  # deck error
@@ -162,6 +168,9 @@ class Bot:
 
 
 def main(argv=None) -> None:
+    import faulthandler
+
+    faulthandler.enable()  # a crash in the C++ part still leaves a trace
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7911)
@@ -180,6 +189,8 @@ def main(argv=None) -> None:
     try:
         asyncio.run(bot.run(args.host, args.port))
     finally:
+        if bot.duel is not None:
+            bot.stats["blocked looping answers"] = bot.duel.blocked_answers
         print(dict(bot.stats), flush=True)
         if bot.duel is not None and bot.duel.skipped:
             reasons = Counter(s.split(":", 1)[0] + ":" + s.split(":", 2)[1] for s in bot.duel.skipped)

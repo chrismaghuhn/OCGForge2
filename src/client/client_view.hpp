@@ -35,6 +35,10 @@ public:
                                            std::uint32_t flags) const override;
     std::optional<core::StaticCardData> printed(std::uint32_t code) const override;
 
+    // The field as bytes (life points, every card's place, code and position, the chain): equal
+    // whenever the duel is back in the same state, for loop detection.
+    std::vector<std::uint8_t> digest() const;
+
 private:
     struct Card {
         observation::detail::RawCardQuery query;  // as last refreshed or moved; no owner/materials/counters
