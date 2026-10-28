@@ -157,6 +157,8 @@ def arena(model: Model, opponents: dict[str, Model], args: argparse.Namespace, i
 def save_latest(model: Model, optimizer: torch.optim.Optimizer, out: Path, iteration: int) -> None:
     """<out>/latest, replaced only once the new copy is complete (latest.old survives a crash midway)."""
     tmp, latest, old = out / "latest.tmp", out / "latest", out / "latest.old"
+    if not latest.exists() and old.exists():  # an earlier save stopped between the two renames
+        old.rename(latest)
     shutil.rmtree(tmp, ignore_errors=True)
     save_checkpoint(model, tmp)
     torch.save({"optimizer": optimizer.state_dict(), "iteration": iteration}, tmp / STATE_FILE)
@@ -167,15 +169,34 @@ def save_latest(model: Model, optimizer: torch.optim.Optimizer, out: Path, itera
     shutil.rmtree(old, ignore_errors=True)
 
 
+def save_checkpoint_whole(model: Model, path: Path) -> None:
+    """save_checkpoint into <path>.tmp, then renamed: a kill midway leaves no half checkpoint."""
+    tmp = path.with_name(path.name + ".tmp")
+    shutil.rmtree(tmp, ignore_errors=True)
+    save_checkpoint(model, tmp)
+    shutil.rmtree(path, ignore_errors=True)
+    tmp.rename(path)
+
+
 def drop_after(path: Path, iteration: int) -> None:
-    """Remove log lines of iterations after `iteration` (run again after a resume)."""
-    if path.exists():
-        lines = [l for l in path.read_text(encoding="utf-8").splitlines() if json.loads(l)["iteration"] <= iteration]
-        path.write_text("".join(l + "\n" for l in lines), encoding="utf-8")
+    """Remove log lines of iterations after `iteration` (run again after a resume) and a line cut
+    off by a kill."""
+    if not path.exists():
+        return
+    kept = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            if json.loads(line)["iteration"] <= iteration:
+                kept.append(line)
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("".join(l + "\n" for l in kept), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def error_reasons(messages: list[str], top: int = 3) -> dict[str, int]:
-    return dict(Counter(m.split(" (seed")[0].splitlines()[0][:120] for m in messages).most_common(top))
+    return dict(Counter((m.split(" (seed")[0].splitlines() or [""])[0][:120] for m in messages).most_common(top))
 
 
 def main(argv=None) -> None:
@@ -194,6 +215,8 @@ def main(argv=None) -> None:
                     entropy_coef=args.entropy, kl_coef=0.0, bf16=not args.fp32)
     iteration = 0
     saved = next((d for d in (out / "latest", out / "latest.old") if (d / STATE_FILE).exists()), None)
+    if args.resume and saved is None and (out / "metrics.jsonl").exists():
+        raise SystemExit(f"--resume: {out} has a run but no saved state to resume from")
     if args.resume and saved is not None:
         model = load_checkpoint(saved, args.device, dropout=0.0)
         state = torch.load(saved / STATE_FILE, map_location=args.device)
@@ -234,8 +257,11 @@ def main(argv=None) -> None:
         return frozen
 
     for checkpoint in sorted((out / "checkpoints").glob("*")) if args.resume else []:  # the league drops old ones
-        if int(checkpoint.name) <= iteration:
-            admit(checkpoint)
+        if checkpoint.name.isdigit() and int(checkpoint.name) <= iteration:
+            try:
+                admit(checkpoint)
+            except Exception as error:  # e.g. cut off by a kill before checkpoints were written whole
+                print(f"skipping checkpoint {checkpoint.name}: {error}", flush=True)
     usage = rollout.CardUsage(model.card_features.size)
     collector = rollout.AsyncCollector(env, batch_size=max(1, args.envs // 2), segment=args.segment,
                                        league=league if args.league_share > 0 else None, card_usage=usage)
@@ -271,7 +297,7 @@ def main(argv=None) -> None:
 
             if iteration % args.arena_every == 0:
                 checkpoint = out / "checkpoints" / f"{iteration:06d}"
-                save_checkpoint(model, checkpoint)
+                save_checkpoint_whole(model, checkpoint)
                 opponents = {"previous": previous} if previous is not None else {}
                 if first is not None and first is not previous:
                     opponents["first"] = first

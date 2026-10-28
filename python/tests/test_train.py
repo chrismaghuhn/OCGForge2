@@ -48,3 +48,22 @@ def test_latest_is_replaced_whole(tmp_path):
     train.save_latest(model, optimizer, tmp_path, 2)
     assert torch.load(tmp_path / "latest" / train.STATE_FILE)["iteration"] == 2
     assert sorted(p.name for p in tmp_path.iterdir()) == ["latest"]
+
+
+def test_resume_survives_a_cut_off_log_line_and_an_interrupted_save(tmp_path):
+    log = tmp_path / "metrics.jsonl"
+    log.write_text('{"iteration": 1}\n{"iteration": 2}\n{"iteration": 3}\n{"iterat')
+    train.drop_after(log, 2)
+    assert log.read_text() == '{"iteration": 1}\n{"iteration": 2}\n'
+
+    from ocgforge.model import Model, ModelConfig
+    from ocgforge.cards import CardFeatures
+    from conftest import make_table
+
+    model = Model(CardFeatures.build(make_table(), min_term_count=1), ModelConfig(d_model=16, heads=2, layers=1, ff=32))
+    optimizer = torch.optim.AdamW(model.parameters())
+    train.save_latest(model, optimizer, tmp_path, 1)
+    (tmp_path / "latest").rename(tmp_path / "latest.old")  # killed between the two renames
+    train.save_latest(model, optimizer, tmp_path, 2)
+    assert torch.load(tmp_path / "latest" / train.STATE_FILE)["iteration"] == 2
+    assert not (tmp_path / "latest.old").exists()
