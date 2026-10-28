@@ -332,6 +332,10 @@ NB_MODULE(_core, m) {
             const auto* o = d.observation();
             return o && o->globals.turn_count ? *o->globals.turn_count : 0;
         })
+        .def_prop_ro("phase", [](const Duel& d) -> std::uint32_t {
+            const auto* o = d.observation();
+            return o && o->globals.phase ? *o->globals.phase : 0;
+        }, "PHASE_* bit of the pending decision (0 if unknown).")
         .def_prop_ro("turn_player", [](const Duel& d) -> std::uint8_t {
             const auto* o = d.observation();
             return o && o->globals.turn_player ? *o->globals.turn_player : 255;

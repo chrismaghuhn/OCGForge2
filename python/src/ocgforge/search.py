@@ -99,13 +99,19 @@ def search_turn(spec: DuelSpec, actions: list[str], policy, card_index, k: int =
 
 
 def honest_search(spec: DuelSpec, duel, policy, card_index, lines: int = 8, worlds_per_line: int = 8,
-                  max_decisions: int = 80, seed: int = 0, pool: ThreadPoolExecutor | None = None) -> SearchResult:
+                  max_decisions: int = 80, seed: int = 0, pool: ThreadPoolExecutor | None = None,
+                  make_world=None, segment: int = 0) -> SearchResult:
     """Search without peeking: from `duel` at the searching player's first idle command of its turn,
     build `worlds_per_line` worlds from what that player can see (ocgforge.worlds), generate `lines`
     candidate plans (rollout 0 the most likely answers, the others sampled, each in its own world),
     replay every plan in every world (the player's answers follow the plan while it fits, then the
     most likely answer; the opponent's are sampled) and keep the plan with the best mean score.
-    The plan is the player's answers only, in canonical form (worlds.canonical)."""
+    The plan is the player's answers only, in canonical form (worlds.canonical).
+
+    By default the worlds are built at the current point, which must be the start of the player's
+    main phase; `make_world(i)` builds world i elsewhere (e.g. worlds.world_now mid-turn) or returns
+    None. With `segment` (worlds.phase_group) a rollout ends when the duel leaves that phase group
+    instead of at the end of the turn."""
     from . import worlds as w
 
     pool = pool or ThreadPoolExecutor(16)
@@ -113,12 +119,14 @@ def honest_search(spec: DuelSpec, duel, policy, card_index, lines: int = 8, worl
     snapshot = duel.snapshot()
     decklists = {0: w.read_decklist(spec.deck0), 1: w.read_decklist(spec.deck1)}
     rng = random.Random(seed)
-    scripts = [w.sample_world(snapshot, me, decklists, random.Random(rng.getrandbits(32)))
-               for _ in range(max(lines, worlds_per_line))]
+    if make_world is None:
+        scripts = [w.sample_world(snapshot, me, decklists, random.Random(rng.getrandbits(32)))
+                   for _ in range(max(lines, worlds_per_line))]
+        make_world = lambda i: w.start_world(spec, scripts[i], me, seed + i)  # noqa: E731
 
     def run(plans: list[list[str] | None], world_ids: list[int], greedy_mine: list[bool]):
         """Play each (plan, world) to the end of the turn; returns per-run scores and my answers."""
-        duels = list(pool.map(lambda i: w.start_world(spec, scripts[i], me, seed + i), world_ids))
+        duels = list(pool.map(make_world, world_ids))
         n = len(duels)
         mine: list[list[str]] = [[] for _ in range(n)]
         steps = [0] * n
@@ -139,14 +147,13 @@ def honest_search(spec: DuelSpec, duel, policy, card_index, lines: int = 8, worl
             moves = []
             for n_, i in enumerate(open_):
                 d = duels[i]
-                if d.turn != turn[i]:
+                if d.turn != turn[i] or (segment and w.phase_group(d.phase) != segment):
                     scores[i] = values[n_] if d.player == me else -values[n_]
                     continue
                 keys = d.keys()
                 key = None
                 if d.player == me and plans[i] is not None and steps[i] < len(plans[i]):
-                    wanted = plans[i][steps[i]]
-                    key = next((k for k in keys if w.canonical(k) == wanted), None)
+                    key = w.match(plans[i][steps[i]], keys)
                     steps[i] += 1
                 if key is None:
                     choice = greedy[n_] if (d.player == me and (plans[i] is not None or greedy_mine[i])) else sampled[n_]
@@ -169,6 +176,8 @@ def honest_search(spec: DuelSpec, duel, policy, card_index, lines: int = 8, worl
     _, candidates = run([None] * lines, list(range(lines)), [i == 0 for i in range(lines)])
     plans = [p for p in candidates if p]
     unique = list(dict.fromkeys(tuple(p) for p in plans))
+    if not unique:  # no world could be built (or the player had nothing to do)
+        return SearchResult([], 0.0, 0.0, [])
     # Every plan in every world.
     grid_plans = [list(p) for p in unique for _ in range(worlds_per_line)]
     grid_worlds = [j for _ in unique for j in range(worlds_per_line)]
@@ -213,35 +222,61 @@ class SearchPolicy:
 
 
 class HonestSearchPolicy:
-    """Plays like `policy`, but at its first idle command of each own turn runs honest_search and then
-    follows the plan while each next answer is legal (else, and on the opponent's turn, the policy's
-    most likely answer). Worlds are only built at the start of a turn: the puzzle API cannot rebuild
-    what happened earlier in a turn."""
+    """Plays like `policy`, but searches honestly (honest_search) on its own turns and follows the
+    plan while each next answer is legal (else, and on the opponent's turn, the policy's most likely
+    answer). Without `phases` it plans the whole turn at its first idle command. With `phases` it
+    plans each phase on its own: Main Phase 1 there, the Battle Phase at its first battle command and
+    Main Phase 2 at its first idle command, each scored where the phase ends. Worlds for the later
+    phases are built at the turn's start and replayed through this turn's answers (worlds.world_now),
+    so this-turn effects and what the opponent revealed meanwhile carry over."""
 
     def __init__(self, policy, card_index, lines: int = 8, worlds_per_line: int = 8,
-                 pool: ThreadPoolExecutor | None = None):
+                 pool: ThreadPoolExecutor | None = None, phases: bool = False):
         self.policy, self.card_index = policy, card_index
-        self.lines, self.worlds_per_line = lines, worlds_per_line
+        self.lines, self.worlds_per_line, self.phases = lines, worlds_per_line, phases
         self.pool = pool or ThreadPoolExecutor(16)
         self.plan: list[str] = []
         self.turn = None
+        self.searched: set[int] = set()
+        self.start = None
+        self.start_index = 0
         self.searches = 0
+        self.failed = 0
         self.gains: list[float] = []
+
+    def search(self, spec: DuelSpec, actions: list[str], duel, segment: int) -> None:
+        from . import worlds as w
+
+        make_world = None
+        if segment > 1:
+            now, history, me = duel.snapshot(), actions[self.start_index:], duel.player
+            decklists = {0: w.read_decklist(spec.deck0), 1: w.read_decklist(spec.deck1)}
+            base = 1000 * (self.searches + 1)
+            make_world = lambda i: w.world_now(spec, self.start, now, history, me, decklists,  # noqa: E731
+                                               random.Random(base + i), base + 10 * i)
+        result = honest_search(spec, duel, self.policy, self.card_index, self.lines, self.worlds_per_line,
+                               seed=self.searches, pool=self.pool, make_world=make_world, segment=segment)
+        self.searches += 1
+        if not result.values:
+            self.failed += 1
+        self.plan = result.line
+        self.gains.append(result.value - result.greedy_value)
 
     def choose(self, spec: DuelSpec, actions: list[str], duel) -> str:
         from . import worlds as w
 
         keys = duel.keys()
-        if duel.turn_player == duel.player and duel.turn != self.turn and keys[0].startswith("idle"):
-            self.turn = duel.turn
-            result = honest_search(spec, duel, self.policy, self.card_index, self.lines, self.worlds_per_line,
-                                   seed=self.searches, pool=self.pool)
-            self.plan = result.line
-            self.searches += 1
-            self.gains.append(result.value - result.greedy_value)
-        if duel.turn_player == duel.player and duel.turn == self.turn and self.plan:
-            wanted = self.plan.pop(0)
-            key = next((k for k in keys if w.canonical(k) == wanted), None)
+        mine = duel.turn_player == duel.player
+        if mine and duel.turn != self.turn and keys[0].startswith("idle"):
+            self.turn, self.start, self.start_index, self.searched = duel.turn, duel.snapshot(), len(actions), {1}
+            self.search(spec, actions, duel, 1 if self.phases else 0)
+        elif self.phases and mine and duel.turn == self.turn and keys[0].startswith(("idle", "battle")):
+            group = w.phase_group(duel.phase)
+            if group in (2, 3) and group not in self.searched:
+                self.searched.add(group)
+                self.search(spec, actions, duel, group)
+        if mine and duel.turn == self.turn and self.plan:
+            key = w.match(self.plan.pop(0), keys)
             if key is not None:
                 return key
             self.plan = []  # the duel left the plan
@@ -262,13 +297,15 @@ class GreedyPolicy(rollout.ModelPolicy):
             self.sample = sample
 
 
-def match(model, decks: list[Path], duels: int, k: int, device: str, seed: int = 0, honest: bool = False) -> dict:
+def match(model, decks: list[Path], duels: int, k: int, device: str, seed: int = 0, honest: bool = False,
+          phases: bool = False) -> dict:
     """`duels` duels of a searching player against the plain sampling policy (same model), alternating
     seats: oracle search (SearchPolicy) or, with honest=True, HonestSearchPolicy with k lines x k worlds."""
     rng = random.Random(seed)
     card_index = model.card_features.index_map()
     policy = GreedyPolicy(model, device, sample=True, seed=seed)
-    searcher = HonestSearchPolicy(policy, card_index, k, k) if honest else SearchPolicy(policy, card_index, k)
+    searcher = (HonestSearchPolicy(policy, card_index, k, k, phases=phases) if honest or phases
+                else SearchPolicy(policy, card_index, k))
     wins = losses = draws = 0
     started = time.time()
     for n in range(duels):
@@ -297,6 +334,7 @@ def match(model, decks: list[Path], duels: int, k: int, device: str, seed: int =
               f" ({wins}-{losses}-{draws}, {searcher.searches} searches, {time.time() - started:.0f}s)", flush=True)
     gain = sum(searcher.gains) / max(1, len(searcher.gains))
     return {"wins": wins, "losses": losses, "draws": draws, "searches": searcher.searches,
+            "failed_searches": getattr(searcher, "failed", 0),
             "mean_value_gain": round(gain, 4), "seconds": round(time.time() - started)}
 
 
@@ -311,9 +349,11 @@ def main(argv=None) -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--honest", action="store_true", help="honest search (k plans x k sampled worlds)")
+    parser.add_argument("--phases", action="store_true", help="honest search per phase (Main 1, Battle, Main 2)")
     args = parser.parse_args(argv)
     model = load_checkpoint(args.checkpoint, args.device, dropout=0.0)
-    print(match(model, args.decks, args.duels, args.k, args.device, args.seed, args.honest), flush=True)
+    print(match(model, args.decks, args.duels, args.k, args.device, args.seed, args.honest,
+                args.phases), flush=True)
 
 
 if __name__ == "__main__":
