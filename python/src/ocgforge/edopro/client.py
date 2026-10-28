@@ -5,7 +5,8 @@
 
 The room is created in EDOPro (LAN/host, Master Rule 2020: the rules the model is trained on). The
 bot sends its deck, gets ready, and once the host starts, plays rock paper scissors, goes first if it
-may, and answers every question: with --checkpoint the model's most likely answer (--sample samples
+may, accepts every rematch (and plays every duel of a match with the same deck), and answers every
+question: with --checkpoint the model's most likely answer (--sample samples
 instead), without it a uniformly random legal answer. It sees the duel as in training: ClientDuel
 builds the same observation from what the server sends this player. --record writes every packet, both directions, for offline replay: per packet u8 direction
 (0 = from the server, 1 = to it), u16 length, then the packet without its length prefix.
@@ -113,6 +114,11 @@ class Bot:
             self.send(p.hand_result(self.rng.randint(1, 3)))
         elif kind == p.STOC_SELECT_TP:
             self.send(p.tp_result(go_first=True))
+        elif kind == p.STOC_REMATCH:  # always up for another duel
+            print("rematch: accepted", flush=True)
+            self.send(p.packet(p.CTOS_REMATCH_RESPONSE, bytes([1])))
+        elif kind == p.STOC_CHANGE_SIDE:  # match: no side decking, the same deck again
+            self.send(p.update_deck(*self.deck))
         elif kind == p.STOC_TIME_LIMIT:
             self.send(p.packet(p.CTOS_TIME_CONFIRM))
         elif kind == p.STOC_GAME_MSG:
