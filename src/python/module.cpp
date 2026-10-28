@@ -242,6 +242,10 @@ NB_MODULE(_core, m) {
              "safe to call from another thread while step runs.")
         .def_prop_ro("duels_finished", &VectorEnv::duels_finished)
         .def_prop_ro("duel_errors", &VectorEnv::duel_errors)
+        .def_prop_ro("blocked_answers", &VectorEnv::blocked_answers,
+                     "Answers removed by loop blocking, summed over finished duels.")
+        .def_prop_ro("loop_losses", &VectorEnv::loop_losses,
+                     "Duels lost by a player who kept looping although answers were blocked.")
         .def_prop_ro("start_failures", &VectorEnv::start_failures,
                      "Duels that failed to start and were replaced; nonzero usually means a deck problem.")
         .def_prop_ro("last_start_failure", &VectorEnv::last_start_failure);

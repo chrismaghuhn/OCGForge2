@@ -34,12 +34,20 @@ struct DuelConfig {
     // the recent events; full ones have every card property and the whole event history.
     bool full_observations = false;
 
-    // Loop protection: a duel that needs more decisions than this, or that
-    // reaches the exact same engine question in the exact same field state
-    // more than max_repeats times, is treated as stuck and throws DuelError.
+    // Loop protection. A duel that needs more than max_decisions decisions throws DuelError.
+    // An answer given block_after times to the same engine question in the same field state is
+    // removed from that question's candidates. When that leaves no candidate, or the question
+    // comes back more than max_repeats times, the asking player loses (reason kLoopLoss).
+    // Questions with a single candidate are not counted; multi-step (continuation) questions only
+    // count towards max_repeats. block_after = 0 turns blocking off: visit max_repeats + 1 then
+    // throws a "stuck" DuelError (the old behaviour also had max_repeats = 16).
     std::uint64_t max_decisions = 5000;
-    std::uint32_t max_repeats = 16;
+    std::uint32_t block_after = 8;
+    std::uint32_t max_repeats = 64;
 };
+
+// DuelResult::reason of a duel lost by looping (see DuelConfig::block_after).
+constexpr std::uint8_t kLoopLoss = 0xF0;
 
 struct DuelResult {
     std::uint8_t winner = 255;
@@ -81,11 +89,14 @@ public:
     void act(const std::string& semantic_key);
 
     std::uint64_t decision_count() const noexcept { return decision_count_; }
+    // Answers removed so far by loop blocking.
+    std::uint64_t blocked_answers() const noexcept { return blocked_answers_; }
 
 private:
     void advance();
     void publish(protocol::DecisionRequest request);
     void submit(std::vector<std::uint8_t> response);
+    void lose_by_loop(std::uint8_t player);
     [[noreturn]] void fail(const std::string& message) const;
 
     DuelConfig config_;
@@ -97,6 +108,10 @@ private:
     std::optional<observation::PlayerObservation> observation_;
     std::optional<DuelResult> result_;
     std::map<std::string, std::uint32_t> seen_states_;
+    // Per question-and-state hash: how often each answer (semantic key) was given.
+    std::map<std::string, std::map<std::string, std::uint32_t>> answers_;
+    std::string state_;  // hash of the pending engine question; empty during a continuation
+    std::uint64_t blocked_answers_ = 0;
     std::deque<std::string> recent_;
 };
 

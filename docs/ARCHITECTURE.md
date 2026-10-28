@@ -62,10 +62,25 @@ this by replaying random duels.
 
 ## Loop protection
 
-`DuelConfig::max_decisions` (default 5000) caps a duel's length.
-`DuelConfig::max_repeats` (default 16) stops a duel when the same engine
-question in the same field state comes up again and again. Both throw
+`DuelConfig::max_decisions` (default 5000) caps a duel's length and throws
 `DuelError` with the last 20 decisions.
+
+A policy can loop without progress, typically by picking a card, cancelling
+the follow-up selection and picking the same card again. The duel hashes each
+engine question together with the field state; an answer given
+`DuelConfig::block_after` times (default 8) to the same question in the same
+state is removed from its candidates there. When no candidate is left, or the
+question comes back more than `max_repeats` times (default 64), the asking
+player loses (`DuelResult::reason == kLoopLoss`), so the duel still has a
+result to learn from. Questions with a single candidate are not counted (the
+player asked has no choice). Multi-step selections built on our side
+(continuations) name the engine step in their keys, so their answers are not
+blocked; they only count towards `max_repeats`. `VectorEnv` sums
+`blocked_answers` and `loop_losses`; `train.py` logs them per iteration. With
+`block_after = 0` visit `max_repeats + 1` throws a "stuck" `DuelError`
+instead (the old behaviour, with `max_repeats = 16`). With the overnight
+model this turned about 40% stuck duels into finished ones (16% of them lost by
+looping).
 
 Some card scripts search combinations of materials (Synchro, Ritual, ...)
 and, in unusual board states, never finish. Patch 0004 gives each

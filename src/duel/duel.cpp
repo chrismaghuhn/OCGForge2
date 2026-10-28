@@ -2,6 +2,7 @@
 
 #include <sstream>
 #include <utility>
+#include <vector>
 
 #include "ocgapi_constants.h"
 #include "ygo/core/core_host.hpp"
@@ -61,6 +62,10 @@ void Duel::act(const std::string& semantic_key) {
         throw std::logic_error("Duel::act() called on a finished duel");
     }
     const auto& candidate = protocol::select_candidate(*request_, semantic_key);
+    if (!state_.empty() && ++answers_[state_][candidate.semantic_key] == config_.block_after) {
+        ++blocked_answers_;
+    }
+    state_.clear();
 
     std::ostringstream line;
     line << '#' << decision_count_ << " p" << static_cast<int>(request_->player) << ' '
@@ -132,16 +137,51 @@ void Duel::advance() {
                  std::to_string(decoded.decisions.size()));
         }
 
-        // Same question in the same field state too often means no progress.
-        auto state = host_->query_field();
-        state.insert(state.end(), message.begin(), message.end());
-        if (++seen_states_[util::sha256_bytes(state)] > config_.max_repeats) {
-            fail("duel is stuck: the same decision in the same state was asked " +
-                 std::to_string(config_.max_repeats) + " times");
+        // Same question in the same field state again means no progress so far: answers given
+        // block_after times there are dropped, and a player who loops anyway loses. A question with
+        // a single candidate is no choice, so it never counts against the player asked.
+        auto request = std::move(decoded.decisions.front());
+        if (request.candidates.size() > 1) {
+            auto state = host_->query_field();
+            state.insert(state.end(), message.begin(), message.end());
+            auto hash = util::sha256_bytes(state);
+            if (++seen_states_[hash] > config_.max_repeats) {
+                if (config_.block_after == 0) {
+                    fail("duel is stuck: the same decision in the same state was asked " +
+                         std::to_string(config_.max_repeats + 1) + " times");
+                }
+                lose_by_loop(request.player);
+                return;
+            }
+            // Continuation keys name the engine step, so they differ on every visit; those
+            // questions are only covered by max_repeats.
+            if (config_.block_after != 0 && !request.continuation) {
+                if (auto answers = answers_.find(hash); answers != answers_.end()) {
+                    std::erase_if(request.candidates, [&](const protocol::ActionCandidate& candidate) {
+                        auto given = answers->second.find(candidate.semantic_key);
+                        return given != answers->second.end() && given->second >= config_.block_after;
+                    });
+                    if (request.candidates.empty()) {
+                        lose_by_loop(request.player);
+                        return;
+                    }
+                }
+                state_ = std::move(hash);
+            }
         }
-        publish(std::move(decoded.decisions.front()));
+        publish(std::move(request));
         return;
     }
+}
+
+void Duel::lose_by_loop(std::uint8_t player) {
+    if (player > 1) {
+        fail("loop by player " + std::to_string(player) + " in a two-player duel");
+    }
+    request_.reset();
+    observation_.reset();
+    state_.clear();
+    result_ = DuelResult{static_cast<std::uint8_t>(1 - player), kLoopLoss};
 }
 
 void Duel::publish(protocol::DecisionRequest request) {

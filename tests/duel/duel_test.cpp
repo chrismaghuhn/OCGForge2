@@ -82,45 +82,68 @@ TEST_CASE("decision limit stops a duel that runs too long") {
             Catch::Matchers::ContainsSubstring("last decisions:"));
 }
 
-// Reproduces the old Hiita loop on purpose: a policy that always unselects
-// when it can makes no progress, and the duel must report itself as stuck
-// instead of running forever.
-TEST_CASE("select/unselect ping-pong is detected as stuck") {
-    bool detected = false;
-    for (std::uint64_t seed = 1; seed <= 50 && !detected; ++seed) {
-        Duel duel(test::duel_config(seed));
-        std::mt19937_64 rng(seed);
-        try {
-            while (!duel.finished()) {
-                const DecisionRequest& request = duel.request();
-                const ygo::protocol::ActionCandidate* chosen = nullptr;
-                if (request.kind == ygo::protocol::DecisionRequestKind::UnselectCard) {
-                    for (const auto& candidate : request.candidates) {
-                        if (candidate.card_selection_operation == ygo::protocol::CardSelectionOperation::Unselect) {
-                            chosen = &candidate;
-                        }
-                    }
-                    if (chosen == nullptr) {
-                        for (const auto& candidate : request.candidates) {
-                            if (candidate.card_selection_operation == ygo::protocol::CardSelectionOperation::Select) {
-                                chosen = &candidate;
-                            }
-                        }
+// Reproduces the old Hiita loop on purpose: a policy that always unselects when it can makes no
+// progress. Plays until the policy hits the loop protection or the duel ends.
+namespace {
+enum class PingPong { Finished, Stuck };
+
+PingPong play_ping_pong(Duel& duel, std::uint64_t seed) {
+    std::mt19937_64 rng(seed);
+    try {
+        while (!duel.finished()) {
+            const DecisionRequest& request = duel.request();
+            const ygo::protocol::ActionCandidate* chosen = nullptr;
+            if (request.kind == ygo::protocol::DecisionRequestKind::UnselectCard) {
+                for (const auto& candidate : request.candidates) {
+                    if (candidate.card_selection_operation == ygo::protocol::CardSelectionOperation::Unselect) {
+                        chosen = &candidate;
                     }
                 }
                 if (chosen == nullptr) {
-                    std::uniform_int_distribution<std::size_t> pick(0, request.candidates.size() - 1);
-                    chosen = &request.candidates[pick(rng)];
+                    for (const auto& candidate : request.candidates) {
+                        if (candidate.card_selection_operation == ygo::protocol::CardSelectionOperation::Select) {
+                            chosen = &candidate;
+                        }
+                    }
                 }
-                duel.act(chosen->semantic_key);
             }
-        } catch (const DuelError& error) {
-            CAPTURE(seed, error.what());
-            REQUIRE_THAT(error.what(), Catch::Matchers::ContainsSubstring("stuck"));
-            detected = true;
+            if (chosen == nullptr) {
+                std::uniform_int_distribution<std::size_t> pick(0, request.candidates.size() - 1);
+                chosen = &request.candidates[pick(rng)];
+            }
+            duel.act(chosen->semantic_key);
         }
+    } catch (const DuelError& error) {
+        CAPTURE(seed, error.what());
+        REQUIRE_THAT(error.what(), Catch::Matchers::ContainsSubstring("stuck"));
+        return PingPong::Stuck;
+    }
+    return PingPong::Finished;
+}
+}  // namespace
+
+TEST_CASE("without blocking, select/unselect ping-pong is detected as stuck") {
+    bool detected = false;
+    for (std::uint64_t seed = 1; seed <= 50 && !detected; ++seed) {
+        auto config = test::duel_config(seed);
+        config.block_after = 0;
+        config.max_repeats = 16;
+        Duel duel(config);
+        detected = play_ping_pong(duel, seed) == PingPong::Stuck;
     }
     CHECK(detected);
+}
+
+TEST_CASE("blocking breaks select/unselect ping-pong instead of failing the duel") {
+    std::uint64_t blocked = 0;
+    for (std::uint64_t seed = 1; seed <= 50; ++seed) {
+        Duel duel(test::duel_config(seed));
+        CAPTURE(seed);
+        REQUIRE(play_ping_pong(duel, seed) == PingPong::Finished);
+        REQUIRE(duel.result()->winner <= 2);
+        blocked += duel.blocked_answers();
+    }
+    CHECK(blocked > 0);
 }
 
 // Every deck in decks/ (training and hold-out) against every other, random play. Slow; run with
@@ -155,4 +178,32 @@ TEST_CASE("random duels across all deck pairings finish", "[.][slow]") {
         }
     }
     WARN(budget_failures << " of " << paths.size() * paths.size() << " duels hit the Lua call budget");
+}
+
+TEST_CASE("a player who keeps looping loses with kLoopLoss") {
+    bool lost = false;
+    for (std::uint64_t seed = 1; seed <= 50 && !lost; ++seed) {
+        auto config = test::duel_config(seed);
+        config.block_after = 1;
+        config.max_repeats = 1;  // the second visit of any choice already ends the duel
+        Duel duel(config);
+        REQUIRE(play_ping_pong(duel, seed) == PingPong::Finished);
+        if (duel.result()->reason == ygo::duel::kLoopLoss) {
+            CHECK(duel.result()->winner <= 1);
+            lost = true;
+        }
+    }
+    CHECK(lost);
+}
+
+TEST_CASE("a player whose every answer is blocked loses with kLoopLoss") {
+    bool lost = false;
+    for (std::uint64_t seed = 1; seed <= 50 && !lost; ++seed) {
+        auto config = test::duel_config(seed);
+        config.block_after = 1;  // each answer once per state: ping-pong runs out of answers first
+        Duel duel(config);
+        REQUIRE(play_ping_pong(duel, seed) == PingPong::Finished);
+        lost = duel.result()->reason == ygo::duel::kLoopLoss;
+    }
+    CHECK(lost);
 }

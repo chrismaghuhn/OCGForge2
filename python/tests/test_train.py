@@ -24,6 +24,7 @@ def test_training_runs_an_arena_and_resumes(tmp_path):
     metrics = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
     arena = [json.loads(line) for line in (tmp_path / "arena.jsonl").read_text().splitlines()]
     assert [m["iteration"] for m in metrics] == [1, 2]
+    assert all(m["blockedAnswers"] >= 0 and m["loopLosses"] >= 0 for m in metrics)
     assert arena[0]["iteration"] == 2 and "games_random" in arena[0]
     assert arena[0]["vs_random"] is None or 0.0 <= arena[0]["vs_random"] <= 1.0  # duels can be cut off
     assert (tmp_path / "checkpoints" / "000002" / "model.safetensors").exists()
@@ -35,6 +36,13 @@ def test_training_runs_an_arena_and_resumes(tmp_path):
     train.main([*args, "--resume"])
     metrics = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
     assert [m["iteration"] for m in metrics] == [1, 2, 3]
+
+    init = tmp_path / "from-latest"  # a new run from these weights: its first arena opponent is them
+    args[args.index("--out") + 1] = str(init)
+    train.main([*args, "--init", str(tmp_path / "latest")])
+    arena = [json.loads(line) for line in (init / "arena.jsonl").read_text().splitlines()]
+    assert (init / "checkpoints" / "000000" / "model.safetensors").exists()
+    assert "games_previous" in arena[0]
 
 
 def test_latest_is_replaced_whole(tmp_path):

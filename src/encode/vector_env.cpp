@@ -224,6 +224,7 @@ Ready VectorEnv::play(std::size_t env, std::int64_t action) {
         }
         result.done = 1;
         result.winner = slot.duel->result()->winner;
+        loop_losses_ += slot.duel->result()->reason == duel::kLoopLoss ? 1 : 0;
     } catch (const std::exception& error) {
         // DuelError (stuck, engine failure) or a decision the encoder cannot
         // represent: this duel has no result, start another.
@@ -232,6 +233,7 @@ Ready VectorEnv::play(std::size_t env, std::int64_t action) {
     }
     ++duels_finished_;
     duel_errors_ += result.error.empty() ? 0 : 1;
+    blocked_answers_ += slot.duel->blocked_answers();
     reset(slot);  // throws if no new duel can be started
     return result;
 }

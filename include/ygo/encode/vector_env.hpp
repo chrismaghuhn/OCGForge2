@@ -116,6 +116,10 @@ public:
 
     std::uint64_t duels_finished() const noexcept { return duels_finished_; }
     std::uint64_t duel_errors() const noexcept { return duel_errors_; }
+    // Loop protection (duel::DuelConfig::block_after), summed over finished duels: answers
+    // blocked, and duels lost by a player who looped anyway.
+    std::uint64_t blocked_answers() const noexcept { return blocked_answers_; }
+    std::uint64_t loop_losses() const noexcept { return loop_losses_; }
     // Duels that failed to start (and were replaced by another seed/deck pair), and the
     // last reason. Nonzero usually means a deck or card data problem.
     std::uint64_t start_failures() const noexcept { return start_failures_; }
@@ -139,6 +143,8 @@ private:
     ThreadPool pool_;
     std::atomic<std::uint64_t> duels_finished_ = 0;
     std::atomic<std::uint64_t> duel_errors_ = 0;
+    std::atomic<std::uint64_t> blocked_answers_ = 0;
+    std::atomic<std::uint64_t> loop_losses_ = 0;
 
     // recv/send mode
     enum class EnvState : std::uint8_t { Queued, HandedOut, Playing };

@@ -12,7 +12,9 @@ previous and its first arena checkpoint (both seats, sampled moves); win rates, 
 rest on and an Elo estimate (random = 1500) go to <out>/arena.jsonl, how often the model took each
 card's actions since the last arena to <out>/cards.jsonl and the model to
 <out>/checkpoints/<iteration>. <out>/latest holds the checkpoint plus optimizer state to resume
-from with --resume. Run several --seed values to see how much a result depends on luck.
+from with --resume. --init starts a new run from the weights of an earlier checkpoint (fresh
+optimizer, iteration 0); that checkpoint becomes <out>/checkpoints/000000, the first arena opponent
+and a league anchor. Run several --seed values to see how much a result depends on luck.
 """
 
 from __future__ import annotations
@@ -83,6 +85,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--arena-envs", type=int, default=128)
     p.add_argument("--save-every", type=int, default=5, help="iterations between saves of <out>/latest")
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--init", type=Path, help="start from this checkpoint's weights (e.g. <run>/latest)")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--fp32", action="store_true", help="no bf16 autocast (slower, exact)")
     p.add_argument("--no-jemalloc", action="store_true", help="keep glibc malloc")
@@ -142,7 +145,8 @@ def arena(model: Model, opponents: dict[str, Model], args: argparse.Namespace, i
     for k, (label, other) in enumerate(opponents.items(), start=1):
         policy = rollout.ModelPolicy(other, args.device, seed=iteration + k, bf16=not args.fp32)
         results += rollout.match(env, me, policy, args.arena_duels, name, label, names)
-    # Duels cut off (loop protection, Lua budget) are not counted, so a matchup can have no games.
+    # Duels cut off (Lua budget, decision limit) are not counted, so a matchup can have no games. A loop
+    # loss counts as a win for the other side (since the loop blocking; earlier runs dropped those duels).
     summary: dict = {}
     for label in ("random", *opponents):
         summary.update({f"vs_{label}": None, f"games_{label}": 0})
@@ -215,6 +219,9 @@ def main(argv=None) -> None:
                     entropy_coef=args.entropy, kl_coef=0.0, bf16=not args.fp32)
     iteration = 0
     saved = next((d for d in (out / "latest", out / "latest.old") if (d / STATE_FILE).exists()), None)
+    if args.resume and args.init is None and (out / "run.json").exists():  # a resumed --init run keeps its origin
+        init = json.loads((out / "run.json").read_text(encoding="utf-8")).get("init")
+        args.init = Path(init) if init else None
     if args.resume and saved is None and (out / "metrics.jsonl").exists():
         raise SystemExit(f"--resume: {out} has a run but no saved state to resume from")
     if args.resume and saved is not None:
@@ -225,6 +232,13 @@ def main(argv=None) -> None:
         iteration = state["iteration"]
         for log in ("metrics.jsonl", "arena.jsonl", "cards.jsonl"):
             drop_after(out / log, iteration)
+    elif args.init is not None:
+        model = load_checkpoint(args.init, args.device, dropout=0.0)
+        save_checkpoint_whole(model, out / "checkpoints" / f"{0:06d}")
+        shape = lambda c: (c.d_model, c.heads, c.layers, c.ff)  # noqa: E731
+        if shape(SIZES[args.size]) != shape(model.config):
+            print(f"--init: the model keeps its own size, not --size {args.size}", flush=True)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=ppo.lr)
     else:
         model = build_model(args).to(args.device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=ppo.lr)
@@ -256,7 +270,7 @@ def main(argv=None) -> None:
         previous = frozen
         return frozen
 
-    for checkpoint in sorted((out / "checkpoints").glob("*")) if args.resume else []:  # the league drops old ones
+    for checkpoint in sorted((out / "checkpoints").glob("*")) if args.resume or args.init else []:  # league drops old ones
         if checkpoint.name.isdigit() and int(checkpoint.name) <= iteration:
             try:
                 admit(checkpoint)
@@ -269,6 +283,7 @@ def main(argv=None) -> None:
     policy = rollout.ModelPolicy(model, args.device, seed=args.seed, bf16=ppo.bf16)
     deadline = time.time() + args.hours * 3600 if args.hours > 0 else None
     saved_iteration, failing = iteration, 0
+    loops = env.blocked_answers, env.loop_losses  # duels end between iterations too: carry the baseline
     try:
         while iteration < args.iterations and (deadline is None or time.time() < deadline):
             start = time.time()
@@ -284,9 +299,13 @@ def main(argv=None) -> None:
                     "collectSeconds": round(collected - start, 2), "updateSeconds": round(done - collected, 2),
                     "duels": stats.duels, "leagueDuels": stats.league_duels, "errors": stats.errors,
                     "errorReasons": error_reasons(stats.error_messages),
+                    # loop protection: answers blocked and duels lost by looping anyway
+                    "blockedAnswers": env.blocked_answers - loops[0],
+                    "loopLosses": env.loop_losses - loops[1],
                     "leagueDataShare": round(stats.league_decisions / max(1, stats.learner_decisions), 3),
                     "wins": stats.wins, "league": league.scores(),
                     **{k: round(v, 5) if isinstance(v, float) else v for k, v in history[-1].items()}}
+            loops = loops[0] + line["blockedAnswers"], loops[1] + line["loopLosses"]
             with open(out / "metrics.jsonl", "a", encoding="utf-8") as f:
                 f.write(json.dumps(line) + "\n")
             print(json.dumps(line), flush=True)
