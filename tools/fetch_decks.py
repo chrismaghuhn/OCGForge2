@@ -6,8 +6,9 @@ Downloads the top decks uploaded in the last --weeks (raw JSON stays in .cache/y
 committed), drops lists marked incomplete, OCG-only or Genesys, and per archetype keeps the
 best-placed list, preferring lists legal under the current banlist and then the newest. Card names
 are mapped to passcodes through the pinned BabelCDB (official passcodes before pre-release ones).
-Each candidate becomes .cache/yugiohmeta/decks/<archetype>.ydk; decks with cards that are not in
-the card pool are reported and not written. Copy the ones you want into decks/.
+Each candidate becomes .cache/yugiohmeta/decks/<archetype>.ydk (or --decks-dir); decks with cards
+that are not in the card pool are reported and not written. With --fallback an archetype whose best
+list has such cards takes its next-best list that has none. Copy the ones you want into decks/.
 """
 
 from __future__ import annotations
@@ -99,6 +100,11 @@ def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--weeks", type=int, default=6)
     parser.add_argument("--min-lists", type=int, default=1, help="skip archetypes with fewer top lists")
+    parser.add_argument("--decks-dir", type=Path, default=OUT / "decks", help="where the .ydk files go")
+    parser.add_argument("--fallback", action="store_true",
+                        help="take the next-best list of an archetype when the best has unknown cards")
+    parser.add_argument("--all-formats", action="store_true",
+                        help="keep OCG and Genesys lists too (TCG lists still win within an archetype)")
     args = parser.parse_args(argv)
 
     since = dt.date.today() - dt.timedelta(weeks=args.weeks)
@@ -106,22 +112,28 @@ def main(argv=None) -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / f"top-decks-{dt.date.today().isoformat()}.json").write_text(json.dumps(decks), encoding="utf-8")
 
-    usable = [d for d in decks if d.get("deckType") and not d.get("incomplete") and not d.get("ocg")
-              and not d.get("genesys")]
+    usable = [d for d in decks if d.get("deckType") and not d.get("incomplete")
+              and (args.all_formats or not (d.get("ocg") or d.get("genesys")))]
     by_type: dict[str, list[dict]] = {}
     for deck in usable:
         by_type.setdefault(deck["deckType"]["name"], []).append(deck)
 
     codes = card_codes()
-    (OUT / "decks").mkdir(exist_ok=True)
+    args.decks_dir.mkdir(parents=True, exist_ok=True)
     rows = []
     for name, lists in by_type.items():
         if len(lists) < args.min_lists:
             continue
-        best = min(lists, key=lambda d: (bool(d.get("illegal")), placement(d), -dt.datetime.fromisoformat(
+        ranked = sorted(lists, key=lambda d: (bool(d.get("ocg") or d.get("genesys")), bool(d.get("illegal")),
+                                              placement(d), -dt.datetime.fromisoformat(
             d["uploaded"].replace("Z", "+00:00")).timestamp()))
-        text, missing = to_ydk(best, codes)
-        path = OUT / "decks" / f"{slug(name)}.ydk"
+        best, (text, missing) = ranked[0], to_ydk(ranked[0], codes)
+        for candidate in ranked[1:] if args.fallback and missing else []:
+            candidate_text, candidate_missing = to_ydk(candidate, codes)
+            if not candidate_missing:  # otherwise the report keeps the best list and what it misses
+                best, text, missing = candidate, candidate_text, candidate_missing
+                break
+        path = args.decks_dir / f"{slug(name)}.ydk"
         if missing:
             path.unlink(missing_ok=True)
         else:

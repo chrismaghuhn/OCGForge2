@@ -75,3 +75,34 @@ def test_resume_survives_a_cut_off_log_line_and_an_interrupted_save(tmp_path):
     train.save_latest(model, optimizer, tmp_path, 2)
     assert torch.load(tmp_path / "latest" / train.STATE_FILE)["iteration"] == 2
     assert not (tmp_path / "latest.old").exists()
+
+
+def test_entropy_ramps_from_start_to_the_coefficient():
+    from types import SimpleNamespace
+
+    args = SimpleNamespace(entropy=0.03, entropy_start=0.08, entropy_ramp=100)
+    assert [round(train.entropy_coef(args, i), 4) for i in (0, 50, 100, 400)] == [0.08, 0.055, 0.03, 0.03]
+    assert train.entropy_coef(SimpleNamespace(entropy=0.03, entropy_start=None, entropy_ramp=0), 5) == 0.03
+
+
+def test_reset_heads_keeps_the_encoder(card_features):
+    from ocgforge.model import Model, ModelConfig
+
+    model = Model(card_features, ModelConfig(d_model=32, heads=2, layers=1, ff=64))
+    before = {k: v.clone() for k, v in model.state_dict().items()}
+    train.reset_heads(model)
+    after = model.state_dict()
+    changed = {k for k in before if not torch.equal(before[k], after[k])}
+    assert changed and all(k.startswith(("score.", "value.")) for k in changed)
+
+
+def test_resume_keeps_the_runs_origin_and_schedules():
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    args = SimpleNamespace(**train.RESUMED_SETTINGS)
+    args.tempo_floor = 0.5  # given again on the command line: wins over run.json
+    train.restore_run_settings(args, {"init": "runs/base", "tempo_slope": 0.05, "tempo_floor": 0.6,
+                                      "entropy_start": 0.08, "entropy_ramp": 150})
+    assert args.init == Path("runs/base") and args.tempo_slope == 0.05 and args.tempo_floor == 0.5
+    assert (args.entropy_start, args.entropy_ramp) == (0.08, 150)

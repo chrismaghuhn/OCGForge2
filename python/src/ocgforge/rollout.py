@@ -91,6 +91,19 @@ class RolloutStats:
     learner_decisions: int = 0  # decisions kept for training
     league_decisions: int = 0  # of those, played against a league opponent
     error_messages: list[str] = field(default_factory=list)
+    end_turns: list[int] = field(default_factory=list)  # turn count at the end of each finished duel
+
+
+@dataclass(frozen=True)
+class Tempo:
+    """Duel results lose weight the longer the duel ran: full weight up to turn `start` (turns of
+    both players), then `slope` less per turn, never below `floor` (so a late win stays a win)."""
+    start: int = 5
+    slope: float = 0.0
+    floor: float = 0.6
+
+    def weight(self, turn: int) -> float:
+        return 1.0 if turn <= self.start else max(self.floor, 1.0 - self.slope * (turn - self.start))
 
 
 def _mark_fresh(fresh: list[bool | None], decisions: Sequence[dict]) -> None:
@@ -221,6 +234,78 @@ class CardUsage:
         self.chosen[:] = 0
 
 
+_EXTRA_TYPE_IDS = (6 + 2, 13 + 2, 23 + 2, 26 + 2)  # Fusion, Synchro, Xyz, Link as CardFeatures.types ids
+_MONSTER_ZONE = features.ZONES.index("monster_zone")
+_TURN = features.GLOBAL_NUMERIC.index("turn")
+_OWN_TURN = features.GLOBAL_NUMERIC.index("isOwnTurn")
+
+
+class ExtraDeckUsage:
+    """The learner's Extra Deck monsters: in how many duels each one reached its field ("played") and
+    how often each one stood there when the learner's turn ended ("end board"), counted over all own
+    turns and separately for the first turn of the duel (the board a first player sets up). The end
+    of a turn is the learner's last decision in it, seen when its next decision is in another turn;
+    a duel that ends in the learner's own turn records no end board for that turn."""
+
+    def __init__(self, card_features):
+        self.extra = np.isin(card_features.types, _EXTRA_TYPE_IDS).any(axis=1)
+        n = len(self.extra)
+        self.played = np.zeros(n, np.int64)
+        self.end_board = np.zeros(n, np.int64)
+        self.first_board = np.zeros(n, np.int64)
+        self.turns = 0  # own turns with a recorded end board
+        self.first_turns = 0
+        self.seen: dict[tuple[int, int], set[int]] = {}  # (env, player) -> extra cards on its field this duel
+        self.last: dict[tuple[int, int], tuple[int, list[int]]] = {}  # -> (own turn, extra cards on its field)
+
+    def add(self, ids: list[int], batch: dict, rows: list[int]) -> None:
+        """Counts the learner's `rows` of a batch; every row of it (a league opponent's too) may
+        start a new duel in its env, which forgets that env's previous duel."""
+        for n in np.flatnonzero(batch["duel_decision"] == 0):
+            for player in (0, 1):
+                self.seen.pop((ids[n], player), None)
+                self.last.pop((ids[n], player), None)
+        if not rows:
+            return
+        players = batch["player"]
+        cards = batch["token_card"]
+        own = (batch["token_side"] == 0) & (batch["token_zone"] == _MONSTER_ZONE)
+        for n in rows:
+            key = (ids[n], int(players[n]))
+            field = [int(c) for c in cards[n][own[n]] if c > 1 and self.extra[c]]
+            seen = self.seen.setdefault(key, set())
+            for card in set(field) - seen:
+                self.played[card] += 1
+                seen.add(card)
+            turn = round(float(batch["global_numeric"][n][_TURN]) * 20)
+            previous = self.last.get(key)
+            if previous is not None and previous[0] != turn:
+                self._end_turn(*previous)
+                del self.last[key]
+            if batch["global_numeric"][n][_OWN_TURN] > 0.5:
+                self.last[key] = (turn, field)
+
+    def _end_turn(self, turn: int, field: list[int]) -> None:
+        self.turns += 1
+        np.add.at(self.end_board, field, 1)
+        if turn == 1:
+            self.first_turns += 1
+            np.add.at(self.first_board, field, 1)
+
+    def summary(self) -> dict:
+        return {"endBoardTurns": self.turns,
+                "endBoardExtra": round(float(self.end_board.sum() / max(1, self.turns)), 3),
+                "firstTurnBoards": self.first_turns,
+                "firstTurnExtra": round(float(self.first_board.sum() / max(1, self.first_turns)), 3)}
+
+    def reset(self) -> None:
+        """Clears the counts; duels in progress keep their state."""
+        self.played[:] = 0
+        self.end_board[:] = 0
+        self.first_board[:] = 0
+        self.turns = self.first_turns = 0
+
+
 def _rows(batch: dict, rows: list[int]) -> dict:
     """The given rows of a recv_batch batch."""
     count = len(batch["token_count"])
@@ -247,9 +332,11 @@ class AsyncCollector:
     they play self-play too."""
 
     def __init__(self, env, batch_size: int, segment: int = 128, league: League | None = None,
-                 card_usage: CardUsage | None = None):
+                 card_usage: CardUsage | None = None, extra_usage: ExtraDeckUsage | None = None,
+                 tempo: Tempo | None = None):
         self.env, self.batch_size, self.segment, self.league = env, batch_size, segment, league
-        self.card_usage = card_usage
+        self.card_usage, self.extra_usage, self.tempo = card_usage, extra_usage, tempo
+        self.turn: dict[int, int] = {}  # env -> turn count at its latest decision
         self.pending: dict[tuple[int, int], list[dict]] = {}
         self.league_envs = round(len(env) * league.share) if league else 0
         self.opponent: dict[int, str] = {}  # env -> league opponent of its current duel
@@ -277,6 +364,9 @@ class AsyncCollector:
                     stats.errors += 1
                     stats.error_messages.append(error)
                     continue
+                turn = self.turn.get(i, 0)
+                stats.end_turns.append(turn)
+                weight = self.tempo.weight(turn) if self.tempo else 1.0
                 if opponent is not None:
                     learner = 1 - i % 2
                     self.league.result(opponent, (_result_for(learner, winner) + 1) / 2)
@@ -289,7 +379,10 @@ class AsyncCollector:
                 for player in continue_with:
                     seat = seats[player]
                     if seat:
-                        segments.append((seat, _result_for(player, winner), None))
+                        segments.append((seat, _result_for(player, winner) * weight, None))
+            turns = batch["global_numeric"][:, _TURN] * 20
+            for n, i in enumerate(ids):
+                self.turn[i] = round(float(turns[n]))
             for i, first in zip(ids, (batch["duel_decision"] == 0).tolist()):
                 if first and i < self.league_envs and i not in self.opponent and (name := self.league.pick()):
                     self.opponent[i] = name
@@ -303,9 +396,11 @@ class AsyncCollector:
                 part = batch if len(rows) == len(ids) else _rows(batch, rows)
                 for n, c, lp, v in zip(rows, *_play(policy if name is None else self.league.policies[name], part)):
                     choices[n], logprobs[n], values[n] = c, lp, v
+            learner_rows = [n for n, a in enumerate(actor) if a is None]
             if self.card_usage is not None:
-                learner_rows = [n for n, a in enumerate(actor) if a is None]
                 self.card_usage.add(batch, learner_rows, [choices[n] for n in learner_rows])
+            if self.extra_usage is not None:
+                self.extra_usage.add(ids, batch, learner_rows)
             for n, (i, choice, logprob, value) in enumerate(zip(ids, choices, logprobs, values)):
                 if actor[n] is not None:
                     continue  # the league opponent's move: not trained on

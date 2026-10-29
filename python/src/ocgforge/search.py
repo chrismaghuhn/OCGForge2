@@ -100,7 +100,7 @@ def search_turn(spec: DuelSpec, actions: list[str], policy, card_index, k: int =
 
 def honest_search(spec: DuelSpec, duel, policy, card_index, lines: int = 8, worlds_per_line: int = 8,
                   max_decisions: int = 80, seed: int = 0, pool: ThreadPoolExecutor | None = None,
-                  make_world=None, segment: int = 0, deterministic: bool = True) -> SearchResult:
+                  make_world=None, segment: int = 0, deterministic: bool = True, truth: bool = False) -> SearchResult:
     """Search without peeking: from `duel` at the searching player's first idle command of its turn,
     build `worlds_per_line` worlds from what that player can see (ocgforge.worlds), generate `lines`
     candidate plans (rollout 0 the most likely answers, the others sampled, each in its own world),
@@ -111,7 +111,9 @@ def honest_search(spec: DuelSpec, duel, policy, card_index, lines: int = 8, worl
     By default the worlds are built at the current point, which must be the start of the player's
     main phase; `make_world(i)` builds world i elsewhere (e.g. worlds.world_now mid-turn) or returns
     None. With `segment` (worlds.phase_group) a rollout ends when the duel leaves that phase group
-    instead of at the end of the turn."""
+    instead of at the end of the turn. With `truth` the worlds keep the opponent's real hidden cards
+    and only reshuffle the decks: a restricted oracle that knows the opponent's hand but not the order
+    of its own deck."""
     from . import worlds as w
 
     pool = pool or ThreadPoolExecutor(16)
@@ -120,7 +122,7 @@ def honest_search(spec: DuelSpec, duel, policy, card_index, lines: int = 8, worl
     decklists = {0: w.read_decklist(spec.deck0), 1: w.read_decklist(spec.deck1)}
     rng = random.Random(seed)
     if make_world is None:
-        scripts = [w.sample_world(snapshot, me, decklists, random.Random(rng.getrandbits(32)))
+        scripts = [w.sample_world(snapshot, me, decklists, random.Random(rng.getrandbits(32)), truth=truth)
                    for _ in range(max(lines, worlds_per_line))]
         make_world = lambda i: w.start_world(spec, scripts[i], me, seed + i)  # noqa: E731
 
@@ -243,12 +245,15 @@ class HonestSearchPolicy:
     plans each phase on its own: Main Phase 1 there, the Battle Phase at its first battle command and
     Main Phase 2 at its first idle command, each scored where the phase ends. Worlds for the later
     phases are built at the turn's start and replayed through this turn's answers (worlds.world_now),
-    so this-turn effects and what the opponent revealed meanwhile carry over."""
+    so this-turn effects and what the opponent revealed meanwhile carry over.
+
+    With `oracle` it plans Main Phase 1 only, in worlds that keep the opponent's real hidden cards
+    (honest_search truth=True): the combo line of a restricted oracle, the rest of the turn greedy."""
 
     def __init__(self, policy, card_index, lines: int = 8, worlds_per_line: int = 8,
-                 pool: ThreadPoolExecutor | None = None, phases: bool = False):
+                 pool: ThreadPoolExecutor | None = None, phases: bool = False, oracle: bool = False):
         self.policy, self.card_index = policy, card_index
-        self.lines, self.worlds_per_line, self.phases = lines, worlds_per_line, phases
+        self.lines, self.worlds_per_line, self.phases, self.oracle = lines, worlds_per_line, phases, oracle
         self.pool = pool or ThreadPoolExecutor(16)
         self.plan: list[str] = []
         self.turn = None
@@ -270,7 +275,8 @@ class HonestSearchPolicy:
             make_world = lambda i: w.world_now(spec, self.start, now, history, me, decklists,  # noqa: E731
                                                random.Random(base + i), base + 10 * i)
         result = honest_search(spec, duel, self.policy, self.card_index, self.lines, self.worlds_per_line,
-                               seed=self.searches, pool=self.pool, make_world=make_world, segment=segment)
+                               seed=self.searches, pool=self.pool, make_world=make_world, segment=segment,
+                               truth=self.oracle)
         self.searches += 1
         if not result.values:
             self.failed += 1
@@ -284,7 +290,7 @@ class HonestSearchPolicy:
         mine = duel.turn_player == duel.player
         if mine and duel.turn != self.turn and keys[0].startswith("idle"):
             self.turn, self.start, self.start_index, self.searched = duel.turn, duel.snapshot(), len(actions), {1}
-            self.search(spec, actions, duel, 1 if self.phases else 0)
+            self.search(spec, actions, duel, 1 if self.phases or self.oracle else 0)
         elif self.phases and mine and duel.turn == self.turn and keys[0].startswith(("idle", "battle")):
             group = w.phase_group(duel.phase)
             if group in (2, 3) and group not in self.searched:
@@ -313,13 +319,15 @@ class GreedyPolicy(rollout.ModelPolicy):
 
 
 def match(model, decks: list[Path], duels: int, k: int, device: str, seed: int = 0, honest: bool = False,
-          phases: bool = False) -> dict:
+          phases: bool = False, oracle_main: bool = False) -> dict:
     """`duels` duels of a searching player against the plain sampling policy (same model), alternating
-    seats: oracle search (SearchPolicy) or, with honest=True, HonestSearchPolicy with k lines x k worlds."""
+    seats: oracle search (SearchPolicy) or, with honest=True, HonestSearchPolicy with k lines x k worlds
+    (oracle_main: its restricted oracle, Main Phase 1 only)."""
     rng = random.Random(seed)
     card_index = model.card_features.index_map()
     policy = GreedyPolicy(model, device, sample=True, seed=seed)
-    searcher = (HonestSearchPolicy(policy, card_index, k, k, phases=phases) if honest or phases
+    searcher = (HonestSearchPolicy(policy, card_index, k, k, phases=phases, oracle=oracle_main)
+                if honest or phases or oracle_main
                 else SearchPolicy(policy, card_index, k))
     wins = losses = draws = 0
     started = time.time()
@@ -365,10 +373,14 @@ def main(argv=None) -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--honest", action="store_true", help="honest search (k plans x k sampled worlds)")
     parser.add_argument("--phases", action="store_true", help="honest search per phase (Main 1, Battle, Main 2)")
+    parser.add_argument("--oracle-main", action="store_true",
+                        help="restricted oracle: Main Phase 1 only, real hidden cards, decks reshuffled")
     args = parser.parse_args(argv)
+    if args.oracle_main and args.phases:
+        parser.error("--oracle-main plans Main Phase 1 only; it does not combine with --phases")
     model = load_checkpoint(args.checkpoint, args.device, dropout=0.0)
     print(match(model, args.decks, args.duels, args.k, args.device, args.seed, args.honest,
-                args.phases), flush=True)
+                args.phases, args.oracle_main), flush=True)
 
 
 if __name__ == "__main__":

@@ -123,3 +123,52 @@ def test_card_usage_counts_offered_and_chosen_card_actions():
     usage.add(batch, [0, 1], [1, 2])  # summon card 6; then the padding slot is not a card action
     assert usage.offered[[5, 6, 7]].tolist() == [2, 1, 1]
     assert usage.chosen.tolist() == [0, 0, 0, 0, 0, 0, 1, 0, 0, 0]
+
+
+def test_extra_deck_usage_counts_played_cards_and_end_boards():
+    from types import SimpleNamespace
+
+    from ocgforge import features
+    from ocgforge.rollout import ExtraDeckUsage
+
+    types = np.zeros((10, 2), np.int64)
+    types[5, 0], types[6, 1] = 13 + 2, 26 + 2  # card 5 a Synchro, card 6 a Link; card 7 a main deck card
+    usage = ExtraDeckUsage(SimpleNamespace(types=types))
+    mzone, grave = features.ZONES.index("monster_zone"), features.ZONES.index("graveyard")
+    turn, own = features.GLOBAL_NUMERIC.index("turn"), features.GLOBAL_NUMERIC.index("isOwnTurn")
+
+    def step(duel_decision, turn_count, own_turn, tokens):
+        """One decision of player 0 in env 3; tokens are (card, side, zone)."""
+        g = np.zeros((1, len(features.GLOBAL_NUMERIC)), np.float32)
+        g[0, turn], g[0, own] = turn_count / 20, float(own_turn)
+        usage.add([3], {"player": np.array([0]), "duel_decision": np.array([duel_decision]), "global_numeric": g,
+                        "token_card": np.array([[c for c, _, _ in tokens]]),
+                        "token_side": np.array([[s for _, s, _ in tokens]]),
+                        "token_zone": np.array([[z for _, _, z in tokens]])}, [0])
+
+    step(0, 1, True, [(7, 0, mzone)])
+    step(5, 1, True, [(5, 0, mzone), (6, 1, mzone)])  # the opponent's Link is not ours
+    step(9, 1, True, [(5, 0, mzone), (6, 0, mzone), (7, 0, mzone)])  # turn 1 ends with both on the field
+    step(12, 2, False, [(5, 0, mzone), (6, 0, grave)])
+    step(20, 3, True, [(5, 0, mzone), (6, 0, mzone)])  # card 6 again in the same duel: still played once
+    step(25, 5, True, [(6, 0, mzone)])  # no decision in turn 4: turn 3 ends here
+    assert usage.played[[5, 6, 7]].tolist() == [1, 1, 0]
+    assert usage.end_board[[5, 6]].tolist() == [2, 2] and usage.first_board[[5, 6]].tolist() == [1, 1]
+    assert usage.summary() == {"endBoardTurns": 2, "endBoardExtra": 2.0, "firstTurnBoards": 1, "firstTurnExtra": 2.0}
+    step(0, 1, False, [(6, 0, mzone)])  # a new duel: turn 5 never ended, card 6 counts again
+    assert usage.played[6] == 2 and usage.turns == 2
+    step(9, 4, True, [(5, 0, mzone)])  # this duel ends in our own turn 4 with card 5 out
+    # The next duel starts with the opponent's decision (a league opponent's row: not counted)...
+    usage.add([3], {"player": np.array([1]), "duel_decision": np.array([0]),
+                    "global_numeric": np.zeros((1, len(features.GLOBAL_NUMERIC)), np.float32),
+                    "token_card": np.array([[0]]), "token_side": np.array([[2]]), "token_zone": np.array([[0]])}, [])
+    step(3, 2, False, [(5, 0, mzone)])  # ...so our turn 4 of the last duel is no end board here
+    assert usage.turns == 2 and usage.played[5] == 3  # played in all three duels
+
+
+def test_tempo_keeps_early_results_and_shrinks_late_ones_to_the_floor():
+    from ocgforge.rollout import Tempo
+
+    tempo = Tempo(start=5, slope=0.05, floor=0.6)
+    assert [tempo.weight(t) for t in (1, 3, 5)] == [1.0, 1.0, 1.0]
+    assert [round(tempo.weight(t), 2) for t in (6, 10, 13, 30)] == [0.95, 0.75, 0.6, 0.6]

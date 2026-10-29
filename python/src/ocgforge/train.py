@@ -84,6 +84,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--arena-duels", type=int, default=200, help="per matchup; 200 gives about +-7%% on a win rate")
     p.add_argument("--arena-envs", type=int, default=128)
     p.add_argument("--save-every", type=int, default=5, help="iterations between saves of <out>/latest")
+    p.add_argument("--reset-heads", action="store_true",
+                   help="with --init: new policy (score) and value heads, the card and board encoder kept")
+    p.add_argument("--entropy-start", type=float, help="entropy coefficient at iteration 0, ramped to --entropy")
+    p.add_argument("--entropy-ramp", type=int, default=0, help="iterations from --entropy-start to --entropy")
+    p.add_argument("--tempo-slope", type=float, default=0.0,
+                   help="duel results lose this much weight per turn after --tempo-start (0 = off)")
+    p.add_argument("--tempo-start", type=int, default=5, help="last turn (both players' turns) at full weight")
+    p.add_argument("--tempo-floor", type=float, default=0.6, help="lowest weight of a result")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--init", type=Path, help="start from this checkpoint's weights (e.g. <run>/latest)")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -118,6 +126,37 @@ def build_model(args: argparse.Namespace) -> Model:
     return Model(card_features, config, text_embeddings=embeddings)
 
 
+# Settings a resumed run keeps from run.json unless given again: its origin and its reward and
+# exploration schedules (dropping them silently would change what the run optimizes mid-way).
+RESUMED_SETTINGS = {"init": None, "tempo_slope": 0.0, "tempo_start": 5, "tempo_floor": 0.6,
+                    "entropy_start": None, "entropy_ramp": 0}
+
+
+def restore_run_settings(args: argparse.Namespace, run: dict) -> None:
+    for name, default in RESUMED_SETTINGS.items():
+        if getattr(args, name) == default and run.get(name, default) != default:
+            value = run[name]
+            setattr(args, name, Path(value) if name == "init" else value)
+            print(f"--resume: {name} = {value} from run.json", flush=True)
+
+
+def reset_heads(model: Model) -> None:
+    """Fresh policy and value heads: what the encoder knows about cards and boards stays, what the
+    model learned to do with it starts over."""
+    for head in (model.score, model.value):
+        for layer in head.modules():
+            if isinstance(layer, torch.nn.Linear):
+                layer.reset_parameters()
+
+
+def entropy_coef(args: argparse.Namespace, iteration: int) -> float:
+    """--entropy, or a linear ramp from --entropy-start to it over --entropy-ramp iterations."""
+    if args.entropy_start is None or args.entropy_ramp <= 0:
+        return args.entropy
+    share = min(1.0, iteration / args.entropy_ramp)
+    return args.entropy_start + (args.entropy - args.entropy_start) * share
+
+
 def card_names(card_features: CardFeatures) -> dict[int, str]:
     """Card index -> name."""
     table = CardTable.from_cdb()
@@ -132,6 +171,15 @@ def card_report(usage: rollout.CardUsage, names: dict[int, str]) -> list[dict]:
              "rate": round(float(usage.chosen[i] / usage.offered[i]), 4)}
             for i in np.flatnonzero(usage.offered)]
     return sorted(rows, key=lambda r: -r["chosen"])
+
+
+def extra_report(usage: rollout.ExtraDeckUsage, names: dict[int, str]) -> list[dict]:
+    """Every Extra Deck monster that reached the learner's field, most played first: duels it was
+    played in, and own turns (all, and the duel's first turn) it ended on the field."""
+    rows = [{"card": names.get(int(i), str(int(i))), "played": int(usage.played[i]),
+             "endBoard": int(usage.end_board[i]), "firstTurn": int(usage.first_board[i])}
+            for i in np.flatnonzero(usage.played | usage.end_board)]
+    return sorted(rows, key=lambda r: (-r["played"], -r["endBoard"]))
 
 
 def arena(model: Model, opponents: dict[str, Model], args: argparse.Namespace, iteration: int) -> dict:
@@ -219,9 +267,8 @@ def main(argv=None) -> None:
                     entropy_coef=args.entropy, kl_coef=0.0, bf16=not args.fp32)
     iteration = 0
     saved = next((d for d in (out / "latest", out / "latest.old") if (d / STATE_FILE).exists()), None)
-    if args.resume and args.init is None and (out / "run.json").exists():  # a resumed --init run keeps its origin
-        init = json.loads((out / "run.json").read_text(encoding="utf-8")).get("init")
-        args.init = Path(init) if init else None
+    if args.resume and (out / "run.json").exists():
+        restore_run_settings(args, json.loads((out / "run.json").read_text(encoding="utf-8")))
     if args.resume and saved is None and (out / "metrics.jsonl").exists():
         raise SystemExit(f"--resume: {out} has a run but no saved state to resume from")
     if args.resume and saved is not None:
@@ -238,6 +285,8 @@ def main(argv=None) -> None:
         shape = lambda c: (c.d_model, c.heads, c.layers, c.ff)  # noqa: E731
         if shape(SIZES[args.size]) != shape(model.config):
             print(f"--init: the model keeps its own size, not --size {args.size}", flush=True)
+        if args.reset_heads:  # checkpoint 0 above keeps the old heads: the arena's "first" is the init model
+            reset_heads(model)
         optimizer = torch.optim.AdamW(model.parameters(), lr=ppo.lr)
     else:
         model = build_model(args).to(args.device)
@@ -277,8 +326,12 @@ def main(argv=None) -> None:
             except Exception as error:  # e.g. cut off by a kill before checkpoints were written whole
                 print(f"skipping checkpoint {checkpoint.name}: {error}", flush=True)
     usage = rollout.CardUsage(model.card_features.size)
+    extra = rollout.ExtraDeckUsage(model.card_features)
     collector = rollout.AsyncCollector(env, batch_size=max(1, args.envs // 2), segment=args.segment,
-                                       league=league if args.league_share > 0 else None, card_usage=usage)
+                                       league=league if args.league_share > 0 else None, card_usage=usage,
+                                       extra_usage=extra,
+                                       tempo=rollout.Tempo(args.tempo_start, args.tempo_slope, args.tempo_floor)
+                                       if args.tempo_slope > 0 else None)
     names = card_names(model.card_features)
     policy = rollout.ModelPolicy(model, args.device, seed=args.seed, bf16=ppo.bf16)
     deadline = time.time() + args.hours * 3600 if args.hours > 0 else None
@@ -290,7 +343,8 @@ def main(argv=None) -> None:
             segments, stats = collector.collect(policy, args.steps)
             collected = time.time()
             steps = build_steps(segments, ppo.gamma, ppo.lam)
-            history = ppo_update(model, optimizer, steps, ppo, args.device, seed=args.seed * 1_000_003 + iteration + 1)
+            config = replace(ppo, entropy_coef=entropy_coef(args, iteration))
+            history = ppo_update(model, optimizer, steps, config, args.device, seed=args.seed * 1_000_003 + iteration + 1)
             iteration += 1
             done = time.time()
             finished = stats.duels + stats.league_duels + stats.errors
@@ -303,7 +357,9 @@ def main(argv=None) -> None:
                     "blockedAnswers": env.blocked_answers - loops[0],
                     "loopLosses": env.loop_losses - loops[1],
                     "leagueDataShare": round(stats.league_decisions / max(1, stats.learner_decisions), 3),
-                    "wins": stats.wins, "league": league.scores(),
+                    "wins": stats.wins, "league": league.scores(), "entropyCoef": round(config.entropy_coef, 5),
+                    "endTurn": round(float(np.mean(stats.end_turns)), 2) if stats.end_turns else None,
+                    "endByTurn5": round(float(np.mean(np.array(stats.end_turns) <= 5)), 3) if stats.end_turns else None,
                     **{k: round(v, 5) if isinstance(v, float) else v for k, v in history[-1].items()}}
             loops = loops[0] + line["blockedAnswers"], loops[1] + line["loopLosses"]
             with open(out / "metrics.jsonl", "a", encoding="utf-8") as f:
@@ -320,13 +376,15 @@ def main(argv=None) -> None:
                 opponents = {"previous": previous} if previous is not None else {}
                 if first is not None and first is not previous:
                     opponents["first"] = first
-                result = {"iteration": iteration, **arena(model, opponents, args, iteration)}
+                result = {"iteration": iteration, **arena(model, opponents, args, iteration), **extra.summary()}
                 with open(out / "arena.jsonl", "a", encoding="utf-8") as f:
                     f.write(json.dumps(result) + "\n")
                 print(json.dumps(result), flush=True)
                 with open(out / "cards.jsonl", "a", encoding="utf-8") as f:
-                    f.write(json.dumps({"iteration": iteration, "cards": card_report(usage, names)}) + "\n")
+                    f.write(json.dumps({"iteration": iteration, "cards": card_report(usage, names),
+                                        "extra": extra_report(extra, names), **extra.summary()}) + "\n")
                 usage.reset()
+                extra.reset()
                 admit(checkpoint)
             if iteration % args.save_every == 0 or iteration % args.arena_every == 0:
                 save_latest(model, optimizer, out, iteration)
