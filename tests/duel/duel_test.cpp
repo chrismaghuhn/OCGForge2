@@ -68,6 +68,27 @@ TEST_CASE("same seed and same choices give the same duel") {
     CHECK(first.result.reason == second.result.reason);
 }
 
+TEST_CASE("the seed shuffles the decks: opening hands differ between seeds, not within one") {
+    const auto hand = [](std::uint64_t seed) {
+        Duel duel(test::duel_config(seed));
+        std::vector<std::uint32_t> cards;
+        for (const auto& card : duel.snapshot().cards) {
+            if (card.controller == 0 && card.location == 0x02) {  // LOCATION_HAND
+                cards.push_back(card.code);
+            }
+        }
+        std::sort(cards.begin(), cards.end());
+        return cards;
+    };
+    CHECK(hand(7) == hand(7));
+    std::vector<std::vector<std::uint32_t>> hands;
+    for (std::uint64_t seed = 1; seed <= 8; ++seed) {
+        hands.push_back(hand(seed));
+    }
+    std::sort(hands.begin(), hands.end());
+    CHECK(std::unique(hands.begin(), hands.end()) - hands.begin() >= 6);
+}
+
 TEST_CASE("decision limit stops a duel that runs too long") {
     auto config = test::duel_config(7);
     config.max_decisions = 10;

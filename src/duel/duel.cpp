@@ -25,6 +25,26 @@ constexpr std::size_t kEventTail = 512;
 // resolution, ...). Far above anything a real duel needs.
 constexpr std::uint64_t kMaxStepsWithoutDecision = 100000;
 
+std::uint64_t splitmix64(std::uint64_t& state) noexcept {
+    std::uint64_t z = (state += 0x9e3779b97f4a7c15ULL);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
+// ocgcore draws the opening hands from the decks in the order the host adds the cards and does not
+// shuffle them first (EDOPro's host shuffles before adding), so the host shuffles the main deck:
+// Fisher-Yates from the duel seed, the same on every platform. Same seed, same deck order.
+core::Deck shuffled(core::Deck deck, std::uint64_t seed, std::uint8_t player) {
+    std::uint64_t state = seed ^ (0xd1b54a32d192ed03ULL * (player + 1));
+    auto& cards = deck.main_deck;
+    for (std::size_t i = cards.size(); i > 1; --i) {
+        const auto j = static_cast<std::size_t>(splitmix64(state) % i);
+        std::swap(cards[i - 1], cards[j]);
+    }
+    return deck;
+}
+
 }  // namespace
 
 Duel::Duel(DuelConfig config) : config_(std::move(config)) {
@@ -38,8 +58,8 @@ Duel::Duel(DuelConfig config) : config_(std::move(config)) {
 
     host_ = std::make_unique<core::CoreHost>(std::move(host_config));
     if (config_.fixture_script.empty()) {
-        host_->load_deck(0, config_.deck0);
-        host_->load_deck(1, config_.deck1);
+        host_->load_deck(0, shuffled(config_.deck0, config_.seed, 0));
+        host_->load_deck(1, shuffled(config_.deck1, config_.seed, 1));
     } else {
         host_->load_script_text("world.lua", config_.fixture_script);
     }
