@@ -96,14 +96,19 @@ class RolloutStats:
 
 @dataclass(frozen=True)
 class Tempo:
-    """Duel results lose weight the longer the duel ran: full weight up to turn `start` (turns of
-    both players), then `slope` less per turn, never below `floor` (so a late win stays a win)."""
+    """Wins lose weight the longer the duel ran: full weight up to turn `start` (turns of both
+    players), then `slope` less per turn, never below `floor` (so a late win stays a win). Losses
+    stay -1 unless `losses`: shrinking them too would pay a lost position for dragging the duel out."""
     start: int = 5
     slope: float = 0.0
     floor: float = 0.6
+    losses: bool = False
 
     def weight(self, turn: int) -> float:
         return 1.0 if turn <= self.start else max(self.floor, 1.0 - self.slope * (turn - self.start))
+
+    def apply(self, result: float, turn: int) -> float:
+        return result * self.weight(turn) if result > 0 or self.losses else result
 
 
 def _mark_fresh(fresh: list[bool | None], decisions: Sequence[dict]) -> None:
@@ -366,7 +371,6 @@ class AsyncCollector:
                     continue
                 turn = self.turn.get(i, 0)
                 stats.end_turns.append(turn)
-                weight = self.tempo.weight(turn) if self.tempo else 1.0
                 if opponent is not None:
                     learner = 1 - i % 2
                     self.league.result(opponent, (_result_for(learner, winner) + 1) / 2)
@@ -379,7 +383,8 @@ class AsyncCollector:
                 for player in continue_with:
                     seat = seats[player]
                     if seat:
-                        segments.append((seat, _result_for(player, winner) * weight, None))
+                        result = _result_for(player, winner)
+                        segments.append((seat, self.tempo.apply(result, turn) if self.tempo else result, None))
             turns = batch["global_numeric"][:, _TURN] * 20
             for n, i in enumerate(ids):
                 self.turn[i] = round(float(turns[n]))

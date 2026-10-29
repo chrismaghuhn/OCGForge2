@@ -92,6 +92,7 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="duel results lose this much weight per turn after --tempo-start (0 = off)")
     p.add_argument("--tempo-start", type=int, default=5, help="last turn (both players' turns) at full weight")
     p.add_argument("--tempo-floor", type=float, default=0.6, help="lowest weight of a result")
+    p.add_argument("--tempo-losses", action="store_true", help="shrink losses too (default: wins only)")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--init", type=Path, help="start from this checkpoint's weights (e.g. <run>/latest)")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -128,7 +129,7 @@ def build_model(args: argparse.Namespace) -> Model:
 
 # Settings a resumed run keeps from run.json unless given again: its origin and its reward and
 # exploration schedules (dropping them silently would change what the run optimizes mid-way).
-RESUMED_SETTINGS = {"init": None, "tempo_slope": 0.0, "tempo_start": 5, "tempo_floor": 0.6,
+RESUMED_SETTINGS = {"init": None, "tempo_slope": 0.0, "tempo_start": 5, "tempo_floor": 0.6, "tempo_losses": False,
                     "entropy_start": None, "entropy_ramp": 0}
 
 
@@ -330,7 +331,7 @@ def main(argv=None) -> None:
     collector = rollout.AsyncCollector(env, batch_size=max(1, args.envs // 2), segment=args.segment,
                                        league=league if args.league_share > 0 else None, card_usage=usage,
                                        extra_usage=extra,
-                                       tempo=rollout.Tempo(args.tempo_start, args.tempo_slope, args.tempo_floor)
+                                       tempo=rollout.Tempo(args.tempo_start, args.tempo_slope, args.tempo_floor, args.tempo_losses)
                                        if args.tempo_slope > 0 else None)
     names = card_names(model.card_features)
     policy = rollout.ModelPolicy(model, args.device, seed=args.seed, bf16=ppo.bf16)

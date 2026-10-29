@@ -172,3 +172,5 @@ def test_tempo_keeps_early_results_and_shrinks_late_ones_to_the_floor():
     tempo = Tempo(start=5, slope=0.05, floor=0.6)
     assert [tempo.weight(t) for t in (1, 3, 5)] == [1.0, 1.0, 1.0]
     assert [round(tempo.weight(t), 2) for t in (6, 10, 13, 30)] == [0.95, 0.75, 0.6, 0.6]
+    assert (round(tempo.apply(1.0, 10), 2), tempo.apply(-1.0, 10), tempo.apply(0.0, 10)) == (0.75, -1.0, 0.0)
+    assert round(Tempo(start=5, slope=0.05, floor=0.6, losses=True).apply(-1.0, 10), 2) == -0.75
