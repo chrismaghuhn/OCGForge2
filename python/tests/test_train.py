@@ -106,3 +106,23 @@ def test_resume_keeps_the_runs_origin_and_schedules():
                                       "entropy_start": 0.08, "entropy_ramp": 150})
     assert args.init == Path("runs/base") and args.tempo_slope == 0.05 and args.tempo_floor == 0.5
     assert (args.entropy_start, args.entropy_ramp) == (0.08, 150)
+
+
+def test_extend_seen_marks_the_decks_cards_and_survives_a_save(tmp_path):
+    from conftest import make_table
+    from ocgforge.cards import UNK, CardFeatures
+    from ocgforge.model import Model, ModelConfig, load_checkpoint, save_checkpoint
+
+    table = make_table()
+    model = Model(CardFeatures.build(table, trained_codes={1001}, min_term_count=1),
+                  ModelConfig(d_model=16, heads=2, layers=1, ff=32))
+    deck = tmp_path / "d.ydk"
+    deck.write_text("#main\n1001\n1003\n1004\n#extra\n1002\n!side\n1003\n")
+    warrior, link, spell = (table.index_of[c] for c in (1001, 1002, 1003))
+    trained_before = model.name.weight[warrior].clone()
+    assert train.extend_seen(model, [deck]) == 2  # the Link and the spell; the alternate artwork is the Warrior
+    assert model.card_seen[[warrior, link, spell]].tolist() == [True, True, True]
+    assert torch.equal(model.name.weight[link], model.name.weight[UNK])
+    assert torch.equal(model.name.weight[warrior], trained_before)
+    save_checkpoint(model, tmp_path / "ckpt")
+    assert load_checkpoint(tmp_path / "ckpt").card_features.seen[[link, spell]].tolist() == [True, True]

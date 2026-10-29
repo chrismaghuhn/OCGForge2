@@ -34,7 +34,7 @@ import numpy as np
 import torch
 
 from . import ladder, rollout
-from .cards import CardFeatures, CardTable
+from .cards import UNK, CardFeatures, CardTable
 from .embed_cards import load_text_embeddings
 from .model import Model, ModelConfig, load_checkpoint, save_checkpoint
 from .ppo import PPOConfig, build_steps, ppo_update
@@ -86,6 +86,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--save-every", type=int, default=5, help="iterations between saves of <out>/latest")
     p.add_argument("--reset-heads", action="store_true",
                    help="with --init: new policy (score) and value heads, the card and board encoder kept")
+    p.add_argument("--extend-seen", action="store_true",
+                   help="with --init: the training decks' cards get learned name embeddings too (starting from "
+                        "the unknown card's), not only the cards of the run the checkpoint was first built for")
     p.add_argument("--entropy-start", type=float, help="entropy coefficient at iteration 0, ramped to --entropy")
     p.add_argument("--entropy-ramp", type=int, default=0, help="iterations from --entropy-start to --entropy")
     p.add_argument("--tempo-slope", type=float, default=0.0,
@@ -139,6 +142,20 @@ def restore_run_settings(args: argparse.Namespace, run: dict) -> None:
             value = run[name]
             setattr(args, name, Path(value) if name == "init" else value)
             print(f"--resume: {name} = {value} from run.json", flush=True)
+
+
+def extend_seen(model: Model, decks: list[Path]) -> int:
+    """Marks every card of `decks` as seen (a learned name embedding instead of "unknown"); newly
+    seen cards start from the unknown card's embedding, so the model plays them as before until
+    training moves them. Returns how many cards were added."""
+    index = model.card_features.index_map()
+    cards = sorted({index[code] for deck in decks for code in deck_codes(deck) if code in index})
+    new = [i for i in cards if not model.card_features.seen[i]]
+    with torch.no_grad():
+        model.card_seen[new] = True
+        model.name.weight[new] = model.name.weight[UNK].clone()
+    model.card_features.seen[new] = True
+    return len(new)
 
 
 def reset_heads(model: Model) -> None:
@@ -288,6 +305,8 @@ def main(argv=None) -> None:
             print(f"--init: the model keeps its own size, not --size {args.size}", flush=True)
         if args.reset_heads:  # checkpoint 0 above keeps the old heads: the arena's "first" is the init model
             reset_heads(model)
+        if args.extend_seen:
+            print(f"--extend-seen: {extend_seen(model, args.decks)} more cards with a name embedding", flush=True)
         optimizer = torch.optim.AdamW(model.parameters(), lr=ppo.lr)
     else:
         model = build_model(args).to(args.device)
