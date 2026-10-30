@@ -126,7 +126,8 @@ sides agree.
 | `tools/setup_deps.py` | fetches/patches dependencies, extracts card data (run by CMake) |
 | `python/` | `ocgforge` Python package: model, PPO, ladder, card embeddings |
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the pieces fit together.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the pieces fit together, and
+[docs/engine-clone.md](docs/engine-clone.md) for the ocgcore fork and `Duel.clone()`.
 
 ## License
 
