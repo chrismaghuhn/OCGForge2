@@ -137,6 +137,8 @@ void VectorEnv::reset(Slot& slot) {
             slot.info.actions.clear();
         }
         try {
+            // Destroy the old duel first, so a slot never holds two Lua states at once.
+            slot.duel.reset();
             slot.duel = std::make_unique<duel::Duel>(std::move(config));
             if (slot.duel->finished()) {
                 continue;  // ended without a single decision; just start another
