@@ -39,3 +39,42 @@ def test_plan_choice_takes_the_next_steps_card():
     assert plan_choice(keys, {0, 2}, [regina, fortuna]) == {0}  # Regina was tried: the next one
     assert plan_choice(keys, {0, 1, 2}, [LUCINA]) == {0, 1, 2}  # nothing of the plan offered
     assert plan_choice(["chain.pass", f"chain.0.0.{regina}.0.2.1"], {0, 1}, [regina]) == {0, 1}
+
+
+class FakeDuel:
+    """A duel that records its answers; clone() copies them."""
+
+    def __init__(self, keys=()):
+        self.played = list(keys)
+        self.clones = 0
+
+    def clone(self):
+        self.clones += 1
+        return FakeDuel(self.played)
+
+    def act(self, key):
+        if key == "bad":
+            raise RuntimeError("rejected")
+        self.played.append(key)
+
+
+def test_grow_clones_all_but_the_last_child_of_a_parent():
+    from ocgforge.combo_check import Line, grow
+    a, b = FakeDuel(["x"]), FakeDuel(["y"])
+    children = [(Line(["x", "1"]), a), (Line(["y", "1"]), b), (Line(["x", "bad"]), a), (Line(["x", "2"]), a)]
+    grown = grow(children)
+    assert [line.keys for line in grown] == [["x", "1"], ["y", "1"], ["x", "2"]]
+    assert [line.duel.played for line in grown] == [["x", "1"], ["y", "1"], ["x", "2"]]
+    assert grown[2].duel is a and grown[1].duel is b  # the last child takes its parent's duel
+    assert a.clones == 2 and b.clones == 0
+
+
+def test_checked_line():
+    from ocgforge import combos as cb
+    from ocgforge.combo_check import Line, checked_line
+    combo = cb.Combo("id", "t", "Elfnote", 0, [], [], end_board=[1, 2, 3, 4, 5])
+    targets = [(1, None), (2, None)]
+    assert checked_line(combo, Line(progress=2, skipped=2, key_cards=4), targets)
+    assert not checked_line(combo, Line(progress=2, skipped=3, key_cards=5), targets)
+    assert not checked_line(combo, Line(progress=2, key_cards=3), targets)
+    assert not checked_line(combo, Line(progress=1, key_cards=5), targets)

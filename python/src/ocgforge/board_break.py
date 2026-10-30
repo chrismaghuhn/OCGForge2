@@ -181,8 +181,8 @@ def main(argv=None) -> None:
         if combo is None:
             print(f"{entry['title']}: combo not found, skipped", flush=True)
             continue
-        # The scenario exactly as combo_check built it (shuffle 0), then the agent's cards for seat 1.
-        rng = random.Random(f"{combo.id}-0")
+        # The scenario exactly as combo_check built it (the book line's shuffle), then the agent's cards.
+        rng = random.Random(f"{combo.id}-{entry.get('shuffle', 0)}")
         script = combo_check.scenario_script(combo, decklist, book_opponent, is_extra, rng)
         seed = rng.getrandbits(32)
         answers = own_answers(make_start(script, seed, args.book_opponent), entry["line"])

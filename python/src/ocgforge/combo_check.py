@@ -19,7 +19,9 @@ import argparse
 import json
 import random
 import re
+import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -124,6 +126,7 @@ class Line:
     key_cards: int = 0  # book end-board cards on our field now
     tried: frozenset = frozenset()  # (board, answer) pairs this line already played: no loops
     skipped: int = 0  # steps passed over without being done
+    duel: object = field(default=None, repr=False, compare=False)  # the engine at this line's end (a clone)
 
 
 def advance(line: Line, targets: list[tuple[int, int | None]], last_key: str | None, now: Counter,
@@ -203,6 +206,23 @@ def plan_choice(keys: list[str], allowed: set[int], ahead: list[int]) -> set[int
     return allowed
 
 
+def grow(children: list[tuple[Line, object]]) -> list[Line]:
+    """Play each chosen child's last answer on a clone of its parent's duel; the parent's last child
+    takes the parent's duel itself. A child whose answer the engine rejects is dropped."""
+    left = Counter(id(parent) for _, parent in children)
+    grown = []
+    for child, parent in children:
+        left[id(parent)] -= 1
+        try:
+            duel = parent if left[id(parent)] == 0 else parent.clone()
+            duel.act(child.keys[-1])
+        except Exception:
+            continue
+        child.duel = duel
+        grown.append(child)
+    return grown
+
+
 def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12, branch: int = 4,
           max_decisions: int = 150, lookahead: int = 3, center: set[int] = frozenset(),
           is_extra=lambda code: False) -> tuple[Line, list[tuple[int, int | None]]]:
@@ -222,18 +242,21 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
     # Steps first: an end-board card played early (a search taken too soon) must not beat the plan.
     rank = lambda l: (l.progress - l.skipped, l.key_cards, l.score)  # steps actually done  # noqa: E731
     first = start()
-    lines = [Line(board=board(first) if first is not None else Counter())]
+    if first is None:
+        return Line(), targets
+    # Each line holds its own duel: children clone their parent's (Duel.clone, ~5 ms) instead of
+    # replaying the whole line into a fresh duel every decision. The keys stay the record: a line
+    # replays from `start()` to the same position (main() replays the best one for the end board).
+    lines = [Line(board=board(first), duel=first)]
     done: list[Line] = []
     for _ in range(max_decisions):
         expanded: list[tuple[Line, object]] = []
         seen: set = set()  # (board, question, steps) already in the beam: the rest are duplicates
         for line in lines:
-            duel = start()
+            duel, line.duel = line.duel, None
             if duel is None:
                 continue
             try:
-                for key in line.keys:
-                    duel.act(key)
                 while not duel.finished and duel.player != 0:  # the opponent never acts
                     key = worlds.decline(duel.keys())
                     duel.act(key)
@@ -317,11 +340,18 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
                 done.append(line)
                 continue
             for value, i in sorted(options, reverse=True)[:branch]:
-                children.append(Line(line.keys + [keys[i]], line.progress, line.score + value, line.board,
-                                     line.key_cards, line.tried | {(state, keys[i])}, line.skipped))
-        lines = sorted(children, key=rank, reverse=True)[:beam]
+                children.append((Line(line.keys + [keys[i]], line.progress, line.score + value, line.board,
+                                      line.key_cards, line.tried | {(state, keys[i])}, line.skipped), duel))
+        lines = grow(sorted(children, key=lambda c: rank(c[0]), reverse=True)[:beam])
     best = max(done + lines, key=rank, default=Line())
     return best, targets
+
+
+def checked_line(combo: cb.Combo, line: Line, targets: list) -> bool:
+    """Checked: every step done in order (at most MAX_SKIPPED passed over) and at least 80 % of the
+    book's end-board cards on our field."""
+    return bool(targets) and line.progress == len(targets) and line.skipped <= MAX_SKIPPED and (
+        not combo.end_board or line.key_cards >= 0.8 * len(combo.end_board))
 
 
 def end_board(duel) -> list[dict]:
@@ -350,6 +380,7 @@ def main(argv=None) -> None:
                         help="hand-written engine steps (JSON list of {title, hand, steps: [[card, action]], "
                              "end_board}): replace the community steps, starting hand and end board of those combos")
     parser.add_argument("--limit", type=int, default=0, help="check only the best-voted N combos")
+    parser.add_argument("--workers", type=int, default=4, help="combos/shuffles searched at once (threads)")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--out", type=Path, help="combo book (JSON lines)")
     args = parser.parse_args(argv)
@@ -383,56 +414,77 @@ def main(argv=None) -> None:
     verbs = Counter()  # action text -> [used, total]
     verbs_used = Counter()
     located = Counter()  # step texts mapped to a location (True) or only "card named" (False)
+
+    def start_for(script: str, seed: int):
+        def start():
+            try:
+                duel = Duel.world(str(cache / "cardscripts"), str(cache / "card_data.tsv"), str(args.deck),
+                                  str(args.opponent), script, seed, 0)
+                for _ in range(20):  # through the draw and standby phase to our first decision
+                    if duel.finished or duel.player == 0:
+                        break
+                    duel.act(worlds.decline(duel.keys()))
+            except Exception:  # a scenario the engine rejects
+                return None
+            return None if duel.finished else duel
+        return start
+
+    def one(combo: cb.Combo, shuffle: int):
+        """One deck order of one combo: its own scenario and seed (`scenario(combo, shuffle)`)."""
+        began = time.perf_counter()
+        rng = random.Random(f"{combo.id}-{shuffle}")
+        script = scenario_script(combo, decklist, opponent, is_extra, rng, hand=hands.get(combo.id))
+        start = start_for(script, rng.getrandbits(32))
+        line, targets = check(combo, start, model, card_index, args.device, beam=args.beam, branch=args.branch,
+                              center=center, is_extra=is_extra)
+        return line, targets, start, time.perf_counter() - began
+
+    # Combos and shuffles run in threads: the engine releases the GIL (Duel.world, act, clone).
+    pool = ThreadPoolExecutor(max(1, args.workers))
+    jobs = [[pool.submit(one, combo, shuffle) for shuffle in range(args.shuffles)] for combo in combos]
     results = []
-    for n, combo in enumerate(combos):
-        checked = 0
-        best = None
-        for shuffle in range(args.shuffles):
-            rng = random.Random(f"{combo.id}-{shuffle}")
-            script = scenario_script(combo, decklist, opponent, is_extra, rng, hand=hands.get(combo.id))
-            seed = rng.getrandbits(32)
-
-            def start(script=script, seed=seed):
-                try:
-                    duel = Duel.world(str(cache / "cardscripts"), str(cache / "card_data.tsv"), str(args.deck),
-                                      str(args.opponent), script, seed, 0)
-                    for _ in range(20):  # through the draw and standby phase to our first decision
-                        if duel.finished or duel.player == 0:
-                            break
-                        duel.act(worlds.decline(duel.keys()))
-                except Exception:  # a scenario the engine rejects
-                    return None
-                return None if duel.finished else duel
-
-            line, targets = check(combo, start, model, card_index, args.device, beam=args.beam, branch=args.branch,
-                                  center=center, is_extra=is_extra)
-            ok = bool(targets) and line.progress == len(targets) and line.skipped <= MAX_SKIPPED and (
-                not combo.end_board or line.key_cards >= 0.8 * len(combo.end_board))
-            checked += ok
-            if best is None or line.progress > best[0].progress:
-                best = (line, targets, start)
-        line, targets, start = best
+    for n, (combo, futures) in enumerate(zip(combos, jobs)):
+        runs = [f.result() for f in futures]
+        verdicts = [checked_line(combo, line, targets) for line, targets, _, _ in runs]
+        checked = sum(verdicts)
+        # The book keeps a line that is checked if there is one, else the furthest.
+        shuffle = max(range(len(runs)), key=lambda i: (verdicts[i], runs[i][0].progress - runs[i][0].skipped,
+                                                      runs[i][0].key_cards))
+        line, targets, start, _ = runs[shuffle]
+        seconds = sum(r[3] for r in runs)
         entries = [e for step in combo.steps for e in step if e.code is not None]
         for i, e in enumerate(entries):
             verb = e.action.strip().lower() or "(use)"
             verbs[verb] += 1
             verbs_used[verb] += i < line.progress
             located[expected_location(e.action) is not None] += 1
-        duel = start()
+        duel = start()  # the line replays from the scenario alone (no clone involved)
+        replays = duel is not None
         for key in line.keys if duel is not None else []:
+            if duel.finished or key not in duel.keys():
+                replays = False
+                break
             duel.act(key)
+        replays = replays and board(duel) == line.board
         final = end_board(duel) if duel is not None else []
+        on_field = [c for c in final if c["location"] in (worlds.LOCATION_MZONE, worlds.LOCATION_SZONE)]
         result = {"combo": combo.id, "title": combo.title, "votes": combo.votes, "steps": len(targets),
                   "progress": line.progress, "skipped": line.skipped, "checked_shuffles": checked, "shuffles": args.shuffles,
-                  "checked": checked == args.shuffles, "line": line.keys, "end_board": final,
-                  "book_end_board": combo.end_board,
-                  "key_cards_reached": (sum(1 for c in combo.end_board if c in {b["code"] for b in final})
-                                        / len(combo.end_board)) if combo.end_board else None}
+                  "checked": checked == args.shuffles, "shuffle": shuffle, "replays": replays, "line": line.keys,
+                  "end_board": final, "field": len(on_field), "book_end_board": combo.end_board,
+                  "key_cards_reached": (sum(1 for c in combo.end_board if c in {b["code"] for b in on_field})
+                                        / len(combo.end_board)) if combo.end_board else None,
+                  "seconds": round(seconds, 1)}
         results.append(result)
         print(f"{n + 1}/{len(combos)} {'OK  ' if result['checked'] else 'part'} {line.progress}/{len(targets)} "
-              f"steps ({line.skipped} skipped), {checked}/{args.shuffles} shuffles  {combo.title[:60]}", flush=True)
+              f"steps ({line.skipped} skipped), {checked}/{args.shuffles} shuffles, field {len(on_field)}, "
+              f"{seconds:.0f}s{'' if replays else ' NO REPLAY'}  {combo.title[:60]}", flush=True)
+    pool.shutdown()
     passed = sum(r["checked"] for r in results)
-    print(f"checked: {passed}/{len(results)} combos ({passed / max(1, len(results)):.0%})")
+    print(f"checked: {passed}/{len(results)} combos ({passed / max(1, len(results)):.0%}), mean field "
+          f"{sum(r['field'] for r in results) / max(1, len(results)):.2f} (checked: "
+          f"{sum(r['field'] for r in results if r['checked']) / max(1, passed):.2f}), search "
+          f"{sum(r['seconds'] for r in results):.0f}s ({sum(r['seconds'] for r in results) / max(1, len(results)):.1f}s/combo)")
     print(f"steps with a location: {located[True]}, only named: {located[False]}")
     print("verb coverage (used/total):", {v: f"{verbs_used[v]}/{verbs[v]}" for v, _ in verbs.most_common(20)})
     if args.out:
