@@ -126,3 +126,19 @@ def test_extend_seen_marks_the_decks_cards_and_survives_a_save(tmp_path):
     assert torch.equal(model.name.weight[warrior], trained_before)
     save_checkpoint(model, tmp_path / "ckpt")
     assert load_checkpoint(tmp_path / "ckpt").card_features.seen[[link, spell]].tolist() == [True, True]
+
+
+def test_overlap_collects_while_training_and_keeps_the_logs(tmp_path):
+    if not (train.rollout.REPO / ".cache" / "babelcdb").exists():
+        pytest.skip("card database not fetched")
+    args = ["--out", str(tmp_path), "--size", "small", "--text-embeddings", "none", "--envs", "8",
+            "--threads", "2", "--segment", "16", "--steps", "64", "--iterations", "4", "--arena-every", "2",
+            "--arena-duels", "2", "--arena-envs", "4", "--device", "cpu", "--overlap"]
+    train.main(args)
+    metrics = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
+    assert [m["iteration"] for m in metrics] == [1, 2, 3, 4]
+    assert all(m["decisions"] > 0 and m["collectSeconds"] > 0 and m["waitSeconds"] >= 0 for m in metrics)
+    cards = [json.loads(line) for line in (tmp_path / "cards.jsonl").read_text().splitlines()]
+    assert [c["iteration"] for c in cards] == [2, 4] and all(c["cards"] for c in cards)
+    arena = [json.loads(line) for line in (tmp_path / "arena.jsonl").read_text().splitlines()]
+    assert [a["iteration"] for a in arena] == [2, 4] and "endBoardTurns" in arena[0]
