@@ -5,6 +5,7 @@
 #include <memory>
 #include <optional>
 #include <random>
+#include <thread>
 #include <string>
 #include <utility>
 #include <vector>
@@ -221,7 +222,9 @@ TEST_CASE("clones of clones and reseeded clones play on; finished duels cannot b
 
     // A reseeded clone is a valid duel at the same decision (its future draws may differ).
     auto reseeded = duel.clone(12345);
-    CHECK(reseeded->config().seed == 12345);
+    CHECK(reseeded->config().seed == duel.config().seed);
+    CHECK(reseeded->reseeds() == std::vector<std::uint64_t>{12345});
+    CHECK(reseeded->clone(7)->reseeds() == std::vector<std::uint64_t>{12345, 7});
     CHECK(keys(*reseeded) == keys(duel));
     while (!reseeded->finished()) {
         const auto candidates = keys(*reseeded);
@@ -234,4 +237,41 @@ TEST_CASE("clones of clones and reseeded clones play on; finished duels cannot b
         duel.act(candidates[std::uniform_int_distribution<std::size_t>(0, candidates.size() - 1)(rng)]);
     }
     CHECK_THROWS_AS(duel.clone(), std::logic_error);
+}
+
+TEST_CASE("one duel can be cloned from several threads at once", "[clone]") {
+    // How search uses it: many branches from one root, cloned in parallel. Each clone must match
+    // one made alone, and the root must be unchanged (run under asan for memory errors).
+    const auto config = config_for("branded", "maliss", 21);
+    const auto index = card_index(config);
+    std::mt19937_64 rng(21);
+    Duel duel(config);
+    for (int i = 0; i < 40 && !duel.finished(); ++i) {
+        const auto candidates = keys(duel);
+        duel.act(candidates[std::uniform_int_distribution<std::size_t>(0, candidates.size() - 1)(rng)]);
+    }
+    REQUIRE_FALSE(duel.finished());
+    auto untouched = duel.clone();
+
+    constexpr int kThreads = 8;
+    constexpr int kPerThread = 4;
+    std::vector<std::unique_ptr<Duel>> clones(kThreads * kPerThread);
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            for (int i = 0; i < kPerThread; ++i) {
+                clones[t * kPerThread + i] = duel.clone();
+            }
+        });
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    require_same(duel, *untouched, index);
+    for (std::size_t i = 0; i < clones.size(); i += 5) {
+        auto reference = duel.clone();
+        std::mt19937_64 play(i);
+        std::size_t steps = 0;
+        lockstep(*reference, *clones[i], index, play, 30, steps);  // false only on an engine error in both
+    }
 }

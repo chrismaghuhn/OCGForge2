@@ -82,7 +82,8 @@ Duel::Duel(const Duel& source, std::unique_ptr<core::CoreHost> host)
       answers_(source.answers_),
       state_(source.state_),
       blocked_answers_(source.blocked_answers_),
-      recent_(source.recent_) {
+      recent_(source.recent_),
+      reseeds_(source.reseeds_) {
     for (std::uint8_t player = 0; player < 2; ++player) {
         sessions_[player] = std::make_unique<observation::ObservationSession>(*source.sessions_[player]);
     }
@@ -101,7 +102,7 @@ std::unique_ptr<Duel> Duel::clone(std::optional<std::uint64_t> seed) const {
     // Not make_unique: the constructor is private.
     std::unique_ptr<Duel> copy(new Duel(*this, std::move(host)));
     if (seed) {
-        copy->config_.seed = *seed;
+        copy->reseeds_.push_back(*seed);
     }
     return copy;
 }
@@ -332,7 +333,11 @@ DuelSnapshot Duel::snapshot() const {
 
 void Duel::fail(const std::string& message) const {
     std::ostringstream text;
-    text << message << " (seed " << config_.seed << ", decision " << decision_count_ << ")";
+    text << message << " (seed " << config_.seed;
+    for (const auto reseed : reseeds_) {
+        text << ", reseeded " << reseed;
+    }
+    text << ", decision " << decision_count_ << ")";
     if (!recent_.empty()) {
         text << "\nlast decisions:";
         for (const auto& line : recent_) {

@@ -30,7 +30,8 @@ tables hash object keys by that id instead of by address (so a cloned table iter
 same order), `tostring`/`%p` use it, and `luaL_newstatewithalloc` takes the fork's allocator.
 The fork's `clone/` sources use Boost.Interprocess containers, header-only. CMake takes the
 system Boost when it is exactly 1.83, otherwise the fork's `clone/dependencies.cmake` downloads
-the 1.83 tarball (hash-checked). The fork reports API version 11.1; `CoreHost` checks for that.
+the 1.83 tarball (hash-checked), which needs network at configure time; on a machine without
+network install the headers first (Ubuntu 24.04: `libboost1.83-dev`). The fork reports API version 11.1; `CoreHost` checks for that.
 
 Both forks are AGPL-3.0-or-later like upstream; their license headers are kept.
 
@@ -53,7 +54,7 @@ Both forks are AGPL-3.0-or-later like upstream; their license headers are kept.
   headers (`ocg_clone_boost`).
 - `CoreHost::clone`: a new host whose card data is shared (read-only) and whose script store,
   callback error and log are its own; the clone callbacks point at the new host, so a clone
-  never writes into its source and may run on another thread.
+  never writes into its source.
 - `Duel::clone`: copies observation sessions, pending request and observation, loop-guard maps
   (`seen_states_`, `answers_`, `state_`), counters, recent decisions and config.
 - Python: `_core.Duel.clone(seed=None)` (releases the GIL).
@@ -64,13 +65,22 @@ Both forks are AGPL-3.0-or-later like upstream; their license headers are kept.
   Python exception). Mid multi-card selection (a continuation) is fine: the engine is still
   waiting for its one combined answer.
 - The clone is independent of its source: either may be destroyed first, clones can be cloned.
-  One duel must not be used from two threads at once (cloning reads the source).
+- Threads: cloning only reads its source, so one duel may be cloned from several threads at
+  once (tested: 32 parallel clones, each checked against a clone made alone, also under asan).
+  Nothing may act on a duel while it is being cloned, and one duel is never acted on from two
+  threads at once.
 - Same answers, same play: legal action keys, encoded model inputs, privileged snapshots and
   results match. The order of engine messages within one step is not promised to match
   (pointer-keyed containers), and nothing here relies on it.
 - `clone(seed)` reseeds the engine's random state and Lua's `math.random`; the deck order is
   already fixed, so only future shuffles, draws after shuffles, coin flips and dice differ.
-  `config().seed` of the copy is then the new seed.
+  `config()` stays the duel's origin (its seed made the deck order and opening hands); the new
+  seed is appended to `reseeds()` (Python: `reseeds`) and shown in engine error messages.
+- **Hidden information:** a clone, reseeded or not, holds the real hidden cards (both decks'
+  order, the opponent's hand, face-down cards). It is not a sampled world. An honest search must
+  still build its worlds from what the player knows (`worlds.py`) and may clone only within such a
+  world (e.g. one clone per plan instead of replaying the plan's prefix); branching search
+  directly from the real duel is an oracle search.
 - The fork can refuse a state it cannot copy (`OCG_CLONE_UNSUPPORTED`, e.g. a Lua userdata type
   it does not know); `clone()` then throws with the engine's log. Our tests never hit this.
 - Only the safe Lua libraries may be loaded (`enableUnsafeLibraries = 0`, which we use).

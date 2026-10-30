@@ -98,6 +98,7 @@ def test_reseeded_clone_and_finished_duel(card_index):
     for _ in range(10):
         duel.act(rng.choice(duel.keys()))
     reseeded = duel.clone(seed=99)
+    assert reseeded.reseeds == [99] and duel.reseeds == []
     assert reseeded.keys() == duel.keys()
     while not reseeded.finished:
         reseeded.act(rng.choice(reseeded.keys()))
@@ -105,3 +106,25 @@ def test_reseeded_clone_and_finished_duel(card_index):
         duel.act(rng.choice(duel.keys()))
     with pytest.raises(Exception):
         duel.clone()
+
+
+def test_concurrent_clones_of_one_duel(card_index):
+    """Search clones one root from many threads at once (the GIL is released): every such clone must
+    match a clone made alone, and the root must not change."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    deck0, deck1 = PAIRS[1]
+    rng = random.Random(5)
+    duel = new_duel(deck0, deck1, 5)
+    for _ in range(40):
+        duel.act(rng.choice(duel.keys()))
+    assert not duel.finished
+    before = view(duel, card_index)
+    with ThreadPoolExecutor(16) as pool:
+        for _ in range(4):
+            clones = list(pool.map(lambda _: duel.clone(), range(32)))
+            assert view(duel, card_index) == before
+            reference = duel.clone()
+            moves = random.Random(len(clones))
+            for clone in clones[:8]:
+                lockstep(reference.clone(), clone, card_index, random.Random(moves.random()), 40)

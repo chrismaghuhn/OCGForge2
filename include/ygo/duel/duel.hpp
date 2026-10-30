@@ -123,10 +123,16 @@ public:
     // OCG_CloneDuel) and everything this wrapper keeps (observation sessions, the pending request
     // and observation, loop-guard counts, decision count, recent decisions, config). Given the same
     // answers, the copy plays on exactly as this duel would. With a seed, the engine's random state
-    // is reseeded instead (config().seed then is that seed). Only while !finished(); the copy does
-    // not depend on this duel, which may be destroyed first.
+    // is reseeded instead: config() stays the duel's origin (deck order and opening hands come from
+    // config().seed) and the seed is appended to reseeds(). Hidden cards (deck order, the
+    // opponent's hand) are copied as they are, so a search must not treat a reseeded clone as a
+    // sampled world. Only while !finished(); the copy does not depend on this duel, which may be
+    // destroyed first. Clones of one duel may be made from several threads at once, as long as
+    // nothing acts on that duel meanwhile.
     std::unique_ptr<Duel> clone(std::optional<std::uint64_t> seed = std::nullopt) const;
     const DuelConfig& config() const noexcept { return config_; }
+    // Seeds this duel's engine was reseeded with by clone(seed), oldest first; empty if never.
+    const std::vector<std::uint64_t>& reseeds() const noexcept { return reseeds_; }
 
 private:
     Duel(const Duel& source, std::unique_ptr<core::CoreHost> host);
@@ -150,6 +156,7 @@ private:
     std::string state_;  // hash of the pending engine question; empty during a continuation
     std::uint64_t blocked_answers_ = 0;
     std::deque<std::string> recent_;
+    std::vector<std::uint64_t> reseeds_;
 };
 
 }  // namespace ygo::duel
