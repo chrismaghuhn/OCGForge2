@@ -1,0 +1,54 @@
+diff --git a/card.cpp b/card.cpp
+index 906bf05..6d319b5 100644
+--- a/card.cpp
++++ b/card.cpp
+@@ -2908,20 +2908,28 @@ effect* card::is_affected_by_effect(int32_t code, card* target) {
+ 	return nullptr;
+ }
+ void card::get_card_effect(uint32_t code, effect_set* eset) {
++	// The containers are keyed by effect code: start at that code instead of walking every effect.
++	// The end is checked by key, not with a saved iterator, since a condition (Lua) may reset effects.
++	const auto first = [code](effect_container& effects) {
++		return code == 0 ? effects.begin() : effects.lower_bound(code);
++	};
++	const auto within = [code](effect_container& effects, effect_container::iterator it) {
++		return it != effects.end() && (code == 0 || it->first == code);
++	};
+ 	effect* peffect;
+-	for (auto rg = single_effect.begin(); rg != single_effect.end();) {
++	for (auto rg = first(single_effect); within(single_effect, rg);) {
+ 		peffect = rg->second;
+ 		++rg;
+ 		if ((code == 0 || peffect->code == code) && peffect->is_available() && (!peffect->is_flag(EFFECT_FLAG_SINGLE_RANGE) || is_affect_by_effect(peffect)))
+ 			eset->push_back(peffect);
+ 	}
+-	for (auto rg = field_effect.begin(); rg != field_effect.end(); ++rg) {
++	for (auto rg = first(field_effect); within(field_effect, rg); ++rg) {
+ 		peffect = rg->second;
+ 		if ((code == 0 || peffect->code == code) && is_affect_by_effect(peffect))
+ 			eset->push_back(peffect);
+ 	}
+ 	for (auto cit = equiping_cards.begin(); cit != equiping_cards.end(); ++cit) {
+-		for (auto rg = (*cit)->equip_effect.begin(); rg != (*cit)->equip_effect.end();) {
++		for (auto rg = first((*cit)->equip_effect); within((*cit)->equip_effect, rg);) {
+ 			peffect = rg->second;
+ 			++rg;
+ 			if ((code == 0 || peffect->code == code) && peffect->is_available() && is_affect_by_effect(peffect))
+@@ -2938,7 +2946,7 @@ void card::get_card_effect(uint32_t code, effect_set* eset) {
+ 		}
+ 	}
+ 	for (auto cit = xyz_materials.begin(); cit != xyz_materials.end(); ++cit) {
+-		for (auto rg = (*cit)->xmaterial_effect.begin(); rg != (*cit)->xmaterial_effect.end();) {
++		for (auto rg = first((*cit)->xmaterial_effect); within((*cit)->xmaterial_effect, rg);) {
+ 			peffect = rg->second;
+ 			++rg;
+ 			if (peffect->type & EFFECT_TYPE_FIELD)
+@@ -2947,7 +2955,7 @@ void card::get_card_effect(uint32_t code, effect_set* eset) {
+ 				eset->push_back(peffect);
+ 		}
+ 	}
+-	for (auto rg = pduel->game_field->effects.aura_effect.begin(); rg != pduel->game_field->effects.aura_effect.end();) {
++	for (auto rg = first(pduel->game_field->effects.aura_effect); within(pduel->game_field->effects.aura_effect, rg);) {
+ 		peffect = rg->second;
+ 		++rg;
+ 		if ((code == 0 || peffect->code == code) && !peffect->is_flag(EFFECT_FLAG_PLAYER_TARGET) && peffect->is_target(this)
