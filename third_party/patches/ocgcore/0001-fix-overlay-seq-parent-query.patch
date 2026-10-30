@@ -1,8 +1,7 @@
 diff --git a/ocgapi.cpp b/ocgapi.cpp
-index 26dc09c..8345b46 100644
 --- a/ocgapi.cpp
 +++ b/ocgapi.cpp
-@@ -185,7 +185,8 @@ void* OCG_DuelQuery(OCG_Duel ocg_duel, uint32_t* length, const OCG_QueryInfo* in
+@@ -192,7 +192,8 @@
  	pduel->query_buffer.clear();
  	card* pcard = nullptr;
  	if(info.loc & LOCATION_OVERLAY) {

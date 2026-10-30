@@ -44,9 +44,9 @@ void CoreHost::throw_if_callback_error(const char* operation) const {
 
 CoreHost::CoreHost(CoreHostConfig config) : config_(std::move(config)) {
     OCG_GetVersion(&api_major_, &api_minor_);
-    if (api_major_ != 11 || api_minor_ != 0) {
+    if (api_major_ != 11 || api_minor_ != 1) {  // 11.1: the YGO-Gym fork (cloning)
         throw CoreError(CoreErrorCode::Lifecycle, "OCG_GetVersion",
-                        "expected 11.0, got " + std::to_string(api_major_) + "." + std::to_string(api_minor_));
+                        "expected 11.1, got " + std::to_string(api_major_) + "." + std::to_string(api_minor_));
     }
     impl_ = new Impl(config_.card_data_tsv, config_.card_scripts_root, config_.required_script_codes
     );
