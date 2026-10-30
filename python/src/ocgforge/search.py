@@ -14,6 +14,7 @@ when search helps, and a training target for it (expert iteration).
 from __future__ import annotations
 
 import argparse
+import math
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -52,6 +53,7 @@ class SearchResult:
     value: float  # the best line's score for the searching player (-1..1)
     greedy_value: float  # the most likely line's score
     values: list[float] = field(default_factory=list)
+    plans: list[list[str]] = field(default_factory=list)  # honest search: every candidate plan, scored by `values`
 
 
 def search_turn(spec: DuelSpec, actions: list[str], policy, card_index, k: int = 16, max_decisions: int = 80,
@@ -212,7 +214,7 @@ def honest_search(spec: DuelSpec, duel, policy, card_index, lines: int = 8, worl
     means = [sum(scores[k * worlds_per_line:(k + 1) * worlds_per_line]) / worlds_per_line for k in range(len(unique))]
     best = max(range(len(unique)), key=lambda k: means[k])
     greedy_k = unique.index(tuple(candidates[0])) if candidates[0] else best
-    return SearchResult(list(unique[best]), means[best], means[greedy_k], means)
+    return SearchResult(list(unique[best]), means[best], means[greedy_k], means, [list(p) for p in unique])
 
 
 class SearchPolicy:
@@ -261,12 +263,20 @@ class HonestSearchPolicy:
     (honest_search truth=True): the combo line of a restricted oracle, the rest of the turn greedy.
 
     With `through_opponent` each line is scored after the opponent's following turn (honest_search
-    horizon=2), played by `opponent` if given, else by the policy itself."""
+    horizon=2), played by `opponent` if given, else by the policy itself.
+
+    With `on_target(duel, keys, target)` it reports, at every decision it plays from its plan, a
+    distribution over `keys`: the plans still consistent with what it played this turn, each weighted
+    by exp(mean score / temperature) and voting for its next answer (a posterior over the searched
+    plans, the training target of expert iteration)."""
 
     def __init__(self, policy, card_index, lines: int = 8, worlds_per_line: int = 8,
                  pool: ThreadPoolExecutor | None = None, phases: bool = False, oracle: bool = False,
-                 through_opponent: bool = False, opponent=None):
+                 through_opponent: bool = False, opponent=None, on_target=None, temperature: float = 0.05):
         self.policy, self.card_index = policy, card_index
+        self.on_target, self.temperature = on_target, temperature
+        self.scored: list[tuple[list[str], float]] = []  # (plan, mean score) of the last search
+        self.played = 0  # answers played from the plan since the last search
         self.lines, self.worlds_per_line, self.phases, self.oracle = lines, worlds_per_line, phases, oracle
         self.through_opponent, self.opponent = through_opponent, opponent
         self.pool = pool or ThreadPoolExecutor(16)
@@ -297,6 +307,7 @@ class HonestSearchPolicy:
         if not result.values:
             self.failed += 1
         self.plan = result.line
+        self.scored, self.played = list(zip(result.plans, result.values)), 0
         self.gains.append(result.value - result.greedy_value)
 
     def choose(self, spec: DuelSpec, actions: list[str], duel) -> str:
@@ -315,9 +326,33 @@ class HonestSearchPolicy:
         if mine and duel.turn == self.turn and self.plan:
             key = w.match(self.plan.pop(0), keys)
             if key is not None:
+                if self.on_target is not None:
+                    self.report_target(duel, keys, key)
+                self.played += 1
                 return key
             self.plan = []  # the duel left the plan
         return keys[self.policy.greedy([duel.encode(self.card_index)])[0]]
+
+    def report_target(self, duel, keys: list[str], key: str) -> None:
+        """Hands on_target the posterior over the plans that agree with this turn's play so far, and
+        keeps only those that also play `key` now."""
+        from . import worlds as w
+
+        step, target, alive = self.played, [0.0] * len(keys), []
+        best = max((value for _, value in self.scored), default=0.0)
+        for plan, value in self.scored:
+            if len(plan) <= step:
+                continue
+            answer = w.match(plan[step], keys)
+            if answer is None:
+                continue
+            target[keys.index(answer)] += math.exp((value - best) / self.temperature)
+            if answer == key:
+                alive.append((plan, value))
+        total = sum(target)
+        if total > 0:
+            self.on_target(duel, keys, [t / total for t in target])
+        self.scored = alive
 
     def observe_other(self, key: str) -> None:
         pass
