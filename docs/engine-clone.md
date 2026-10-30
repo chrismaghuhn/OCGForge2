@@ -45,6 +45,10 @@ Both forks are AGPL-3.0-or-later like upstream; their license headers are kept.
   `duel_clone::copy_metadata` and the duel archive, so a clone keeps them.
   0004 (Lua call budget) adds fields to Lua's `global_State`; the clone copies them with the rest
   of the state and every `OCG_DuelProcess` resets the budget anyway.
+- New patch 0005: the per-chain-link counter lists (`applied_chain_counters`) that ocgcore
+  allocates are registered with the duel (the fork's `cloned_chain_counters` set), so a duel
+  destroyed in the middle of a chain frees them. Upstream leaks them then; with clones,
+  discarding a duel mid-chain is routine (found by ASan in the clone tests).
 - `CMakeLists.txt`: compiles the fork's `clone/` and `identity/` sources and links the Boost
   headers (`ocg_clone_boost`).
 - `CoreHost::clone`: a new host whose card data is shared (read-only) and whose script store,

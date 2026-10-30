@@ -13,7 +13,8 @@
       "0001-fix-overlay-seq-parent-query.patch",
       "0002-add-starting-player-control.patch",
       "0003-memoize-sum-greater-check.patch",
-      "0004-lua-call-budget.patch"
+      "0004-lua-call-budget.patch",
+      "0005-own-applied-chain-counters.patch"
     ]
   },
   "cardscripts": {

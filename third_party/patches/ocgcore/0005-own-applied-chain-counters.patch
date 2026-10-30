@@ -1,0 +1,17 @@
+diff --git a/field.cpp b/field.cpp
+--- a/field.cpp
++++ b/field.cpp
+@@ -2306,8 +2306,12 @@
+ 		pduel->lua->add_param<LuaParam::INT>(playerid);
+ 		pduel->lua->add_param<LuaParam::INT>(chainid);
+ 		if(!pduel->lua->check_condition(info.check_function, 3)) {
+-			if(ret == nullptr)
++			if(ret == nullptr) {
+ 				ret = new chain::applied_chain_counter_t;
++				// Owned by the duel until the chain link resolves, so a duel destroyed mid-chain
++				// (e.g. a discarded clone) frees it too.
++				pduel->cloned_chain_counters.insert(ret);
++			}
+ 			++info.player_amount[playerid];
+ 			ret->push_back(iter.first);
+ 		}
