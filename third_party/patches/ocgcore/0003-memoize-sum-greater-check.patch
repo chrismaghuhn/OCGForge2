@@ -1,5 +1,4 @@
 diff --git a/field.cpp b/field.cpp
-index 602ed6d..88a3a2d 100644
 --- a/field.cpp
 +++ b/field.cpp
 @@ -12,6 +12,7 @@
@@ -10,7 +9,7 @@ index 602ed6d..88a3a2d 100644
  #include "group.h"
  #include "interpreter.h"
  
-@@ -2640,19 +2641,41 @@ int32_t field::check_with_sum_limit_m(const card_vector& mats, int32_t acc, int3
+@@ -2644,19 +2645,41 @@
  		return TRUE;
  	return FALSE;
  }

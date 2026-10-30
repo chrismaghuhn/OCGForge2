@@ -115,7 +115,7 @@ Fixed inputs live in `third_party/deps.json` (exact commits) and
   codes; the containers are keyed by code, so it now starts at that key (same
   effects, same order). Scripts call it tens of millions of times in a run of random
   duels. It relies on no script changing an effect's code after registering it,
-  as `filter_effect` already does. (0005 is taken by the engine-clone branch.)
+  as `filter_effect` already does.
 
 `tools/setup_deps.py` applies the patches in order to a clean checkout and
 records their hashes in `.cache/ocgcore/.ocgforge-patches`.

@@ -1,7 +1,8 @@
 # OCGForge2
 
 A deterministic Yu-Gi-Oh! duel environment for game-AI experiments, built as a
-thin C++ layer around [ygopro-core](https://github.com/edo9300/ygopro-core).
+thin C++ layer around ygopro-core: [YGO-Gym's fork](https://github.com/rifa-456/ygopro-core) of
+[edo9300/ygopro-core](https://github.com/edo9300/ygopro-core), which adds copying a running duel.
 
 Current scope: a pool of current meta decks (`decks/`, with two hold-out decks
 in `decks/holdout/` that are never used for training), full duels, every legal
@@ -14,7 +15,9 @@ missing from it makes `tools/setup_deps.py` fail and name the deck.
 
 ## Build and test (Linux)
 
-Requirements: CMake ≥ 3.24, Ninja, a C++20 compiler, Python 3, git.
+Requirements: CMake ≥ 3.24, Ninja, a C++20 compiler, Python 3, git, and the Boost 1.83 headers
+(Ubuntu 24.04: `libboost1.83-dev`; without them the first configure downloads Boost, which needs
+network).
 
 ```bash
 cmake --preset debug          # also fetches and patches ocgcore, CardScripts, BabelCDB into .cache/
@@ -58,6 +61,12 @@ auto result = *duel.result();                  // winner, reason
 A duel that needs more than `max_decisions` choices, or that keeps asking the
 same question in the same state, throws `DuelError` with the last decisions in
 the message instead of hanging.
+
+`duel.clone()` copies a duel at its pending decision (~5 ms, against ~140 ms for
+building a new duel and replaying its actions); the copy plays on exactly like the
+original. `duel.clone(seed)` also reseeds future randomness (shuffles, coin flips).
+A clone holds the real hidden cards, so it is not a sampled world for an honest
+search. Details and guarantees: [docs/engine-clone.md](docs/engine-clone.md).
 
 ## Python: model, training and the batched environment
 
@@ -126,7 +135,8 @@ sides agree.
 | `tools/setup_deps.py` | fetches/patches dependencies, extracts card data (run by CMake) |
 | `python/` | `ocgforge` Python package: model, PPO, ladder, card embeddings |
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the pieces fit together.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the pieces fit together, and
+[docs/engine-clone.md](docs/engine-clone.md) for the ocgcore fork and `Duel.clone()`.
 
 ## License
 

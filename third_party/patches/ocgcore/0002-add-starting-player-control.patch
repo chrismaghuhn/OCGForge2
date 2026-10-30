@@ -1,8 +1,28 @@
+diff --git a/clone/graph/duel.cpp b/clone/graph/duel.cpp
+--- a/clone/graph/duel.cpp
++++ b/clone/graph/duel.cpp
+@@ -53,4 +53,5 @@
+     copy(d.assumes,source.assumes);copy(d.uncopy,source.uncopy);
+     d.data_cache=source.data_cache;d.buff=source.buff;d.query_buffer=source.query_buffer;
+     d.messages=source.messages;d.random=source.random;d.has_ended=source.has_ended;
++    d.starting_player_=source.starting_player_;d.started_=source.started_;
+ }
+diff --git a/clone/persistence/graph.cpp b/clone/persistence/graph.cpp
+--- a/clone/persistence/graph.cpp
++++ b/clone/persistence/graph.cpp
+@@ -117,6 +117,8 @@
+     stream_.scalar(d.random);
+     io(d.has_ended);
+     io(d.last_status);
++    io(d.starting_player_);
++    io(d.started_);
+ }
+ void duel_archive::vm() {
+     auto &vm = *duel_.lua;
 diff --git a/duel.cpp b/duel.cpp
-index d58294b..89b6a28 100644
 --- a/duel.cpp
 +++ b/duel.cpp
-@@ -40,6 +40,12 @@ duel::~duel() {
+@@ -45,6 +45,12 @@
  	for(auto& pgroup : groups)
  		delete pgroup;
  }
@@ -16,10 +36,9 @@ index d58294b..89b6a28 100644
  #pragma GCC diagnostic push
  #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 diff --git a/duel.h b/duel.h
-index 35926aa..6d342b4 100644
 --- a/duel.h
 +++ b/duel.h
-@@ -76,6 +76,9 @@ public:
+@@ -90,6 +90,9 @@
  	explicit duel(const OCG_DuelOptions& options, bool& valid_lua_lib);
  	~duel();
  	void clear();
@@ -29,7 +48,7 @@ index 35926aa..6d342b4 100644
  	
  	card* new_card(uint32_t code);
  	template<typename... Args>
-@@ -120,6 +123,8 @@ private:
+@@ -134,6 +137,8 @@
  	void* read_script_payload;
  	void* handle_message_payload;
  	void* read_card_done_payload;
@@ -39,13 +58,12 @@ index 35926aa..6d342b4 100644
  
  #endif /* DUEL_H_ */
 diff --git a/ocgapi.cpp b/ocgapi.cpp
-index 8345b46..fa1cdb9 100644
 --- a/ocgapi.cpp
 +++ b/ocgapi.cpp
-@@ -105,9 +105,16 @@ void OCG_DuelNewCard(OCG_Duel ocg_duel, const OCG_NewCardInfo* info_ptr) {
- 
+@@ -108,9 +108,16 @@
  void OCG_StartDuel(OCG_Duel ocg_duel) {
  	auto* pduel = static_cast<duel*>(ocg_duel);
+ 	pduel->last_status = -1;
 +	pduel->mark_started();
  	pduel->game_field->emplace_process<Processors::Startup>();
  }
@@ -58,12 +76,11 @@ index 8345b46..fa1cdb9 100644
 +
  int OCG_DuelProcess(OCG_Duel ocg_duel) {
  	auto* pduel = static_cast<duel*>(ocg_duel);
- 	pduel->buff.clear();
+ 	pduel->last_status = -1;
 diff --git a/ocgapi.h b/ocgapi.h
-index b95a2cf..912bdb0 100644
 --- a/ocgapi.h
 +++ b/ocgapi.h
-@@ -32,6 +32,7 @@ OCGAPI int OCG_CreateDuel(OCG_Duel* out_ocg_duel, const OCG_DuelOptions* options
+@@ -60,6 +60,7 @@
  OCGAPI void OCG_DestroyDuel(OCG_Duel ocg_duel);
  OCGAPI void OCG_DuelNewCard(OCG_Duel ocg_duel, const OCG_NewCardInfo* info_ptr);
  OCGAPI void OCG_StartDuel(OCG_Duel ocg_duel);
@@ -72,10 +89,9 @@ index b95a2cf..912bdb0 100644
  /*** DUEL PROCESSING AND QUERYING ***/
  OCGAPI int OCG_DuelProcess(OCG_Duel ocg_duel);
 diff --git a/processor.cpp b/processor.cpp
-index d2c6c09..07279f8 100644
 --- a/processor.cpp
 +++ b/processor.cpp
-@@ -5039,7 +5039,7 @@ bool field::process(Processors::Startup& arg) {
+@@ -5041,7 +5041,7 @@
  
  			}
  		}

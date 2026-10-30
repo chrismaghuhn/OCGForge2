@@ -317,6 +317,15 @@ NB_MODULE(_core, m) {
              },
              "Privileged: every card, hidden ones included (for building search worlds after hiding).")
         .def("act", &Duel::act, "semantic_key"_a, nb::call_guard<nb::gil_scoped_release>())
+        .def("clone", [](const Duel& d, std::optional<std::uint64_t> seed) { return d.clone(seed); },
+             "seed"_a = nb::none(), nb::call_guard<nb::gil_scoped_release>(),
+             "An independent copy at the pending decision (engine state included) that plays on exactly like "
+             "this duel given the same actions; with seed, the engine's random state is reseeded instead "
+             "(future shuffles, coin flips; listed in reseeds). Hidden cards are copied as they are: a "
+             "clone is not a sampled world. Faster than replaying the actions into a new Duel. Clones of "
+             "one duel may be made from several threads at once while nothing acts on it. Raises on a "
+             "finished duel.")
+        .def_prop_ro("reseeds", &Duel::reseeds, "Seeds clone(seed) reseeded this duel with, oldest first.")
         .def_prop_ro("finished", &Duel::finished)
         .def_prop_ro("winner", [](const Duel& d) -> std::optional<std::uint8_t> {
             return d.result() ? std::optional(d.result()->winner) : std::nullopt;
