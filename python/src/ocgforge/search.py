@@ -14,6 +14,7 @@ when search helps, and a training target for it (expert iteration).
 from __future__ import annotations
 
 import argparse
+import math
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -52,6 +53,7 @@ class SearchResult:
     value: float  # the best line's score for the searching player (-1..1)
     greedy_value: float  # the most likely line's score
     values: list[float] = field(default_factory=list)
+    plans: list[list[str]] = field(default_factory=list)  # honest search: every candidate plan, scored by `values`
 
 
 def search_turn(spec: DuelSpec, actions: list[str], policy, card_index, k: int = 16, max_decisions: int = 80,
@@ -100,7 +102,8 @@ def search_turn(spec: DuelSpec, actions: list[str], policy, card_index, k: int =
 
 def honest_search(spec: DuelSpec, duel, policy, card_index, lines: int = 8, worlds_per_line: int = 8,
                   max_decisions: int = 80, seed: int = 0, pool: ThreadPoolExecutor | None = None,
-                  make_world=None, segment: int = 0, deterministic: bool = True, truth: bool = False) -> SearchResult:
+                  make_world=None, segment: int = 0, deterministic: bool = True, truth: bool = False,
+                  horizon: int = 1, opponent=None) -> SearchResult:
     """Search without peeking: from `duel` at the searching player's first idle command of its turn,
     build `worlds_per_line` worlds from what that player can see (ocgforge.worlds), generate `lines`
     candidate plans (rollout 0 the most likely answers, the others sampled, each in its own world),
@@ -113,7 +116,10 @@ def honest_search(spec: DuelSpec, duel, policy, card_index, lines: int = 8, worl
     None. With `segment` (worlds.phase_group) a rollout ends when the duel leaves that phase group
     instead of at the end of the turn. With `truth` the worlds keep the opponent's real hidden cards
     and only reshuffle the decks: a restricted oracle that knows the opponent's hand but not the order
-    of its own deck."""
+    of its own deck. With `horizon` 2 a rollout also plays the opponent's following turn and is scored
+    when the player is back (the board the opponent could not break, not the value head's guess of
+    it); the opponent's answers then come from `opponent` if given. A plan keeps only the player's
+    answers on its own turn."""
     from . import worlds as w
 
     pool = pool or ThreadPoolExecutor(16)
@@ -154,10 +160,16 @@ def honest_search(spec: DuelSpec, duel, policy, card_index, lines: int = 8, worl
             rows = [duels[i].encode(card_index) for i in open_]
             sampled, _, values = policy(rows)
             greedy = policy.greedy(rows)
+            if opponent is not None:  # the opponent's decisions come from its own model
+                theirs = [n_ for n_, i in enumerate(open_) if duels[i].player != me]
+                if theirs:
+                    other = [rows[n_] for n_ in theirs]
+                    for n_, s_, g_ in zip(theirs, opponent(other)[0], opponent.greedy(other)):
+                        sampled[n_], greedy[n_] = s_, g_
             moves = []
             for n_, i in enumerate(open_):
                 d = duels[i]
-                if d.turn != turn[i] or (segment and w.phase_group(d.phase) != segment):
+                if d.turn - turn[i] >= horizon or (segment and w.phase_group(d.phase) != segment):
                     scores[i] = values[n_] if d.player == me else -values[n_]
                     continue
                 keys = d.keys()
@@ -171,7 +183,7 @@ def honest_search(spec: DuelSpec, duel, policy, card_index, lines: int = 8, worl
                     else:
                         choice = greedy[n_] if greedy_other else sampled[n_]
                     key = keys[choice]
-                if d.player == me:
+                if d.player == me and d.turn == turn[i]:
                     mine[i].append(w.canonical(key))
                 moves.append((i, key))
             for i in pool.map(act_safely, moves):
@@ -202,7 +214,7 @@ def honest_search(spec: DuelSpec, duel, policy, card_index, lines: int = 8, worl
     means = [sum(scores[k * worlds_per_line:(k + 1) * worlds_per_line]) / worlds_per_line for k in range(len(unique))]
     best = max(range(len(unique)), key=lambda k: means[k])
     greedy_k = unique.index(tuple(candidates[0])) if candidates[0] else best
-    return SearchResult(list(unique[best]), means[best], means[greedy_k], means)
+    return SearchResult(list(unique[best]), means[best], means[greedy_k], means, [list(p) for p in unique])
 
 
 class SearchPolicy:
@@ -248,12 +260,25 @@ class HonestSearchPolicy:
     so this-turn effects and what the opponent revealed meanwhile carry over.
 
     With `oracle` it plans Main Phase 1 only, in worlds that keep the opponent's real hidden cards
-    (honest_search truth=True): the combo line of a restricted oracle, the rest of the turn greedy."""
+    (honest_search truth=True): the combo line of a restricted oracle, the rest of the turn greedy.
+
+    With `through_opponent` each line is scored after the opponent's following turn (honest_search
+    horizon=2), played by `opponent` if given, else by the policy itself.
+
+    With `on_target(duel, keys, target)` it reports, at every decision it plays from its plan, a
+    distribution over `keys`: the plans still consistent with what it played this turn, each weighted
+    by exp(mean score / temperature) and voting for its next answer (a posterior over the searched
+    plans, the training target of expert iteration)."""
 
     def __init__(self, policy, card_index, lines: int = 8, worlds_per_line: int = 8,
-                 pool: ThreadPoolExecutor | None = None, phases: bool = False, oracle: bool = False):
+                 pool: ThreadPoolExecutor | None = None, phases: bool = False, oracle: bool = False,
+                 through_opponent: bool = False, opponent=None, on_target=None, temperature: float = 0.05):
         self.policy, self.card_index = policy, card_index
+        self.on_target, self.temperature = on_target, temperature
+        self.scored: list[tuple[list[str], float]] = []  # (plan, mean score) of the last search
+        self.played = 0  # answers played from the plan since the last search
         self.lines, self.worlds_per_line, self.phases, self.oracle = lines, worlds_per_line, phases, oracle
+        self.through_opponent, self.opponent = through_opponent, opponent
         self.pool = pool or ThreadPoolExecutor(16)
         self.plan: list[str] = []
         self.turn = None
@@ -276,11 +301,13 @@ class HonestSearchPolicy:
                                                random.Random(base + i), base + 10 * i)
         result = honest_search(spec, duel, self.policy, self.card_index, self.lines, self.worlds_per_line,
                                seed=self.searches, pool=self.pool, make_world=make_world, segment=segment,
-                               truth=self.oracle)
+                               truth=self.oracle, horizon=2 if self.through_opponent else 1,
+                               max_decisions=250 if self.through_opponent else 80, opponent=self.opponent)
         self.searches += 1
         if not result.values:
             self.failed += 1
         self.plan = result.line
+        self.scored, self.played = list(zip(result.plans, result.values)), 0
         self.gains.append(result.value - result.greedy_value)
 
     def choose(self, spec: DuelSpec, actions: list[str], duel) -> str:
@@ -299,9 +326,33 @@ class HonestSearchPolicy:
         if mine and duel.turn == self.turn and self.plan:
             key = w.match(self.plan.pop(0), keys)
             if key is not None:
+                if self.on_target is not None:
+                    self.report_target(duel, keys, key)
+                self.played += 1
                 return key
             self.plan = []  # the duel left the plan
         return keys[self.policy.greedy([duel.encode(self.card_index)])[0]]
+
+    def report_target(self, duel, keys: list[str], key: str) -> None:
+        """Hands on_target the posterior over the plans that agree with this turn's play so far, and
+        keeps only those that also play `key` now."""
+        from . import worlds as w
+
+        step, target, alive = self.played, [0.0] * len(keys), []
+        best = max((value for _, value in self.scored), default=0.0)
+        for plan, value in self.scored:
+            if len(plan) <= step:
+                continue
+            answer = w.match(plan[step], keys)
+            if answer is None:
+                continue
+            target[keys.index(answer)] += math.exp((value - best) / self.temperature)
+            if answer == key:
+                alive.append((plan, value))
+        total = sum(target)
+        if total > 0:
+            self.on_target(duel, keys, [t / total for t in target])
+        self.scored = alive
 
     def observe_other(self, key: str) -> None:
         pass
@@ -319,15 +370,19 @@ class GreedyPolicy(rollout.ModelPolicy):
 
 
 def match(model, decks: list[Path], duels: int, k: int, device: str, seed: int = 0, honest: bool = False,
-          phases: bool = False, oracle_main: bool = False) -> dict:
+          phases: bool = False, oracle_main: bool = False, through_opponent: bool = False,
+          opponent_model=None) -> dict:
     """`duels` duels of a searching player against the plain sampling policy (same model), alternating
     seats: oracle search (SearchPolicy) or, with honest=True, HonestSearchPolicy with k lines x k worlds
-    (oracle_main: its restricted oracle, Main Phase 1 only)."""
+    (oracle_main: its restricted oracle, Main Phase 1 only; through_opponent: lines scored after the
+    opponent's next turn, played by opponent_model if given)."""
     rng = random.Random(seed)
     card_index = model.card_features.index_map()
     policy = GreedyPolicy(model, device, sample=True, seed=seed)
-    searcher = (HonestSearchPolicy(policy, card_index, k, k, phases=phases, oracle=oracle_main)
-                if honest or phases or oracle_main
+    opponent = GreedyPolicy(opponent_model, device, sample=True, seed=seed + 1) if opponent_model is not None else None
+    searcher = (HonestSearchPolicy(policy, card_index, k, k, phases=phases, oracle=oracle_main,
+                                   through_opponent=through_opponent, opponent=opponent)
+                if honest or phases or oracle_main or through_opponent
                 else SearchPolicy(policy, card_index, k))
     wins = losses = draws = 0
     started = time.time()
@@ -375,12 +430,18 @@ def main(argv=None) -> None:
     parser.add_argument("--phases", action="store_true", help="honest search per phase (Main 1, Battle, Main 2)")
     parser.add_argument("--oracle-main", action="store_true",
                         help="restricted oracle: Main Phase 1 only, real hidden cards, decks reshuffled")
+    parser.add_argument("--through-opponent", action="store_true",
+                        help="honest search scoring each line after the opponent's next turn")
+    parser.add_argument("--opponent-checkpoint", type=Path, help="model playing the opponent in those rollouts")
     args = parser.parse_args(argv)
     if args.oracle_main and args.phases:
         parser.error("--oracle-main plans Main Phase 1 only; it does not combine with --phases")
+    if args.through_opponent and args.phases:
+        parser.error("--through-opponent scores whole turns; it does not combine with --phases")
     model = load_checkpoint(args.checkpoint, args.device, dropout=0.0)
+    opponent = load_checkpoint(args.opponent_checkpoint, args.device, dropout=0.0) if args.opponent_checkpoint else None
     print(match(model, args.decks, args.duels, args.k, args.device, args.seed, args.honest,
-                args.phases, args.oracle_main), flush=True)
+                args.phases, args.oracle_main, args.through_opponent, opponent), flush=True)
 
 
 if __name__ == "__main__":
