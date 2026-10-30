@@ -88,7 +88,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--save-every", type=int, default=5, help="iterations between saves of <out>/latest")
     p.add_argument("--overlap", action="store_true",
                    help="collect the next iteration's duels while the GPU trains on the last ones (with the "
-                        "weights from one update earlier)")
+                        "weights from one update earlier); needs GPU memory for a second copy of the model")
     p.add_argument("--reset-heads", action="store_true",
                    help="with --init: new policy (score) and value heads, the card and board encoder kept")
     p.add_argument("--extend-seen", action="store_true",
@@ -390,6 +390,7 @@ def main(argv=None) -> None:
     actor = copy.deepcopy(model) if args.overlap else model
     policy = rollout.ModelPolicy(actor, args.device, seed=args.seed, bf16=ppo.bf16)
     prefetch = Prefetch(collector, policy, args.steps) if args.overlap else None
+    admitting = None  # an arena checkpoint for the league, admitted while no collection runs
     deadline = time.time() + args.hours * 3600 if args.hours > 0 else None
     saved_iteration, failing = iteration, 0
     loops = env.blocked_answers, env.loop_losses  # duels end between iterations too: carry the baseline
@@ -405,9 +406,13 @@ def main(argv=None) -> None:
                 cards_line = {"cards": card_report(usage, names), "extra": extra_report(extra, names), **extra.summary()}
                 usage.reset()
                 extra.reset()
+            if admitting is not None:  # the league only changes while nothing plays against it
+                admit(admitting)
+                admitting = None
+            last = iteration + 1 >= args.iterations or (deadline is not None and time.time() >= deadline)
             if prefetch is not None:
                 actor.load_state_dict(model.state_dict())
-                prefetch = Prefetch(collector, policy, args.steps)
+                prefetch = Prefetch(collector, policy, args.steps) if not last else None
             collected = time.time()
             steps = build_steps(segments, ppo.gamma, ppo.lam)
             config = replace(ppo, entropy_coef=entropy_coef(args, iteration))
@@ -451,13 +456,15 @@ def main(argv=None) -> None:
                 print(json.dumps(result), flush=True)
                 with open(out / "cards.jsonl", "a", encoding="utf-8") as f:
                     f.write(json.dumps({"iteration": iteration, **cards_line}) + "\n")
-                admit(checkpoint)
+                admitting = checkpoint
             if iteration % args.save_every == 0 or iteration % args.arena_every == 0:
                 save_latest(model, optimizer, out, iteration)
                 saved_iteration = iteration
     except KeyboardInterrupt:
         print("interrupted", flush=True)
     finally:
+        if prefetch is not None:  # an interrupted run: let the collection in flight finish briefly
+            prefetch.thread.join(timeout=30)
         if iteration > saved_iteration:  # the deadline, the last iterations or an interrupt
             save_latest(model, optimizer, out, iteration)
             print(f"saved iteration {iteration} to {out / 'latest'}", flush=True)
