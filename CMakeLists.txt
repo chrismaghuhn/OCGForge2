@@ -22,8 +22,10 @@ execute_process(
 if(NOT setup_result EQUAL 0)
     message(FATAL_ERROR "tools/setup_deps.py failed")
 endif()
+# A patch edited in place (same name in deps.json) must also re-run setup_deps.py.
+file(GLOB_RECURSE ocgforge_patches CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/third_party/patches/*")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    "${CMAKE_SOURCE_DIR}/third_party/deps.json" "${CMAKE_SOURCE_DIR}/tools/setup_deps.py")
+    "${CMAKE_SOURCE_DIR}/third_party/deps.json" "${CMAKE_SOURCE_DIR}/tools/setup_deps.py" ${ocgforge_patches})
 
 # --- ocgcore (rules engine + bundled Lua, compiled as C++) --------------------
 # The pinned ocgcore is YGO-Gym's fork (duel cloning, checkpoints, card re-identification), see
