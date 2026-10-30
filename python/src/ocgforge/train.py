@@ -20,11 +20,13 @@ and a league anchor. Run several --seed values to see how much a result depends 
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import shutil
 import signal
 import sys
+import threading
 import time
 from collections import Counter
 from dataclasses import asdict, replace
@@ -84,6 +86,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--arena-duels", type=int, default=200, help="per matchup; 200 gives about +-7%% on a win rate")
     p.add_argument("--arena-envs", type=int, default=128)
     p.add_argument("--save-every", type=int, default=5, help="iterations between saves of <out>/latest")
+    p.add_argument("--overlap", action="store_true",
+                   help="collect the next iteration's duels while the GPU trains on the last ones (with the "
+                        "weights from one update earlier); needs GPU memory for a second copy of the model")
     p.add_argument("--reset-heads", action="store_true",
                    help="with --init: new policy (score) and value heads, the card and board encoder kept")
     p.add_argument("--extend-seen", action="store_true",
@@ -173,6 +178,32 @@ def entropy_coef(args: argparse.Namespace, iteration: int) -> float:
         return args.entropy
     share = min(1.0, iteration / args.entropy_ramp)
     return args.entropy_start + (args.entropy - args.entropy_start) * share
+
+
+class Prefetch:
+    """collector.collect(policy, steps) on a daemon thread (the engine and torch release the GIL), so
+    the duels of the next iteration are played while the learner trains. Daemon: an interrupt does
+    not wait for it."""
+
+    def __init__(self, collector: rollout.AsyncCollector, policy, steps: int):
+        self.result, self.error = None, None
+
+        def run() -> None:
+            start = time.time()
+            try:
+                self.result = (*collector.collect(policy, steps), time.time() - start)
+            except BaseException as error:  # handed to the main thread by get()
+                self.error = error
+
+        self.thread = threading.Thread(target=run, daemon=True)
+        self.thread.start()
+
+    def get(self):
+        """(segments, stats, collect seconds) once the collection is done."""
+        self.thread.join()
+        if self.error is not None:
+            raise self.error
+        return self.result
 
 
 def card_names(card_features: CardFeatures) -> dict[int, str]:
@@ -353,14 +384,35 @@ def main(argv=None) -> None:
                                        tempo=rollout.Tempo(args.tempo_start, args.tempo_slope, args.tempo_floor, args.tempo_losses)
                                        if args.tempo_slope > 0 else None)
     names = card_names(model.card_features)
-    policy = rollout.ModelPolicy(model, args.device, seed=args.seed, bf16=ppo.bf16)
+    # With --overlap an actor copy plays the next iteration's duels while `model` trains; it gets the
+    # learner's weights before each collection, so its data is one update old (PPO's ratio uses the
+    # logprobs stored with it, so the update stays consistent).
+    actor = copy.deepcopy(model) if args.overlap else model
+    policy = rollout.ModelPolicy(actor, args.device, seed=args.seed, bf16=ppo.bf16)
+    prefetch = Prefetch(collector, policy, args.steps) if args.overlap else None
+    admitting = None  # an arena checkpoint for the league, admitted while no collection runs
     deadline = time.time() + args.hours * 3600 if args.hours > 0 else None
     saved_iteration, failing = iteration, 0
     loops = env.blocked_answers, env.loop_losses  # duels end between iterations too: carry the baseline
     try:
         while iteration < args.iterations and (deadline is None or time.time() < deadline):
             start = time.time()
-            segments, stats = collector.collect(policy, args.steps)
+            if prefetch is not None:
+                segments, stats, collect_seconds = prefetch.get()
+            else:
+                segments, stats = collector.collect(policy, args.steps)
+                collect_seconds = time.time() - start
+            if (iteration + 1) % args.arena_every == 0:  # the card logs up to here; the next collection may start
+                cards_line = {"cards": card_report(usage, names), "extra": extra_report(extra, names), **extra.summary()}
+                usage.reset()
+                extra.reset()
+            if admitting is not None:  # the league only changes while nothing plays against it
+                admit(admitting)
+                admitting = None
+            last = iteration + 1 >= args.iterations or (deadline is not None and time.time() >= deadline)
+            if prefetch is not None:
+                actor.load_state_dict(model.state_dict())
+                prefetch = Prefetch(collector, policy, args.steps) if not last else None
             collected = time.time()
             steps = build_steps(segments, ppo.gamma, ppo.lam)
             config = replace(ppo, entropy_coef=entropy_coef(args, iteration))
@@ -369,8 +421,9 @@ def main(argv=None) -> None:
             done = time.time()
             finished = stats.duels + stats.league_duels + stats.errors
             line = {"iteration": iteration, "time": round(done, 1), "decisions": len(steps),
-                    "decisionsPerSecond": round(stats.decisions / (collected - start)),
-                    "collectSeconds": round(collected - start, 2), "updateSeconds": round(done - collected, 2),
+                    "decisionsPerSecond": round(stats.decisions / max(collect_seconds, 1e-6)),
+                    "collectSeconds": round(collect_seconds, 2), "waitSeconds": round(collected - start, 2),
+                    "updateSeconds": round(done - collected, 2),
                     "duels": stats.duels, "leagueDuels": stats.league_duels, "errors": stats.errors,
                     "errorReasons": error_reasons(stats.error_messages),
                     # loop protection: answers blocked and duels lost by looping anyway
@@ -396,22 +449,22 @@ def main(argv=None) -> None:
                 opponents = {"previous": previous} if previous is not None else {}
                 if first is not None and first is not previous:
                     opponents["first"] = first
-                result = {"iteration": iteration, **arena(model, opponents, args, iteration), **extra.summary()}
+                result = {"iteration": iteration, **arena(model, opponents, args, iteration),
+                          **{k: v for k, v in cards_line.items() if k not in ("cards", "extra")}}
                 with open(out / "arena.jsonl", "a", encoding="utf-8") as f:
                     f.write(json.dumps(result) + "\n")
                 print(json.dumps(result), flush=True)
                 with open(out / "cards.jsonl", "a", encoding="utf-8") as f:
-                    f.write(json.dumps({"iteration": iteration, "cards": card_report(usage, names),
-                                        "extra": extra_report(extra, names), **extra.summary()}) + "\n")
-                usage.reset()
-                extra.reset()
-                admit(checkpoint)
+                    f.write(json.dumps({"iteration": iteration, **cards_line}) + "\n")
+                admitting = checkpoint
             if iteration % args.save_every == 0 or iteration % args.arena_every == 0:
                 save_latest(model, optimizer, out, iteration)
                 saved_iteration = iteration
     except KeyboardInterrupt:
         print("interrupted", flush=True)
     finally:
+        if prefetch is not None:  # an interrupted run: let the collection in flight finish briefly
+            prefetch.thread.join(timeout=30)
         if iteration > saved_iteration:  # the deadline, the last iterations or an interrupt
             save_latest(model, optimizer, out, iteration)
             print(f"saved iteration {iteration} to {out / 'latest'}", flush=True)
