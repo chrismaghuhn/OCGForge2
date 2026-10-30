@@ -20,7 +20,10 @@
   },
   "cardscripts": {
     "repository": "https://github.com/ProjectIgnis/CardScripts.git",
-    "commit": "10912cc9398395a2652cb53106285670e49144a3"
+    "commit": "10912cc9398395a2652cb53106285670e49144a3",
+    "patches": [
+      "0001-synchro-search-memo.patch"
+    ]
   },
   "babelcdb": {
     "repository": "https://github.com/ProjectIgnis/BabelCDB.git",

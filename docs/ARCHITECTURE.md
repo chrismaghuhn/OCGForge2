@@ -117,7 +117,18 @@ Fixed inputs live in `third_party/deps.json` (exact commits) and
   duels. It relies on no script changing an effect's code after registering it,
   as `filter_effect` already does.
 
+Card script patches live in `third_party/patches/cardscripts/`:
+
+- `0001-synchro-search-memo.patch`: `Synchro.Condition` (is a Synchro Summon possible?)
+  searches materials by picking them one at a time and so reaches every material set
+  once per order of its cards; with "1+ non-Tuners" or several Tuners that is factorial
+  in the number of candidates. While the condition searches, the part of the search
+  after a pick is now remembered per state (picked Tuners, picked non-Tuners, candidates
+  left). The checks of each pick itself (material restrictions, hand Synchro) still run
+  for every order, so the answers stay the same. Synchro checks run for every Extra
+  Deck card at every Main Phase decision and were about a third of engine time.
+
 `tools/setup_deps.py` applies the patches in order to a clean checkout and
-records their hashes in `.cache/ocgcore/.ocgforge-patches`.
+records their hashes in `.ocgforge-patches` in that checkout.
 
 Duel mode is `DUEL_MODE_MR5` (Master Rule 2020).

@@ -12,7 +12,7 @@ option(OCGFORGE_BUILD_PYTHON "Build the ocgforge._core Python module" OFF)
 
 # --- Pinned third-party inputs ------------------------------------------------
 # Fetches ocgcore, CardScripts and BabelCDB into .cache/ (see third_party/deps.json),
-# applies our ocgcore patches and writes .cache/card_data.tsv for the decks.
+# applies our ocgcore and card script patches and writes .cache/card_data.tsv for the decks.
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set(OCGFORGE_CACHE "${CMAKE_SOURCE_DIR}/.cache")
 execute_process(

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Fetch the pinned rules engine, card scripts and card database, patch ocgcore,
-and extract the card data for our decks.
+"""Fetch the pinned rules engine, card scripts and card database, patch ocgcore and
+the card scripts, and extract the card data for our decks.
 
 Idempotent: re-running only does work that is missing. Called by CMake at
 configure time; can also be run by hand.
@@ -54,11 +54,11 @@ def checkout(name: str, spec: dict, cache: Path) -> Path:
 
 
 def apply_patches(path: Path, patches: list[str]) -> None:
-    """Apply our patches in order on a clean checkout. A marker with the patches' hashes makes this
-    a no-op when they are already in place (patches touching the same lines can't be checked one
-    by one)."""
+    """Apply our patches (third_party/patches/<checkout name>/) in order on a clean checkout. A
+    marker with the patches' hashes makes this a no-op when they are already in place (patches
+    touching the same lines can't be checked one by one)."""
     marker = path / ".ocgforge-patches"
-    files = [ROOT / "third_party" / "patches" / "ocgcore" / name for name in patches]
+    files = [ROOT / "third_party" / "patches" / path.name / name for name in patches]
     expected = "\n".join(f"{f.name} {hashlib.sha256(f.read_bytes()).hexdigest()}" for f in files) + "\n"
     if marker.exists() and marker.read_text(encoding="utf-8") == expected:
         return
@@ -137,7 +137,8 @@ def main() -> int:
     try:
         ocgcore = checkout("ocgcore", deps["ocgcore"], cache)
         apply_patches(ocgcore, deps["ocgcore"]["patches"])
-        checkout("cardscripts", deps["cardscripts"], cache)
+        cardscripts = checkout("cardscripts", deps["cardscripts"], cache)
+        apply_patches(cardscripts, deps["cardscripts"].get("patches", []))
         babelcdb = checkout("babelcdb", deps["babelcdb"], cache)
     except subprocess.CalledProcessError as error:
         print(f"git {' '.join(error.cmd[1:])} failed:\n{error.stderr}", file=sys.stderr)
