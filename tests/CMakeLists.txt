@@ -9,6 +9,7 @@ include(Catch)
 
 add_executable(ocgforge_tests
     core/deck_test.cpp
+    core/script_cache_test.cpp
     client/client_duel_test.cpp
     client/client_view_test.cpp
     protocol/select_unselect_test.cpp
