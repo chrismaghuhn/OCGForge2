@@ -49,3 +49,36 @@ def test_distill_loss_ignores_padding_and_learns_the_target(card_features):
         loss.backward()
         optimizer.step()
     assert stats["policy"] < first and stats["agree"] == 1.0
+
+
+def test_search_data_reads_complete_shards_and_keeps_the_newest(tmp_path):
+    import pickle
+
+    with open(tmp_path / "shard-0-0.pkl", "wb") as f:
+        pickle.dump([{"i": i} for i in range(5)], f)
+    (tmp_path / "shard-0-1.pkl.tmp").write_bytes(b"half written")
+    data = expert.SearchData(tmp_path, window=4)
+    assert data.refresh() == 5 and [s["i"] for s in data.samples] == [1, 2, 3, 4]
+    with open(tmp_path / "shard-0-2.pkl", "wb") as f:
+        pickle.dump([{"i": 9}], f)
+    assert data.refresh() == 1 and [s["i"] for s in data.samples] == [2, 3, 4, 9]
+    assert data.refresh() == 0 and len(data.sample(10)) == 4
+
+
+def test_training_imitates_search_shards(tmp_path):
+    import json
+
+    from ocgforge import rollout, train
+
+    if not (rollout.REPO / ".cache" / "babelcdb").exists():
+        pytest.skip("card database not fetched")
+    decks = sorted((rollout.REPO / "decks").glob("*.ydk"))[:2]
+    base = ["--size", "small", "--text-embeddings", "none", "--envs", "8", "--threads", "2", "--segment", "16",
+            "--steps", "64", "--arena-every", "1000", "--device", "cpu", "--decks", *map(str, decks)]
+    train.main(["--out", str(tmp_path / "base"), "--iterations", "1", *base])
+    expert.generate_shard(tmp_path / "base" / "latest", decks, 1, 2, 3, tmp_path / "search" / "shard-0-0.pkl", "cpu")
+    train.main(["--out", str(tmp_path / "run"), "--iterations", "2", "--init", str(tmp_path / "base" / "latest"),
+                "--search-data", str(tmp_path / "search"), "--search-batch", "16", *base])
+    metrics = [json.loads(line) for line in (tmp_path / "run" / "metrics.jsonl").read_text().splitlines()]
+    assert metrics[0]["searchSamples"] > 0 and metrics[0]["searchNew"] > 0 and metrics[1]["searchNew"] == 0
+    assert all(0 <= m["searchAgree"] <= 1 and m["searchLoss"] >= 0 for m in metrics)

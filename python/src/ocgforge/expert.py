@@ -113,6 +113,70 @@ def distill_loss(model, batch: dict, targets: torch.Tensor, results: torch.Tenso
                                                    "agree": float(agree)}
 
 
+def search_policy_loss(model, batch: dict, targets: torch.Tensor) -> tuple[torch.Tensor, dict]:
+    """Cross-entropy of the policy to the search targets alone (the value head left to PPO)."""
+    scores, _ = model(batch)
+    logprobs = torch.log_softmax(scores.float(), dim=-1)
+    picked = torch.where(targets > 0, logprobs, torch.zeros_like(logprobs))
+    loss = -(targets * picked).sum(-1).mean()
+    agree = (logprobs.argmax(-1) == targets.argmax(-1)).float().mean()
+    return loss, {"searchLoss": float(loss.detach()), "searchAgree": float(agree)}
+
+
+class SearchData:
+    """The newest search samples, read from the shards workers keep writing to `directory`: at most
+    `window` samples, the oldest dropped first. sample(n) draws a batch for PPO's auxiliary loss."""
+
+    def __init__(self, directory: Path, window: int = 50_000, seed: int = 0):
+        self.directory, self.window = Path(directory), window
+        self.samples: list[dict] = []
+        self.loaded: set[str] = set()
+        self.rng = random.Random(seed)
+
+    def refresh(self) -> int:
+        """Loads shards not read yet (complete ones only: workers write *.pkl.tmp and rename); returns
+        how many samples came in."""
+        added = 0
+        for shard in sorted(self.directory.glob("shard-*.pkl"), key=lambda f: f.stat().st_mtime):
+            if shard.name in self.loaded:
+                continue
+            try:
+                with open(shard, "rb") as f:
+                    new = pickle.load(f)
+            except (OSError, EOFError, pickle.UnpicklingError):
+                continue  # still being written: next time
+            self.loaded.add(shard.name)
+            self.samples.extend(new)
+            added += len(new)
+        del self.samples[:-self.window]
+        return added
+
+    def sample(self, n: int) -> list[dict]:
+        return self.rng.sample(self.samples, min(n, len(self.samples))) if self.samples else []
+
+
+def generate_forever(latest: Path, decks: list[Path], k: int, duels: int, out: Path, seed: int,
+                     device: str = "cuda", temperature: float = 0.05, rounds: int = 0) -> None:
+    """A search worker for training: `duels` duels per shard with the newest checkpoint in `latest`
+    (re-read before every shard), shards written as *.pkl.tmp and renamed, `rounds` shards (0 = no
+    limit)."""
+    n = 0
+    while rounds == 0 or n < rounds:
+        try:
+            line = generate_shard(latest, decks, duels, k, seed * 100_000 + n, out / f"shard-{seed}-{n}.pkl.tmp",
+                                  device, temperature)
+        except FileNotFoundError:  # the trainer is replacing latest right now
+            time.sleep(5)
+            continue
+        (out / f"shard-{seed}-{n}.pkl.tmp").rename(out / f"shard-{seed}-{n}.pkl")
+        print(json.dumps({**line, "shard": f"shard-{seed}-{n}.pkl"}), flush=True)
+        n += 1
+
+
+def _forever_job(args: tuple) -> None:
+    generate_forever(*args)
+
+
 def _batch(samples: list[dict], device: str):
     batch = features.collate(samples, device)
     width = batch["candidate_kind"].shape[1]
@@ -187,6 +251,9 @@ def main(argv=None) -> None:
     g.add_argument("--seed", type=int, default=0)
     g.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     g.add_argument("--out", type=Path, required=True)
+    g.add_argument("--forever", action="store_true",
+                   help="keep writing shards of --duels duels each, re-reading --checkpoint (a training run's "
+                        "latest) before each; for PPO's --search-data")
     d = sub.add_parser("distill", help="train a checkpoint on the samples")
     d.add_argument("--checkpoint", type=Path, required=True)
     d.add_argument("--data", type=Path, nargs="+", required=True)
@@ -197,7 +264,13 @@ def main(argv=None) -> None:
     d.add_argument("--micro-batch", type=int, default=64, help="chunk of a batch run at once (GPU memory)")
     d.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args(argv)
-    if args.command == "generate":
+    if args.command == "generate" and args.forever:
+        args.out.mkdir(parents=True, exist_ok=True)
+        jobs = [(args.checkpoint, args.decks, args.k, args.duels, args.out, args.seed * 1000 + i, args.device,
+                 args.temperature) for i in range(args.workers)]
+        with multiprocessing.get_context("spawn").Pool(len(jobs)) as pool:
+            pool.map(_forever_job, jobs)
+    elif args.command == "generate":
         for line in generate(args.checkpoint, args.decks, args.duels, args.k, args.workers, args.out, args.seed,
                              args.device, args.temperature):
             print(json.dumps(line), flush=True)
