@@ -95,6 +95,7 @@ class RolloutStats:
     league_decisions: int = 0  # of those, played against a league opponent
     error_messages: list[str] = field(default_factory=list)
     end_turns: list[int] = field(default_factory=list)  # turn count at the end of each finished duel
+    forced_decisions: int = 0  # learner decisions with a single candidate, answered without the model (skip_forced)
 
 
 @dataclass(frozen=True)
@@ -337,13 +338,18 @@ class AsyncCollector:
 
     With a `league`, the first `league.share` of the envs play a league opponent (picked when a duel
     starts) on seat `env % 2` and keep only the learner's decisions; until the league has models,
-    they play self-play too."""
+    they play self-play too.
+
+    With `skip_forced`, decisions with a single candidate (about a third, mostly chain prompts) are
+    answered without a forward pass and are not kept for training: they carry no policy gradient,
+    and the segment's GAE then runs over the real choices only."""
 
     def __init__(self, env, batch_size: int, segment: int = 128, league: League | None = None,
                  card_usage: CardUsage | None = None, extra_usage: ExtraDeckUsage | None = None,
-                 tempo: Tempo | None = None):
+                 tempo: Tempo | None = None, skip_forced: bool = False):
         self.env, self.batch_size, self.segment, self.league = env, batch_size, segment, league
         self.card_usage, self.extra_usage, self.tempo = card_usage, extra_usage, tempo
+        self.skip_forced = skip_forced
         self.turn: dict[int, int] = {}  # env -> turn count at its latest decision
         self.pending: dict[tuple[int, int], list[dict]] = {}
         self.league_envs = round(len(env) * league.share) if league else 0
@@ -398,9 +404,12 @@ class AsyncCollector:
             # An opponent dropped from the league mid-duel hands its seat to the learner.
             actor = [name if players[n] == i % 2 and (name := self.opponent.get(i)) in self.league_policies() else None
                      for n, i in enumerate(ids)]
+            forced = (np.asarray(batch["candidate_count"]) == 1).tolist() if self.skip_forced else [False] * len(ids)
             choices, logprobs, values = [0] * len(ids), [0.0] * len(ids), [0.0] * len(ids)
             for name in set(actor):
-                rows = [n for n, a in enumerate(actor) if a == name]
+                rows = [n for n, a in enumerate(actor) if a == name and not forced[n]]
+                if not rows:
+                    continue
                 part = batch if len(rows) == len(ids) else _rows(batch, rows)
                 for n, c, lp, v in zip(rows, *_play(policy if name is None else self.league.policies[name], part)):
                     choices[n], logprobs[n], values[n] = c, lp, v
@@ -412,6 +421,9 @@ class AsyncCollector:
             for n, (i, choice, logprob, value) in enumerate(zip(ids, choices, logprobs, values)):
                 if actor[n] is not None:
                     continue  # the league opponent's move: not trained on
+                if forced[n]:
+                    stats.forced_decisions += 1
+                    continue
                 stats.learner_decisions += 1
                 stats.league_decisions += i in self.opponent
                 decision = features.row(batch, n, copy=True)  # compact: a view would keep the whole batch alive

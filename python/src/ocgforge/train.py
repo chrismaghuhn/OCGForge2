@@ -107,6 +107,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--tempo-start", type=int, default=5, help="last turn (both players' turns) at full weight")
     p.add_argument("--tempo-floor", type=float, default=0.6, help="lowest weight of a result")
     p.add_argument("--tempo-losses", action="store_true", help="shrink losses too (default: wins only)")
+    p.add_argument("--skip-forced", action="store_true",
+                   help="answer single-candidate decisions without the model and leave them out of training "
+                        "(about a third of all decisions; --steps still counts every decision)")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--init", type=Path, help="start from this checkpoint's weights (e.g. <run>/latest)")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -144,7 +147,7 @@ def build_model(args: argparse.Namespace) -> Model:
 # Settings a resumed run keeps from run.json unless given again: its origin and its reward and
 # exploration schedules (dropping them silently would change what the run optimizes mid-way).
 RESUMED_SETTINGS = {"init": None, "tempo_slope": 0.0, "tempo_start": 5, "tempo_floor": 0.6, "tempo_losses": False,
-                    "entropy_start": None, "entropy_ramp": 0}
+                    "entropy_start": None, "entropy_ramp": 0, "skip_forced": False}
 
 
 def restore_run_settings(args: argparse.Namespace, run: dict) -> None:
@@ -410,7 +413,7 @@ def main(argv=None) -> None:
                                        league=league if args.league_share > 0 else None, card_usage=usage,
                                        extra_usage=extra,
                                        tempo=rollout.Tempo(args.tempo_start, args.tempo_slope, args.tempo_floor, args.tempo_losses)
-                                       if args.tempo_slope > 0 else None)
+                                       if args.tempo_slope > 0 else None, skip_forced=args.skip_forced)
     names = card_names(model.card_features)
     # With --overlap an actor copy plays the next iteration's duels while `model` trains; it gets the
     # learner's weights before each collection, so its data is one update old (PPO's ratio uses the
@@ -468,6 +471,7 @@ def main(argv=None) -> None:
                     # loop protection: answers blocked and duels lost by looping anyway
                     "blockedAnswers": env.blocked_answers - loops[0],
                     "loopLosses": env.loop_losses - loops[1],
+                    "forcedDecisions": stats.forced_decisions,
                     "leagueDataShare": round(stats.league_decisions / max(1, stats.learner_decisions), 3),
                     **({"searchSamples": len(search_data.samples), "searchNew": search_new} if search_data else {}),
                     "wins": stats.wins, "league": league.scores(), "entropyCoef": round(config.entropy_coef, 5),
