@@ -107,13 +107,17 @@ duels): 1.7 MB after creation, peak median 3.6 MB, max 5.2 MB; per deck the high
 3.9-5.2 MB, so the default leaves >10x headroom below the fork's 256 MiB heap reserve.
 
 Lua runs its generational collector (`CoreHostConfig::lua_generational_gc`, default on, patch
-0007's `OCG_DuelSetLuaGenerationalGC` right after creation; `OCGFORGE_LUA_GC=inc|gen` overrides
-it for A/B runs). Card scripts make mostly short-lived garbage, and the fork's heap region never
+0007's `OCG_DuelSetLuaGenerationalGC` right after creation; `OCGFORGE_LUA_GC=inc|gen` forces one
+mode for the whole process, over the config, for A/B runs; any other value makes duel creation
+fail). Card scripts make mostly short-lived garbage, and the fork's heap region never
 shrinks, so a smaller heap stays smaller: with random play the region grows ~0.9 MB per 1000
 decisions instead of ~2.2 MB (max 5.4 vs 8.9 MB over 6 duels), VectorEnv runs 6-20% more
 decisions/s on one thread and 256 envs used ~7% less RSS after 60 s. Play is the same in both
 modes (tested), and clones copy the generational lists (clone tests, incl. `[slow]`, pass in
 both modes).
+
+Card data (`CardDataStore`) and compiled card scripts (`ScriptCache`) are read once per process
+and kept until it exits; a process only sees an updated `.cache` after a restart.
 
 `VectorEnv::info(env)` shows the seed, decks and actions of an env's current
 duel (also while `step` runs), which is enough to replay a stuck duel with

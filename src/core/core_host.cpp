@@ -89,6 +89,24 @@ void CoreHost::throw_if_lua_budget_exceeded(const char* operation) const {
     }
 }
 
+// OCGFORGE_LUA_GC=gen|inc forces the Lua collector for every duel of the process (A/B runs), over
+// CoreHostConfig::lua_generational_gc. Read once; any other value is an error, so a typo cannot
+// quietly measure the default twice.
+static std::optional<bool> lua_gc_override() {
+    static const std::optional<bool> mode = [] () -> std::optional<bool> {
+        const char* value = std::getenv("OCGFORGE_LUA_GC");
+        if (value == nullptr || *value == '\0') {
+            return std::nullopt;
+        }
+        const std::string text(value);
+        if (text == "gen" || text == "inc") {
+            return text == "gen";
+        }
+        throw CoreError(CoreErrorCode::Lifecycle, "OCGFORGE_LUA_GC", "expected gen or inc, got " + text);
+    }();
+    return mode;
+}
+
 CoreHost::CoreHost(CoreHostConfig config) : config_(std::move(config)) {
     OCG_GetVersion(&api_major_, &api_minor_);
     if (api_major_ != 11 || api_minor_ != 1) {  // 11.1: the YGO-Gym fork (cloning)
@@ -129,11 +147,7 @@ CoreHost::CoreHost(CoreHostConfig config) : config_(std::move(config)) {
         }
         // Only now: the limit must never apply while the Lua state is being built.
         OCG_DuelSetLuaMemoryLimit(impl_->duel, config_.lua_memory_limit);
-        bool generational = config_.lua_generational_gc;
-        if (const char* mode = std::getenv("OCGFORGE_LUA_GC"); mode != nullptr) {
-            generational = std::string(mode) == "gen" ? true : std::string(mode) == "inc" ? false : generational;
-        }
-        if (generational) {  // the state is built and no Lua code has run yet
+        if (lua_gc_override().value_or(config_.lua_generational_gc)) {  // the state is built and no Lua code has run yet
             OCG_DuelSetLuaGenerationalGC(impl_->duel, 1);
         }
 

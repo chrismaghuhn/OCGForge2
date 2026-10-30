@@ -55,27 +55,19 @@ void CardDataStore::load(const std::filesystem::path& path) {
 }
 
 std::shared_ptr<const CardDataStore> CardDataStore::shared(const std::filesystem::path& path) {
-    // Kept while the process runs, so a duel created after the last one was destroyed does not
-    // parse the file again (~7 ms); read again only when the file changed (size or mtime).
-    // Never destroyed: worker threads may still start duels while the process exits.
-    struct Cached {
-        std::shared_ptr<const CardDataStore> store;
-        std::filesystem::file_time_type modified;
-        std::uintmax_t size = 0;
-    };
+    // Kept while the process runs, like the compiled card scripts (ScriptCache), so a duel created
+    // after the last one was destroyed does not parse the file again (~7 ms). Card data and
+    // scripts are both read once per process; a process that should see an updated .cache must
+    // be restarted. Never destroyed: worker threads may still start duels while the process exits.
     static auto* mutex = new std::mutex;
-    static auto* cache = new std::map<std::filesystem::path, Cached>;
-    std::error_code error;
-    const auto modified = std::filesystem::last_write_time(path, error);
-    const auto size = error ? 0 : std::filesystem::file_size(path, error);
+    static auto* cache = new std::map<std::filesystem::path, std::shared_ptr<const CardDataStore>>;
     std::lock_guard lock(*mutex);
-    auto& cached = (*cache)[path];
-    if (cached.store && !error && cached.modified == modified && cached.size == size) {
-        return cached.store;
+    auto& store = (*cache)[path];
+    if (!store) {
+        auto loaded = std::make_shared<CardDataStore>();
+        loaded->load(path);
+        store = std::move(loaded);
     }
-    auto store = std::make_shared<CardDataStore>();
-    store->load(path);
-    cached = Cached{store, modified, size};
     return store;
 }
 
