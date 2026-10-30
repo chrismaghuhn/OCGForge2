@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "support.hpp"
+#include "ygo/encode/encoder.hpp"
 #include "ygo/protocol/message_decoder.hpp"
 
 using ygo::duel::Duel;
@@ -57,6 +58,38 @@ TEST_CASE("many random duels always finish", "[.][slow]") {
     for (std::uint64_t seed = 1000; seed < 1500; ++seed) {
         CAPTURE(seed);
         CHECK_NOTHROW(play_random(seed));
+    }
+}
+
+// A lazy duel that looks only at real choices (like VectorEnv with skip_forced) plays exactly like an
+// eager one, and the observations it builds late encode the same as the ones built in act().
+TEST_CASE("lazy observations give the same duel and the same model input") {
+    for (std::uint64_t seed = 1; seed <= std::min<std::uint64_t>(8, random_duel_count()); ++seed) {
+        CAPTURE(seed);
+        auto lazy_config = test::duel_config(seed);
+        lazy_config.lazy_observations = true;
+        Duel eager(test::duel_config(seed));
+        Duel lazy(std::move(lazy_config));
+        std::mt19937_64 rng(seed);
+        std::size_t compared = 0;
+        while (!eager.finished()) {
+            REQUIRE(!lazy.finished());
+            const auto& candidates = eager.request().candidates;
+            REQUIRE(lazy.request().candidates.size() == candidates.size());
+            if (candidates.size() > 1) {
+                CHECK(ygo::encode::encode(*lazy.observation(), lazy.request(), {}) ==
+                      ygo::encode::encode(*eager.observation(), eager.request(), {}));
+                ++compared;
+            }
+            const auto key = candidates[rng() % candidates.size()].semantic_key;
+            eager.act(key);
+            lazy.act(key);
+        }
+        REQUIRE(lazy.finished());
+        CHECK(lazy.decision_count() == eager.decision_count());
+        CHECK(lazy.result()->winner == eager.result()->winner);
+        CHECK(lazy.result()->reason == eager.result()->reason);
+        CHECK(compared > 0);
     }
 }
 

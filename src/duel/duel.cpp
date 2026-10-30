@@ -116,8 +116,14 @@ const protocol::DecisionRequest& Duel::request() const {
     return *request_;
 }
 
-const observation::PlayerObservation* Duel::observation() const noexcept {
-    return observation_ ? &*observation_ : nullptr;
+const observation::PlayerObservation* Duel::observation() const {
+    if (!request_ || !config_.build_observations) {
+        return nullptr;
+    }
+    if (!observation_) {
+        build_observation();
+    }
+    return &*observation_;
 }
 
 void Duel::act(const std::string& semantic_key) {
@@ -254,10 +260,15 @@ void Duel::publish(protocol::DecisionRequest request) {
         fail(error.what());
     }
     request_ = std::move(request);
-    if (!config_.build_observations) {
-        return;
+    observation_.reset();
+    if (config_.build_observations && !config_.lazy_observations) {
+        build_observation();
     }
+}
 
+// The engine does not move between publish and the next act, so a lazy build gives the same
+// observation as one in publish. Kept only once it passed the visibility check.
+void Duel::build_observation() const {
     observation::ObservationBuildConfig build;
     build.decision_index = decision_count_;
     build.engine_step_index = request_->engine_step_index;
@@ -275,8 +286,8 @@ void Duel::publish(protocol::DecisionRequest request) {
     build.knowledge.own_decklist_known = true;
     build.own_deck.known = true;
     build.own_deck.main_deck = request_->player == 0 ? config_.deck0.main_deck : config_.deck1.main_deck;
-    observation_ = observation::build_player_observation(*host_, request_->player, std::move(build));
-    observation::attach_decision_context(*observation_, *request_);
+    auto built = observation::build_player_observation(*host_, request_->player, std::move(build));
+    observation::attach_decision_context(built, *request_);
 
     // Every card a candidate refers to must be visible to the deciding player.
     for (const auto& candidate : request_->candidates) {
@@ -286,12 +297,13 @@ void Duel::publish(protocol::DecisionRequest request) {
                               (candidate.target_card != 0 && candidate.target_location != 0 &&
                                candidate.target_location != LOCATION_DECK &&
                                candidate.target_location != LOCATION_EXTRA);
-        if (has_card && !observation::candidate_observation_consistent(*observation_, candidate) &&
-            !observation::revealed_this_turn(*observation_, candidate.source_card, candidate.source_controller,
+        if (has_card && !observation::candidate_observation_consistent(built, candidate) &&
+            !observation::revealed_this_turn(built, candidate.source_card, candidate.source_controller,
                                              candidate.source_location)) {
             fail("candidate refers to a card the player cannot see: " + candidate.semantic_key);
         }
     }
+    observation_ = std::move(built);
 }
 
 DuelSnapshot Duel::snapshot() const {

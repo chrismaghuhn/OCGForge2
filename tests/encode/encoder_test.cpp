@@ -140,6 +140,98 @@ TEST_CASE("vector env restarts finished duels and is deterministic") {
     CHECK(play(1) == play(3));  // same duels whatever the thread count
 }
 
+namespace {
+
+VectorEnvConfig skip_forced_config() {
+    VectorEnvConfig config;
+    config.card_scripts_root = OCGFORGE_CACHE_DIR "/cardscripts";
+    config.card_data_tsv = OCGFORGE_CACHE_DIR "/card_data.tsv";
+    config.decks = {test::swordsoul(), test::salamangreat()};
+    config.num_envs = 4;
+    config.seed = 11;
+    config.skip_forced = true;
+    return config;
+}
+
+// The env's pending decision must be reachable by replaying its EnvInfo with a plain Duel: the
+// forced answers are listed, each move once.
+void check_replay(const VectorEnv& env, std::size_t i, const VectorEnvConfig& config) {
+    const auto info = env.info(i);
+    REQUIRE(info.actions.size() == env.duel_decision(i));
+    auto duel_config = test::duel_config(info.seed);
+    duel_config.starting_player = info.starting_player;
+    duel_config.deck0 = config.decks[info.decks.first];
+    duel_config.deck1 = config.decks[info.decks.second];
+    duel_config.max_decisions = config.max_decisions;
+    ygo::duel::Duel duel(std::move(duel_config));
+    for (const auto& key : info.actions) {
+        duel.act(key);
+    }
+    REQUIRE(!duel.finished());
+    CHECK(encode(*duel.observation(), duel.request(), {}) == env.decision(i));
+}
+
+}  // namespace
+
+TEST_CASE("vector env with skip_forced hands out real choices only") {
+    auto config = skip_forced_config();
+    const auto play = [&](std::size_t threads) {
+        config.threads = threads;
+        VectorEnv env(config, {});
+        std::mt19937_64 rng(1);
+        std::vector<std::int64_t> trace;
+        while (env.duels_finished() < 4) {
+            std::vector<std::int64_t> actions;
+            for (std::size_t i = 0; i < env.size(); ++i) {
+                check_shape(env.decision(i));
+                REQUIRE(env.decision(i).candidate_kind.size() > 1);
+                actions.push_back(static_cast<std::int64_t>(rng() % env.decision(i).candidate_kind.size()));
+            }
+            trace.insert(trace.end(), actions.begin(), actions.end());
+            const auto result = env.step(actions);
+            for (std::size_t i = 0; i < env.size(); ++i) {
+                if (result.done[i]) {
+                    CHECK(result.errors[i].empty());
+                }
+            }
+        }
+        CHECK(env.forced_decisions() > 0);
+        CHECK(env.duel_errors() == 0);
+        for (std::size_t i = 0; i < env.size(); ++i) {
+            check_replay(env, i, config);
+        }
+        return trace;
+    };
+    CHECK(play(1) == play(3));
+}
+
+TEST_CASE("vector env with skip_forced in recv/send mode") {
+    auto config = skip_forced_config();
+    config.threads = 2;
+    VectorEnv env(config, {});
+    std::mt19937_64 rng(2);
+    std::size_t handed_out = 0;
+    while (env.duels_finished() < 4) {
+        const auto ready = env.recv(1);
+        REQUIRE(!ready.empty());
+        std::vector<std::size_t> envs;
+        std::vector<std::int64_t> actions;
+        for (const auto& r : ready) {
+            CHECK(r.error.empty());
+            const auto& decision = env.decision(r.env);
+            REQUIRE(decision.candidate_kind.size() > 1);
+            if (++handed_out % 200 == 0) {
+                check_replay(env, r.env, config);
+            }
+            envs.push_back(r.env);
+            actions.push_back(static_cast<std::int64_t>(rng() % decision.candidate_kind.size()));
+        }
+        env.send(envs, actions);
+    }
+    CHECK(env.forced_decisions() > 0);
+    CHECK(env.duel_errors() == 0);
+}
+
 // The `selected` flag of a multi-card selection, checked against the picks actually
 // made (tracked by observation locator), not against the encoder's own marking.
 TEST_CASE("cards picked in an ongoing selection are marked selected and nothing else") {
