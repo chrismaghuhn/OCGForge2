@@ -137,14 +137,22 @@ def attach_reference_logprobs(reference: Model, steps: Sequence[dict], device: t
             step["ref_logprobs"] = row[: len(step["candidate_kind"])].clone()
 
 
+def _size(step: dict) -> tuple[int, int, int]:
+    """What collate pads: events, card tokens, candidates."""
+    return len(step.get("event_kind", ())), len(step["token_card"]), len(step["candidate_kind"])
+
+
 def ppo_update(model: Model, optimizer: torch.optim.Optimizer, steps: Sequence[dict], config: PPOConfig,
-               device: torch.device | str = "cpu", seed: int = 0) -> list[dict[str, float]]:
+               device: torch.device | str = "cpu", seed: int = 0, auxiliary=None) -> list[dict[str, float]]:
     """Clipped-PPO epochs over `steps` (from build_steps). Returns per-epoch mean stats; stops early
     once the approximate KL to the rollout policy exceeds 1.5 x target_kl.
 
     The forward passes run in eval mode: rollouts are played in eval mode, and dropout or name
     dropout here would make the probability ratio and KL measure masking noise, not policy change.
-    Gradients flow as usual."""
+    Gradients flow as usual.
+
+    `auxiliary()`, if given, is called once per minibatch, after its PPO gradient: it backpropagates an
+    extra term (e.g. imitating the search) into the same step and returns its stats, or None."""
     rng = random.Random(seed)
     history: list[dict[str, float]] = []
     for epoch in range(1, config.epochs + 1):
@@ -155,7 +163,9 @@ def ppo_update(model: Model, optimizer: torch.optim.Optimizer, steps: Sequence[d
         order = list(range(len(steps)))
         rng.shuffle(order)
         for start in range(0, len(order), config.batch_size):
-            chosen = order[start:start + config.batch_size]
+            # Similar sizes per micro-batch: collate pads to the largest sample, and the summed
+            # gradient of the batch does not depend on how it is split.
+            chosen = sorted(order[start:start + config.batch_size], key=lambda i: _size(steps[i]))
             optimizer.zero_grad(set_to_none=True)
             stats: dict[str, float] = defaultdict(float)
             for micro in range(0, len(chosen), config.micro_batch):
@@ -165,6 +175,9 @@ def ppo_update(model: Model, optimizer: torch.optim.Optimizer, steps: Sequence[d
                 (loss * share).backward()
                 for key, value in part_stats.items():
                     stats[key] += value * share
+            if auxiliary is not None:
+                for key, value in (auxiliary() or {}).items():
+                    stats[key] += value
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
             optimizer.step()
             for key, value in stats.items():

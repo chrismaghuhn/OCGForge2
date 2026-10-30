@@ -206,3 +206,61 @@ def test_league_envs_keep_only_the_learners_decisions(card_features):
             assert player == 1 - env_id % 2  # the opponent sits on seat env % 2
     assert {seat for env_id, seat in collector.pending if env_id >= 2} == {0, 1}
     assert sum(len(s) for s, _, _ in segments) < stats.decisions
+
+
+class _Recording:
+    """A policy that remembers how many candidates each decision it was asked about had."""
+
+    def __init__(self, policy):
+        self.policy, self.counts = policy, []
+
+    def on_batch(self, batch):
+        self.counts += [int(c) for c in batch["candidate_count"]]
+        return self.policy.on_batch(batch)
+
+
+def test_skip_forced_leaves_single_candidate_decisions_to_the_env(card_features):
+    torch.manual_seed(0)
+    model = Model(card_features, ModelConfig(d_model=32, heads=2, layers=1, ff=64, dropout=0.0))
+    env = rollout.vector_env(card_features, DECKS, num_envs=8, seed=6)
+    collector = rollout.AsyncCollector(env, batch_size=4, segment=16, skip_forced=True)
+    policy = _Recording(rollout.ModelPolicy(model))
+    segments, stats = collector.collect(policy, steps=600)
+    assert stats.forced_decisions > 0 and min(policy.counts) > 1  # the model never sees a forced decision
+    kept = [d for seat, _, _ in segments for d in seat]
+    assert kept and all(len(d["candidate_kind"]) > 1 for d in kept)
+    assert stats.learner_decisions + stats.forced_decisions == stats.decisions
+    steps = build_steps(segments, gamma=1.0, lam=0.95)
+    history = ppo_update(model, torch.optim.AdamW(model.parameters(), lr=1e-4), steps, PPOConfig(epochs=1, batch_size=256))
+    assert history and np.isfinite(history[0]["loss"])
+
+
+def test_ppo_update_does_not_depend_on_the_micro_batch_split(card_features):
+    torch.manual_seed(0)
+    model = Model(card_features, ModelConfig(d_model=32, heads=2, layers=1, ff=64, dropout=0.0))
+    env = rollout.vector_env(card_features, DECKS, num_envs=8, seed=7)
+    segments, _ = rollout.AsyncCollector(env, batch_size=4, segment=16).collect(rollout.ModelPolicy(model), steps=200)
+    steps = build_steps(segments, gamma=1.0, lam=0.95)
+    updated = []
+    for micro in (256, 16):  # one micro-batch vs many (sorted by size)
+        copy_ = Model(card_features, ModelConfig(d_model=32, heads=2, layers=1, ff=64, dropout=0.0))
+        copy_.load_state_dict(model.state_dict())
+        optimizer = torch.optim.SGD(copy_.parameters(), lr=0.1)
+        ppo_update(copy_, optimizer, steps, PPOConfig(epochs=1, batch_size=256, micro_batch=micro, target_kl=1e9))
+        updated.append(copy_.state_dict())
+    for name, value in updated[0].items():
+        assert torch.allclose(value, updated[1][name], atol=1e-5), name
+
+
+def test_skip_forced_env_counts_the_decisions_it_answered_in_cpp(card_features):
+    torch.manual_seed(0)
+    model = Model(card_features, ModelConfig(d_model=32, heads=2, layers=1, ff=64, dropout=0.0))
+    env = rollout.vector_env(card_features, DECKS, num_envs=8, seed=6, skip_forced=True)
+    collector = rollout.AsyncCollector(env, batch_size=4, segment=16, skip_forced=True)
+    policy = _Recording(rollout.ModelPolicy(model))
+    segments, stats = collector.collect(policy, steps=600)
+    assert min(policy.counts) > 1 and env.forced_decisions > 0
+    # the env's workers keep answering forced decisions of sent envs after collect returns
+    assert stats.decisions >= 600 and 0 < stats.forced_decisions <= env.forced_decisions
+    assert stats.learner_decisions + stats.forced_decisions == stats.decisions
+    assert all(len(d["candidate_kind"]) > 1 for seat, _, _ in segments for d in seat)

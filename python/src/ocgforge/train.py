@@ -89,6 +89,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--overlap", action="store_true",
                    help="collect the next iteration's duels while the GPU trains on the last ones (with the "
                         "weights from one update earlier); needs GPU memory for a second copy of the model")
+    p.add_argument("--search-data", type=Path,
+                   help="a directory that search workers fill with shards (expert generate --forever): each PPO "
+                        "minibatch also imitates a sample of the newest search targets")
+    p.add_argument("--search-coef", type=float, default=0.5, help="weight of that imitation loss")
+    p.add_argument("--search-batch", type=int, default=128, help="search samples per PPO minibatch")
+    p.add_argument("--search-window", type=int, default=50_000, help="newest search samples kept")
     p.add_argument("--reset-heads", action="store_true",
                    help="with --init: new policy (score) and value heads, the card and board encoder kept")
     p.add_argument("--extend-seen", action="store_true",
@@ -101,6 +107,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--tempo-start", type=int, default=5, help="last turn (both players' turns) at full weight")
     p.add_argument("--tempo-floor", type=float, default=0.6, help="lowest weight of a result")
     p.add_argument("--tempo-losses", action="store_true", help="shrink losses too (default: wins only)")
+    p.add_argument("--skip-forced", action="store_true",
+                   help="answer single-candidate decisions without the model and leave them out of training "
+                        "(about a third of all decisions; --steps still counts every decision)")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--init", type=Path, help="start from this checkpoint's weights (e.g. <run>/latest)")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -138,7 +147,7 @@ def build_model(args: argparse.Namespace) -> Model:
 # Settings a resumed run keeps from run.json unless given again: its origin and its reward and
 # exploration schedules (dropping them silently would change what the run optimizes mid-way).
 RESUMED_SETTINGS = {"init": None, "tempo_slope": 0.0, "tempo_start": 5, "tempo_floor": 0.6, "tempo_losses": False,
-                    "entropy_start": None, "entropy_ramp": 0}
+                    "entropy_start": None, "entropy_ramp": 0, "skip_forced": False}
 
 
 def restore_run_settings(args: argparse.Namespace, run: dict) -> None:
@@ -161,6 +170,28 @@ def extend_seen(model: Model, decks: list[Path]) -> int:
         model.name.weight[new] = model.name.weight[UNK].clone()
     model.card_features.seen[new] = True
     return len(new)
+
+
+def search_auxiliary(model: Model, data, args: argparse.Namespace, micro_batch: int):
+    """PPO's auxiliary term: cross-entropy to a sample of the newest search targets, weighted by
+    --search-coef and run in micro-batches like the PPO loss."""
+    from .expert import _batch, search_policy_loss
+
+    def run():
+        samples = data.sample(args.search_batch)
+        if not samples:
+            return None
+        stats = {"searchLoss": 0.0, "searchAgree": 0.0}
+        for start in range(0, len(samples), micro_batch):
+            part = samples[start:start + micro_batch]
+            batch, targets, _ = _batch(part, args.device)
+            loss, part_stats = search_policy_loss(model, batch, targets)
+            (loss * args.search_coef * len(part) / len(samples)).backward()
+            for key in stats:
+                stats[key] += part_stats[key] * len(part) / len(samples)
+        return stats
+
+    return run
 
 
 def reset_heads(model: Model) -> None:
@@ -350,7 +381,8 @@ def main(argv=None) -> None:
           flush=True)
 
     env = rollout.vector_env(model.card_features, args.decks, num_envs=args.envs,
-                             seed=args.seed * 1_000_003 + iteration, threads=args.threads)
+                             seed=args.seed * 1_000_003 + iteration, threads=args.threads,
+                             skip_forced=args.skip_forced)
     league = rollout.League(args.league_share, args.league_size, seed=args.seed)
     first: Model | None = None  # first and latest arena checkpoint, for the arena
     previous: Model | None = None
@@ -382,7 +414,7 @@ def main(argv=None) -> None:
                                        league=league if args.league_share > 0 else None, card_usage=usage,
                                        extra_usage=extra,
                                        tempo=rollout.Tempo(args.tempo_start, args.tempo_slope, args.tempo_floor, args.tempo_losses)
-                                       if args.tempo_slope > 0 else None)
+                                       if args.tempo_slope > 0 else None, skip_forced=args.skip_forced)
     names = card_names(model.card_features)
     # With --overlap an actor copy plays the next iteration's duels while `model` trains; it gets the
     # learner's weights before each collection, so its data is one update old (PPO's ratio uses the
@@ -392,6 +424,12 @@ def main(argv=None) -> None:
     prefetch = Prefetch(collector, policy, args.steps) if args.overlap else None
     admitting = None  # an arena checkpoint for the league, admitted while no collection runs
     deadline = time.time() + args.hours * 3600 if args.hours > 0 else None
+    search_data = None
+    if args.search_data is not None:
+        from .expert import SearchData
+
+        args.search_data.mkdir(parents=True, exist_ok=True)
+        search_data = SearchData(args.search_data, args.search_window, seed=args.seed)
     saved_iteration, failing = iteration, 0
     loops = env.blocked_answers, env.loop_losses  # duels end between iterations too: carry the baseline
     try:
@@ -416,7 +454,12 @@ def main(argv=None) -> None:
             collected = time.time()
             steps = build_steps(segments, ppo.gamma, ppo.lam)
             config = replace(ppo, entropy_coef=entropy_coef(args, iteration))
-            history = ppo_update(model, optimizer, steps, config, args.device, seed=args.seed * 1_000_003 + iteration + 1)
+            auxiliary = None
+            if search_data is not None:
+                search_new = search_data.refresh()
+                auxiliary = search_auxiliary(model, search_data, args, ppo.micro_batch)
+            history = ppo_update(model, optimizer, steps, config, args.device, seed=args.seed * 1_000_003 + iteration + 1,
+                                 auxiliary=auxiliary)
             iteration += 1
             done = time.time()
             finished = stats.duels + stats.league_duels + stats.errors
@@ -429,7 +472,9 @@ def main(argv=None) -> None:
                     # loop protection: answers blocked and duels lost by looping anyway
                     "blockedAnswers": env.blocked_answers - loops[0],
                     "loopLosses": env.loop_losses - loops[1],
+                    "forcedDecisions": stats.forced_decisions,
                     "leagueDataShare": round(stats.league_decisions / max(1, stats.learner_decisions), 3),
+                    **({"searchSamples": len(search_data.samples), "searchNew": search_new} if search_data else {}),
                     "wins": stats.wins, "league": league.scores(), "entropyCoef": round(config.entropy_coef, 5),
                     "endTurn": round(float(np.mean(stats.end_turns)), 2) if stats.end_turns else None,
                     "endByTurn5": round(float(np.mean(np.array(stats.end_turns) <= 5)), 3) if stats.end_turns else None,
