@@ -26,8 +26,18 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_SOURCE_DIR}/third_party/deps.json" "${CMAKE_SOURCE_DIR}/tools/setup_deps.py")
 
 # --- ocgcore (rules engine + bundled Lua, compiled as C++) --------------------
+# The pinned ocgcore is YGO-Gym's fork (duel cloning, checkpoints, card re-identification), see
+# docs/engine-clone.md. Its clone/ sources need Boost 1.83 headers (interprocess containers): the
+# system's Boost when it is exactly 1.83, else the fork's dependencies.cmake downloads the tarball.
 set(OCGCORE_DIR "${OCGFORGE_CACHE}/ocgcore")
 file(GLOB OCGCORE_SOURCES "${OCGCORE_DIR}/*.cpp")
+include("${OCGCORE_DIR}/clone/sources.cmake")      # OCG_CLONE_SOURCES, target ocg_clone_boost
+include("${OCGCORE_DIR}/identity/sources.cmake")   # OCG_IDENTITY_SOURCES
+foreach(source IN LISTS OCG_CLONE_SOURCES OCG_IDENTITY_SOURCES)
+    cmake_path(NORMAL_PATH source)  # clone/sources.cmake names ../clone.cpp, which the glob has too
+    list(APPEND OCGCORE_SOURCES "${source}")
+endforeach()
+list(REMOVE_DUPLICATES OCGCORE_SOURCES)
 # Only the Lua modules ocgcore needs (no os, package or debug libraries).
 set(LUA_MODULES lapi lauxlib lbaselib lcode lctype ldebug ldo ldump lfunc lgc liolib llex
     lmathlib lmem lobject lopcodes lparser lstate lstring lstrlib ltable ltablib ltm lundump lvm lzio)
@@ -38,6 +48,7 @@ set_source_files_properties(${LUA_SOURCES} PROPERTIES LANGUAGE CXX)
 add_library(ocgcore STATIC ${OCGCORE_SOURCES} ${LUA_SOURCES})
 target_include_directories(ocgcore SYSTEM PUBLIC "${OCGCORE_DIR}" "${OCGCORE_DIR}/lua/src")
 target_compile_options(ocgcore PRIVATE "-include${OCGCORE_DIR}/lua/luaconf-customize.h" -w)
+target_link_libraries(ocgcore PRIVATE ocg_clone_boost)
 
 # --- OCGForge ----------------------------------------------------------------
 add_library(ygo STATIC

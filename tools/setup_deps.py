@@ -33,11 +33,23 @@ def checkout(name: str, spec: dict, cache: Path) -> Path:
         git("clone", "--filter=blob:none", "--no-checkout", spec["repository"], str(path))
     head = git("rev-parse", "HEAD", cwd=path, check=False).stdout.strip()
     # A fresh --no-checkout clone has no files yet, even when HEAD already is the pinned commit.
-    if fresh or head != spec["commit"]:
+    moved = fresh or head != spec["commit"]
+    if moved:
+        # The pin may have moved to another repository (e.g. upstream ocgcore -> a fork).
+        git("remote", "set-url", "origin", spec["repository"], cwd=path)
         git("fetch", "origin", spec["commit"], cwd=path, check=False)
         git("checkout", "--force", "--detach", spec["commit"], cwd=path)
+        (path / ".ocgforge-patches").unlink(missing_ok=True)  # the checkout dropped our patches
     if spec.get("submodules"):
-        git("submodule", "update", "--init", "--recursive", cwd=path)
+        git("submodule", "sync", "--recursive", cwd=path)
+        # --force only after a move: it would also drop our patches inside a submodule (lua/src).
+        git("submodule", "update", "--init", "--recursive", *(["--force"] if moved else []), cwd=path)
+    for sub in [spec["lua"]] if "lua" in spec else []:
+        # The submodule commit is fixed by the pinned commit; deps.json records it so a fork update
+        # that also moves the Lua fork is visible in review.
+        actual = git("rev-parse", "HEAD", cwd=path / sub["path"]).stdout.strip()
+        if actual != sub["commit"]:
+            raise SystemExit(f"{name}/{sub['path']} is at {actual}, deps.json pins {sub['commit']}")
     return path
 
 

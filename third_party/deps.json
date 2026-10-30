@@ -1,13 +1,20 @@
 {
   "ocgcore": {
-    "repository": "https://github.com/edo9300/ygopro-core.git",
-    "commit": "baa3881d0bae48e9994f915f5c931be53c1ba8ef",
+    "repository": "https://github.com/rifa-456/ygopro-core.git",
+    "commit": "230651623a5e57bc7a7096aab04c3ae6d52da205",
+    "upstream_commit": "baa3881d0bae48e9994f915f5c931be53c1ba8ef",
     "submodules": true,
+    "lua": {
+      "path": "lua/src",
+      "repository": "https://github.com/rifa-456/ygo-lua.git",
+      "commit": "b449bd6dd97b0b7265efb20d47e7a6a26e3db520"
+    },
     "patches": [
       "0001-fix-overlay-seq-parent-query.patch",
       "0002-add-starting-player-control.patch",
       "0003-memoize-sum-greater-check.patch",
-      "0004-lua-call-budget.patch"
+      "0004-lua-call-budget.patch",
+      "0005-own-applied-chain-counters.patch"
     ]
   },
   "cardscripts": {
