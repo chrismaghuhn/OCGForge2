@@ -137,6 +137,11 @@ def attach_reference_logprobs(reference: Model, steps: Sequence[dict], device: t
             step["ref_logprobs"] = row[: len(step["candidate_kind"])].clone()
 
 
+def _size(step: dict) -> tuple[int, int, int]:
+    """What collate pads: events, card tokens, candidates."""
+    return len(step.get("event_kind", ())), len(step["token_card"]), len(step["candidate_kind"])
+
+
 def ppo_update(model: Model, optimizer: torch.optim.Optimizer, steps: Sequence[dict], config: PPOConfig,
                device: torch.device | str = "cpu", seed: int = 0) -> list[dict[str, float]]:
     """Clipped-PPO epochs over `steps` (from build_steps). Returns per-epoch mean stats; stops early
@@ -155,7 +160,9 @@ def ppo_update(model: Model, optimizer: torch.optim.Optimizer, steps: Sequence[d
         order = list(range(len(steps)))
         rng.shuffle(order)
         for start in range(0, len(order), config.batch_size):
-            chosen = order[start:start + config.batch_size]
+            # Similar sizes per micro-batch: collate pads to the largest sample, and the summed
+            # gradient of the batch does not depend on how it is split.
+            chosen = sorted(order[start:start + config.batch_size], key=lambda i: _size(steps[i]))
             optimizer.zero_grad(set_to_none=True)
             stats: dict[str, float] = defaultdict(float)
             for micro in range(0, len(chosen), config.micro_batch):
