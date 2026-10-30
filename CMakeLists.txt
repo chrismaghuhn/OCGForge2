@@ -12,7 +12,7 @@ option(OCGFORGE_BUILD_PYTHON "Build the ocgforge._core Python module" OFF)
 
 # --- Pinned third-party inputs ------------------------------------------------
 # Fetches ocgcore, CardScripts and BabelCDB into .cache/ (see third_party/deps.json),
-# applies our ocgcore patches and writes .cache/card_data.tsv for the decks.
+# applies our ocgcore and card script patches and writes .cache/card_data.tsv for the decks.
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set(OCGFORGE_CACHE "${CMAKE_SOURCE_DIR}/.cache")
 execute_process(
@@ -22,8 +22,10 @@ execute_process(
 if(NOT setup_result EQUAL 0)
     message(FATAL_ERROR "tools/setup_deps.py failed")
 endif()
+# A patch edited in place (same name in deps.json) must also re-run setup_deps.py.
+file(GLOB_RECURSE ocgforge_patches CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/third_party/patches/*")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    "${CMAKE_SOURCE_DIR}/third_party/deps.json" "${CMAKE_SOURCE_DIR}/tools/setup_deps.py")
+    "${CMAKE_SOURCE_DIR}/third_party/deps.json" "${CMAKE_SOURCE_DIR}/tools/setup_deps.py" ${ocgforge_patches})
 
 # --- ocgcore (rules engine + bundled Lua, compiled as C++) --------------------
 # The pinned ocgcore is YGO-Gym's fork (duel cloning, checkpoints, card re-identification), see

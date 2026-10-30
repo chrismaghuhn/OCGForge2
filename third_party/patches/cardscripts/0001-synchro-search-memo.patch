@@ -1,0 +1,84 @@
+diff --git a/proc_synchro.lua b/proc_synchro.lua
+index edfec104..b1ed6829 100644
+--- a/proc_synchro.lua
++++ b/proc_synchro.lua
+@@ -154,7 +154,10 @@ function Synchro.Condition(f1,min1,max1,f2,min2,max2,sub1,sub2,req1,req2,reqm)
+ 						end
+ 					end
+ 					local lv=c:GetLevel()
++					local outer_memo=Synchro.SearchMemo
++					Synchro.SearchMemo={}
+ 					local res=tg:IsExists(Synchro.CheckP41,1,nil,tg,ntg,Group.CreateGroup(),Group.CreateGroup(),Group.CreateGroup(),min1,max1,min2,max2,req1,req2,reqm,lv,c,tp,pg,mgchk,min,max)
++					Synchro.SearchMemo=outer_memo
+ 					local hg=Duel.GetMatchingGroup(Card.IsHasEffect,tp,LOCATION_HAND+LOCATION_GRAVE,0,nil,EFFECT_HAND_SYNCHRO+EFFECT_SYNCHRO_CHECK)
+ 					aux.ResetEffects(hg,EFFECT_HAND_SYNCHRO+EFFECT_SYNCHRO_CHECK)
+ 					return res
+@@ -302,6 +305,20 @@ function Synchro.CheckP32(c,g,tsg,ntsg,sg,f2,sub2,min2,max2,req2,reqm,lv,sc,tp,p
+ 	end
+ 	return res
+ end
++--Synchro.Condition reaches the same material set once for every order its recursion can pick the
++--cards in. The checks of each pick still run for every order; what follows a pick only depends on
++--the picked tuners and non-tuners and on the candidates left (sg is their union), so while
++--Synchro.Condition searches (SearchMemo set) it is computed once per such state.
++function Synchro.SearchKey(step,tsg,ntsg,tg,ntg)
++	local parts={step}
++	for _,g in ipairs({tsg,ntsg,tg or Group.CreateGroup(),ntg}) do
++		local ids={}
++		for tc in g:Iter() do ids[#ids+1]=tc:GetFieldID() end
++		table.sort(ids)
++		parts[#parts+1]=table.concat(ids,",")
++	end
++	return table.concat(parts,";")
++end
+ function Synchro.CheckP41(c,tg,ntg,tsg,ntsg,sg,min1,max1,min2,max2,req1,req2,reqm,lv,sc,tp,pg,mgchk,min,max)
+ 	local res
+ 	local trg=Group.CreateGroup()
+@@ -348,6 +365,10 @@ function Synchro.CheckP41(c,tg,ntg,tsg,ntsg,sg,min1,max1,min2,max2,req1,req2,req
+ 	ntg:Sub(ntrg)
+ 	tsg:AddCard(c)
+ 	sg:AddCard(c)
++	local key=Synchro.SearchMemo and Synchro.SearchKey(41,tsg,ntsg,tg,ntg)
++	if key and Synchro.SearchMemo[key]~=nil then
++		res=Synchro.SearchMemo[key]
++	else
+ 	local tsg_count=#tsg
+ 	if max and (tsg_count>max or (max-tsg_count)<min2) then
+ 		res = false
+@@ -363,6 +384,8 @@ function Synchro.CheckP41(c,tg,ntg,tsg,ntsg,sg,min1,max1,min2,max2,req1,req2,req
+ 		res=(not req1 or req1(tsg,sc,tp))
+ 			and ntg:IsExists(Synchro.CheckP42,1,sg,ntg,tsg,ntsg,sg,min2,max2,req2,reqm,lv,sc,tp,pg,mgchk,min,max)
+ 	end
++	if key then Synchro.SearchMemo[key]=res end
++	end
+ 	tg:Merge(trg)
+ 	ntg:Merge(ntrg)
+ 	tsg:RemoveCard(c)
+@@ -410,6 +433,10 @@ function Synchro.CheckP42(c,ntg,tsg,ntsg,sg,min2,max2,req2,reqm,lv,sc,tp,pg,mgch
+ 	ntg:Sub(ntrg)
+ 	ntsg:AddCard(c)
+ 	sg:AddCard(c)
++	local key=Synchro.SearchMemo and Synchro.SearchKey(42,tsg,ntsg,nil,ntg)
++	if key and Synchro.SearchMemo[key]~=nil then
++		res=Synchro.SearchMemo[key]
++	else
+ 	local tsg_count=#tsg
+ 	local ntsg_count=#ntsg
+ 	if max and (tsg_count+ntsg_count)>max then
+@@ -424,6 +451,8 @@ function Synchro.CheckP42(c,ntg,tsg,ntsg,sg,min2,max2,req2,reqm,lv,sc,tp,pg,mgch
+ 		res=(not min or (tsg_count+ntsg_count)>=min) and (not req2 or req2(ntsg,sc,tp)) and (not reqm or reqm(sg,sc,tp))
+ 			and sg:Includes(pg) and Synchro.CheckP43(tsg,ntsg,sg,lv,sc,tp)
+ 	end
++	if key then Synchro.SearchMemo[key]=res end
++	end
+ 	ntg:Merge(ntrg)
+ 	ntsg:RemoveCard(c)
+ 	sg:RemoveCard(c)
+@@ -459,6 +488,7 @@ function Synchro.CheckP43(tsg,ntsg,sg,lv,sc,tp)
+ end
+ function Synchro.Target(f1,min1,max1,f2,min2,max2,sub1,sub2,req1,req2,reqm)
+ 	return	function(e,tp,eg,ep,ev,re,r,rp,chk,c,smat,mg,min,max)
++				Synchro.SearchMemo=nil --only Synchro.Condition's search is remembered (also after an error in it)
+ 				local sg=Group.CreateGroup()
+ 				local lv=c:GetLevel()
+ 				local mgchk
