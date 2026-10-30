@@ -138,6 +138,8 @@ void VectorEnv::reset(Slot& slot) {
             slot.info.actions.clear();
         }
         try {
+            // Destroy the old duel first, so a slot never holds two Lua states at once.
+            slot.duel.reset();
             slot.duel = std::make_unique<duel::Duel>(std::move(config));
             if (slot.duel->finished()) {
                 continue;  // ended without a single decision; just start another
@@ -157,6 +159,16 @@ void VectorEnv::reset(Slot& slot) {
             }
         }
     }
+}
+
+// The env's duel; none after its last restart failed (reset destroys the old duel first).
+const duel::Duel& VectorEnv::live_duel(std::size_t env) const {
+    const auto& slot = *slots_.at(env);
+    if (!slot.duel) {
+        throw std::logic_error("env " + std::to_string(env) + " has no duel: starting a new one failed (" +
+                               last_start_failure() + ")");
+    }
+    return *slot.duel;
 }
 
 // A new duel whose first decisions are forced plays them here. If it ends or fails meanwhile, it
@@ -222,7 +234,7 @@ const EncodedDecision& VectorEnv::decision(std::size_t env) const {
 
 std::uint64_t VectorEnv::duel_decision(std::size_t env) const {
     require_handed_out(env);
-    return slots_.at(env)->duel->decision_count();
+    return live_duel(env).decision_count();
 }
 
 std::string VectorEnv::last_start_failure() const {
@@ -242,7 +254,7 @@ std::pair<std::size_t, std::size_t> VectorEnv::decks(std::size_t env) const {
 }
 
 void VectorEnv::check_action(std::size_t env, std::int64_t action) const {
-    const auto count = static_cast<std::int64_t>(slots_.at(env)->duel->request().candidates.size());
+    const auto count = static_cast<std::int64_t>(live_duel(env).request().candidates.size());
     if (action < 0 || action >= count) {
         throw std::out_of_range("action " + std::to_string(action) + " for env " + std::to_string(env) +
                                 " is not a candidate index below " + std::to_string(count));

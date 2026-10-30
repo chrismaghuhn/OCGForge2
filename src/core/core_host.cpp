@@ -1,6 +1,7 @@
 #include "ygo/core/core_host.hpp"
 
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -76,6 +77,36 @@ void CoreHost::throw_if_callback_error(const char* operation) const {
     }
 }
 
+// A card script went past one of our Lua budgets (ocgcore patches 0004 and 0007) and was cut
+// off with a Lua error; the duel state can no longer be trusted.
+void CoreHost::throw_if_lua_budget_exceeded(const char* operation) const {
+    if (OCG_DuelLuaBudgetExceeded(impl_->duel) != 0) {
+        throw CoreError(CoreErrorCode::Lifecycle, operation, "Lua call budget exceeded");
+    }
+    if (OCG_DuelLuaMemoryExceeded(impl_->duel) != 0) {
+        throw CoreError(CoreErrorCode::Lifecycle, operation,
+                        "Lua memory budget exceeded (" + std::to_string(config_.lua_memory_limit) + " bytes)");
+    }
+}
+
+// OCGFORGE_LUA_GC=gen|inc forces the Lua collector for every duel of the process (A/B runs), over
+// CoreHostConfig::lua_generational_gc. Read once; any other value is an error, so a typo cannot
+// quietly measure the default twice.
+static std::optional<bool> lua_gc_override() {
+    static const std::optional<bool> mode = [] () -> std::optional<bool> {
+        const char* value = std::getenv("OCGFORGE_LUA_GC");
+        if (value == nullptr || *value == '\0') {
+            return std::nullopt;
+        }
+        const std::string text(value);
+        if (text == "gen" || text == "inc") {
+            return text == "gen";
+        }
+        throw CoreError(CoreErrorCode::Lifecycle, "OCGFORGE_LUA_GC", "expected gen or inc, got " + text);
+    }();
+    return mode;
+}
+
 CoreHost::CoreHost(CoreHostConfig config) : config_(std::move(config)) {
     OCG_GetVersion(&api_major_, &api_minor_);
     if (api_major_ != 11 || api_minor_ != 1) {  // 11.1: the YGO-Gym fork (cloning)
@@ -114,10 +145,16 @@ CoreHost::CoreHost(CoreHostConfig config) : config_(std::move(config)) {
         if (status != OCG_DUEL_CREATION_SUCCESS || impl_->duel == nullptr) {
             throw CoreError(CoreErrorCode::Lifecycle, "OCG_CreateDuel", "status=" + std::to_string(status));
         }
+        // Only now: the limit must never apply while the Lua state is being built.
+        OCG_DuelSetLuaMemoryLimit(impl_->duel, config_.lua_memory_limit);
+        if (lua_gc_override().value_or(config_.lua_generational_gc)) {  // the state is built and no Lua code has run yet
+            OCG_DuelSetLuaGenerationalGC(impl_->duel, 1);
+        }
 
         const auto load_global_script = [this](const std::string& name) {
             std::string error;
             if (impl_->scripts.load(impl_->duel, name.c_str(), &error) == 0) {
+                throw_if_lua_budget_exceeded("load_global_script");
                 throw CoreError(CoreErrorCode::Callback, "load_global_script", error.empty() ? name : error);
             }
         };
@@ -201,6 +238,7 @@ void CoreHost::load_deck(std::uint8_t team, const Deck& deck) {
         info.pos = POS_FACEDOWN_DEFENSE;
         OCG_DuelNewCard(impl_->duel, &info);
         throw_if_callback_error("OCG_DuelNewCard");
+        throw_if_lua_budget_exceeded("OCG_DuelNewCard");
     }
     sequence = 0;
     for (const std::uint32_t code : deck.extra_deck) {
@@ -214,6 +252,7 @@ void CoreHost::load_deck(std::uint8_t team, const Deck& deck) {
         info.pos = POS_FACEDOWN_DEFENSE;
         OCG_DuelNewCard(impl_->duel, &info);
         throw_if_callback_error("OCG_DuelNewCard");
+        throw_if_lua_budget_exceeded("OCG_DuelNewCard");
     }
 }
 
@@ -232,6 +271,7 @@ void CoreHost::load_fixture_card(std::uint8_t team, std::uint32_t code, std::uin
     info.pos = position;
     OCG_DuelNewCard(impl_->duel, &info);
     throw_if_callback_error("OCG_DuelNewCard");
+    throw_if_lua_budget_exceeded("OCG_DuelNewCard");
 }
 
 void CoreHost::load_fixture_script(const std::filesystem::path& path) {
@@ -249,6 +289,7 @@ void CoreHost::load_fixture_script(const std::filesystem::path& path) {
 
 void CoreHost::load_script_text(const std::string& name, const std::string& text) {
     if (OCG_LoadScript(impl_->duel, text.data(), static_cast<std::uint32_t>(text.size()), name.c_str()) == 0) {
+        throw_if_lua_budget_exceeded("OCG_LoadScript");
         throw CoreError(CoreErrorCode::Callback, "OCG_LoadScript", "script rejected: " + name);
     }
     throw_if_callback_error("OCG_LoadScript");
@@ -264,17 +305,14 @@ void CoreHost::start_duel() {
     }
     OCG_StartDuel(impl_->duel);
     throw_if_callback_error("OCG_StartDuel");
+    throw_if_lua_budget_exceeded("OCG_StartDuel");
 }
 
 ProcessResult CoreHost::process() {
     ++process_call_count_;
     const int status = OCG_DuelProcess(impl_->duel);
     throw_if_callback_error("OCG_DuelProcess");
-    if (OCG_DuelLuaBudgetExceeded(impl_->duel) != 0) {
-        // A card script searched too many combinations and was cut off (our ocgcore
-        // patch 0004); the duel state can no longer be trusted.
-        throw CoreError(CoreErrorCode::Lifecycle, "OCG_DuelProcess", "Lua call budget exceeded");
-    }
+    throw_if_lua_budget_exceeded("OCG_DuelProcess");
     std::uint32_t length = 0;
     auto* raw = static_cast<const std::uint8_t*>(OCG_DuelGetMessage(impl_->duel, &length));
     ProcessResult result;
@@ -332,6 +370,16 @@ std::vector<std::uint8_t> CoreHost::query_field() const {
 CoreHostMetrics CoreHost::metrics() const noexcept {
     return CoreHostMetrics{process_call_count_, duel_query_calls_, duel_query_location_calls_, duel_query_field_calls_,
                            duel_query_count_calls_, impl_->scripts.reader_requests(), impl_->scripts.successful_loads()};
+}
+
+void CoreHost::collect_lua_garbage() {
+    OCG_DuelCollectLuaGarbage(impl_->duel);
+    throw_if_callback_error("OCG_DuelCollectLuaGarbage");
+}
+
+LuaMemory CoreHost::lua_memory() const noexcept {
+    return LuaMemory{OCG_DuelLuaMemory(impl_->duel), OCG_DuelLuaMemoryPeak(impl_->duel),
+                     OCG_DuelLuaHeapExtent(impl_->duel)};
 }
 
 std::optional<StaticCardData> CoreHost::static_card_data(std::uint32_t code) const {

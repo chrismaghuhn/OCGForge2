@@ -276,6 +276,7 @@ NB_MODULE(_core, m) {
                 config.seed = seed;
                 config.starting_player = starting_player;
                 config.max_decisions = max_decisions;
+                nb::gil_scoped_release release;  // creating a duel takes milliseconds of engine work
                 new (self) Duel(std::move(config));
             },
             "card_scripts_root"_a, "card_data_tsv"_a, "deck0"_a, "deck1"_a, "seed"_a, "starting_player"_a,
@@ -292,6 +293,7 @@ NB_MODULE(_core, m) {
                 config.fixture_script = script;
                 config.seed = seed;
                 config.starting_player = starting_player;
+                nb::gil_scoped_release release;
                 return std::make_unique<Duel>(std::move(config));
             },
             "card_scripts_root"_a, "card_data_tsv"_a, "deck0"_a, "deck1"_a, "script"_a, "seed"_a, "starting_player"_a,
@@ -328,6 +330,20 @@ NB_MODULE(_core, m) {
              "clone is not a sampled world. Faster than replaying the actions into a new Duel. Clones of "
              "one duel may be made from several threads at once while nothing acts on it. Raises on a "
              "finished duel.")
+        .def_prop_ro("lua_memory",
+                     [](const Duel& d) {
+                         const auto memory = d.lua_memory();
+                         nb::dict out;
+                         out["used"] = memory.used;
+                         out["peak"] = memory.peak;
+                         out["heap_extent"] = memory.heap_extent;
+                         return out;
+                     },
+                     "Bytes of the engine's Lua state: used now (garbage included), peak, and the size of the "
+                     "heap region a clone copies.")
+        .def("collect_lua_garbage", &Duel::collect_lua_garbage, nb::call_guard<nb::gil_scoped_release>(),
+             "A full collection of the engine's Lua heap. Play is unchanged; clones made afterwards have less "
+             "garbage to fix up.")
         .def_prop_ro("reseeds", &Duel::reseeds, "Seeds clone(seed) reseeded this duel with, oldest first.")
         .def_prop_ro("finished", &Duel::finished)
         .def_prop_ro("winner", [](const Duel& d) -> std::optional<std::uint8_t> {
@@ -356,7 +372,12 @@ NB_MODULE(_core, m) {
             if (d.observation() == nullptr) {
                 throw std::logic_error("Duel.encode needs a pending decision (the duel is over)");
             }
-            return to_dict(ygo::encode::encode(*d.observation(), d.request(), card_index));
+            ygo::encode::EncodedDecision decision;
+            {
+                nb::gil_scoped_release release;
+                decision = ygo::encode::encode(*d.observation(), d.request(), card_index);
+            }
+            return to_dict(decision);
         }, "card_index"_a, "The pending decision as model input (one row, like features.row).");
 
     using ygo::client::ClientDuel;

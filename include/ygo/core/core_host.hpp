@@ -27,6 +27,14 @@ struct CoreHostConfig {
     std::uint32_t draw_count_per_turn = 1;
     std::optional<std::uint8_t> starting_player;
     std::vector<std::uint32_t> required_script_codes;
+    // Lua memory budget per duel in bytes (0: none), armed right after the Lua state is created.
+    // A duel whose scripts allocate past it fails like one past the Lua call budget.
+    std::uint64_t lua_memory_limit = kDefaultLuaMemoryLimit;
+    static constexpr std::uint64_t kDefaultLuaMemoryLimit = 64ull << 20;
+    // Lua's generational collector instead of the incremental one (set right after the state is
+    // created; ocgcore patch 0008). Faster and smaller heaps for card scripts, see
+    // docs/ARCHITECTURE.md. The environment variable OCGFORGE_LUA_GC=inc|gen overrides it (A/B runs).
+    bool lua_generational_gc = true;
 
     std::uint8_t effective_starting_player() const noexcept {
         return starting_player.value_or(0);
@@ -46,6 +54,12 @@ struct CoreHostMetrics {
     std::size_t duel_query_count_calls = 0;
     std::size_t script_reader_requests = 0;
     std::size_t script_loads = 0;
+};
+
+struct LuaMemory {
+    std::uint64_t used = 0;         // bytes the Lua state holds now (garbage included)
+    std::uint64_t peak = 0;         // the most it ever held
+    std::uint64_t heap_extent = 0;  // size of the fork's heap region, which a clone copies
 };
 
 class CoreHost final {
@@ -84,6 +98,10 @@ public:
     std::size_t response_submission_count() const noexcept { return response_submission_count_; }
     std::size_t process_call_count() const noexcept { return process_call_count_; }
     CoreHostMetrics metrics() const noexcept;
+    LuaMemory lua_memory() const noexcept;
+    // A full Lua collection (only while a decision is pending), e.g. on a private clone that is
+    // about to be cloned many times.
+    void collect_lua_garbage();
     int api_major() const noexcept { return api_major_; }
     int api_minor() const noexcept { return api_minor_; }
 
@@ -91,6 +109,7 @@ private:
     struct Impl;
     CoreHost(const CoreHost& source, Impl* impl);
     void throw_if_callback_error(const char* operation) const;
+    void throw_if_lua_budget_exceeded(const char* operation) const;
     CoreHostConfig config_;
     Impl* impl_ = nullptr;
     std::size_t response_submission_count_ = 0;

@@ -50,6 +50,8 @@ Both forks are AGPL-3.0-or-later like upstream; their license headers are kept.
   allocates are registered with the duel (the fork's `cloned_chain_counters` set), so a duel
   destroyed in the middle of a chain frees them. Upstream leaks them then; with clones,
   discarding a duel mid-chain is routine (found by ASan in the clone tests).
+- Patch 0007 (Lua memory budget, `docs/ARCHITECTURE.md`): its counters live in Lua's
+  `global_State`, inside the heap region a clone copies, so a clone keeps them (tested).
 - `CMakeLists.txt`: compiles the fork's `clone/` and `identity/` sources and links the Boost
   headers (`ocg_clone_boost`).
 - `CoreHost::clone`: a new host whose card data is shared (read-only) and whose script store,
@@ -113,6 +115,26 @@ Each clone holds ~4.7 MB resident (200 clones of one decision, measured by RSS).
 The slow lockstep case covered 1077 clone points and 63,133 decisions in lockstep without a
 divergence. In one duel a card script hit the Lua call budget (patch 0004); it did so in the
 original and the clone alike, with the same error.
+
+## Clone cost and the Lua heap
+
+The fork keeps every Lua allocation in one region (`clone/lua/region.cpp`: Boost.Interprocess
+segment with per-size free lists). Freed blocks are reused but never compacted, and the segment
+never shrinks. A clone `memcpy`s the whole segment up to its high-water mark (`extent()`, not the
+capacity, not just live bytes) and then fixes up every GC object on Lua's lists, garbage that is
+not yet swept included. So clone time follows the heap: over 829 clone points of 6 random duels,
+clone ms ~ -0.8 + 1.0 x region MB (r = 0.89) and ~ -3.2 + 3.2 x used MB (r = 0.91); RSS per clone
+equals the region size. `Duel.lua_memory` reports both (`used`, `heap_extent`).
+
+- Generational GC (default, see `docs/ARCHITECTURE.md`) keeps the region smaller late in a duel
+  (max 5.4 vs 8.9 MB): clone p90 6.2 vs 7.9 ms, median unchanged (4.9 ms).
+- Template for fan-out: clone the root once, `collect_lua_garbage()` on that private copy (never
+  on the source), then clone the template N times. Over 18 points (decision 50/300/800 of 6
+  duels): used 2.0 -> 1.8 MB, clone median 3.19 -> 2.51 ms (-21%), the collection costs ~0.5 ms;
+  RSS per clone hardly changes (4.06 -> 3.88 MB) because the region keeps its size. Clones of the
+  template played on in lockstep with clones of the root in 18/18 cases (to the end of the duel,
+  incl. two that hit the Lua call budget at the same decision); `tests/duel/lua_memory_test.cpp`
+  checks it too. Worth it from about 2 clones per template.
 
 ## Updating the fork
 

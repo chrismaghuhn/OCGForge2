@@ -9,12 +9,14 @@ include(Catch)
 
 add_executable(ocgforge_tests
     core/deck_test.cpp
+    core/script_cache_test.cpp
     client/client_duel_test.cpp
     client/client_view_test.cpp
     protocol/select_unselect_test.cpp
     protocol/sum_selection_test.cpp
     duel/duel_test.cpp
     duel/clone_test.cpp
+    duel/lua_memory_test.cpp
     encode/encoder_test.cpp
 )
 target_include_directories(ocgforge_tests PRIVATE .)

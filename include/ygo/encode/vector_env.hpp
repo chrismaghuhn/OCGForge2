@@ -146,6 +146,7 @@ private:
     void check_action(std::size_t env, std::int64_t action) const;
     // In recv/send mode an env may only be read while recv has handed it out.
     void require_handed_out(std::size_t env) const;
+    const duel::Duel& live_duel(std::size_t env) const;
     void start_workers();
     void work();
 

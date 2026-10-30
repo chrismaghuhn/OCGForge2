@@ -128,3 +128,31 @@ def test_concurrent_clones_of_one_duel(card_index):
             moves = random.Random(len(clones))
             for clone in clones[:8]:
                 lockstep(reference.clone(), clone, card_index, random.Random(moves.random()), 40)
+
+
+def test_collected_template_plays_on_like_the_original(card_index):
+    """Search fan-out: collect the garbage of one private clone, then clone that template."""
+    rng = random.Random(5)
+    duel = new_duel("branded", "maliss", 5)
+    for _ in range(150):
+        duel.act(rng.choice(duel.keys()))
+    used = duel.lua_memory["used"]
+    template = duel.clone()
+    template.collect_lua_garbage()
+    assert template.lua_memory["used"] <= used
+    assert duel.lua_memory["used"] == used  # the source is untouched
+    assert lockstep(duel.clone(), template.clone(), card_index, random.Random(6), 300) > 0
+
+
+def test_duels_can_be_created_and_encoded_from_threads(card_index):
+    """Duel() and Duel.encode release the GIL; duels built on threads match ones built serially."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def build(seed):
+        duel = new_duel(*PAIRS[seed % len(PAIRS)], seed)
+        return view(duel, card_index)
+
+    seeds = list(range(40, 52))
+    with ThreadPoolExecutor(4) as pool:
+        threaded = list(pool.map(build, seeds))
+    assert threaded == [build(seed) for seed in seeds]
