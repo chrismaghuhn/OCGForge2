@@ -50,7 +50,7 @@ Both forks are AGPL-3.0-or-later like upstream; their license headers are kept.
   allocates are registered with the duel (the fork's `cloned_chain_counters` set), so a duel
   destroyed in the middle of a chain frees them. Upstream leaks them then; with clones,
   discarding a duel mid-chain is routine (found by ASan in the clone tests).
-- Patch 0006 (Lua memory budget, `docs/ARCHITECTURE.md`): its counters live in Lua's
+- Patch 0007 (Lua memory budget, `docs/ARCHITECTURE.md`): its counters live in Lua's
   `global_State`, inside the heap region a clone copies, so a clone keeps them (tested).
 - `CMakeLists.txt`: compiles the fork's `clone/` and `identity/` sources and links the Boost
   headers (`ocg_clone_boost`).

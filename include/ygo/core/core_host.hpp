@@ -32,7 +32,7 @@ struct CoreHostConfig {
     std::uint64_t lua_memory_limit = kDefaultLuaMemoryLimit;
     static constexpr std::uint64_t kDefaultLuaMemoryLimit = 64ull << 20;
     // Lua's generational collector instead of the incremental one (set right after the state is
-    // created; ocgcore patch 0007). Faster and smaller heaps for card scripts, see
+    // created; ocgcore patch 0008). Faster and smaller heaps for card scripts, see
     // docs/ARCHITECTURE.md. The environment variable OCGFORGE_LUA_GC=inc|gen overrides it (A/B runs).
     bool lua_generational_gc = true;
 

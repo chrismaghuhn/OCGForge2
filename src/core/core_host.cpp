@@ -77,7 +77,7 @@ void CoreHost::throw_if_callback_error(const char* operation) const {
     }
 }
 
-// A card script went past one of our Lua budgets (ocgcore patches 0004 and 0006) and was cut
+// A card script went past one of our Lua budgets (ocgcore patches 0004 and 0007) and was cut
 // off with a Lua error; the duel state can no longer be trusted.
 void CoreHost::throw_if_lua_budget_exceeded(const char* operation) const {
     if (OCG_DuelLuaBudgetExceeded(impl_->duel) != 0) {
