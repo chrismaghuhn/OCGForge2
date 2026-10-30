@@ -69,6 +69,17 @@ def defend(keys: list[str], mode: str) -> str:
     return worlds.decline(keys)
 
 
+def wanted(entry: dict, every: bool = False, min_field: int = 0) -> bool:
+    """A book line whose board we break: checked, or (with --min-field) one that left a board of at
+    least that many cards on our field even if it strayed from the community steps."""
+    if every or entry.get("checked"):
+        return True
+    field_size = entry.get("field")
+    if field_size is None:  # books before v2 have no field count
+        field_size = sum(c["location"] in (worlds.LOCATION_MZONE, worlds.LOCATION_SZONE) for c in entry.get("end_board", []))
+    return bool(min_field) and field_size >= min_field
+
+
 def own_answers(start, line: list[str]) -> list[str] | None:
     """The book line's answers of the combo player (seat 0) alone: replayed in the book's own
     scenario, where seat 1 only ever declined. With another hand seat 1 is asked other questions,
@@ -140,6 +151,8 @@ def main(argv=None) -> None:
     p.add_argument("--tries", type=int, default=8, help="agent hands per board")
     p.add_argument("--defender", choices=("pass", "eager"), default="eager")
     p.add_argument("--all", action="store_true", help="also boards of lines that were not fully checked")
+    p.add_argument("--min-field", type=int, default=0,
+                   help="also boards of unchecked lines that leave at least this many cards on the field (0: off)")
     p.add_argument("--greedy", action="store_true", help="the agent plays its most likely answers")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda")
@@ -174,7 +187,7 @@ def main(argv=None) -> None:
         return start
 
     entries = [json.loads(line) for line in args.book.read_text(encoding="utf-8").splitlines() if line.strip()]
-    entries = [e for e in entries if args.all or e.get("checked")]
+    entries = [e for e in entries if wanted(e, args.all, args.min_field)]
     report = []
     for entry in entries:
         combo = combos.get(entry["combo"])

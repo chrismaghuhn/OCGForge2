@@ -23,6 +23,16 @@ def test_with_agent_replaces_only_seat_one():
     assert out[-1] == "Debug.ReloadFieldEnd()"
 
 
+def test_wanted_boards():
+    assert bb.wanted({"checked": True, "field": 1})
+    assert not bb.wanted({"checked": False, "field": 6})
+    assert bb.wanted({"checked": False, "field": 6}, min_field=5)
+    assert not bb.wanted({"checked": False, "field": 4}, min_field=5)
+    assert bb.wanted({"checked": False, "field": 0}, every=True)
+    old = {"checked": False, "end_board": [{"location": 4}, {"location": 8}, {"location": 2}]}  # no "field"
+    assert bb.wanted(old, min_field=2) and not bb.wanted(old, min_field=3)
+
+
 def test_defender_modes():
     keys = ["chain.pass", "chain.0.0.1.0.4.0"]
     assert bb.defend(keys, "pass") == "chain.pass"
