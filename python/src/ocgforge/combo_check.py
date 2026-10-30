@@ -16,9 +16,11 @@ end board and the line (semantic keys) go into the combo book. Several deck shuf
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import random
 import re
+import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -83,12 +85,25 @@ def scenario_script(combo: cb.Combo, decklist: tuple[list[int], list[int]], oppo
     return "\n".join(lines) + "\n"
 
 
+_cpu_models: dict[int, object] = {}
+_cpu_lock = threading.Lock()
+
+
 @torch.no_grad()
 def candidate_logprobs(model, rows: list[dict], device: str) -> list[list[float]]:
+    """The model's log-probabilities of each row's answers. On a shared GPU that runs out of memory
+    the batch goes to a CPU copy of the model instead of failing the run."""
     model.eval()
-    inputs = features.collate(rows, device)
-    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=str(device).startswith("cuda")):
-        scores, _ = model(inputs)
+    try:
+        inputs = features.collate(rows, device)
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=str(device).startswith("cuda")):
+            scores, _ = model(inputs)
+    except torch.cuda.OutOfMemoryError:
+        with _cpu_lock:
+            if id(model) not in _cpu_models:
+                _cpu_models[id(model)] = copy.deepcopy(model).to("cpu")
+            cpu_model = _cpu_models[id(model)]
+        scores, _ = cpu_model(features.collate(rows, "cpu"))
     logprobs = torch.log_softmax(scores.float(), dim=-1).cpu()
     return [logprobs[i, : len(r["candidate_kind"])].tolist() for i, r in enumerate(rows)]
 
