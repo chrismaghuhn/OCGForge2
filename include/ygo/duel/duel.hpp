@@ -119,7 +119,17 @@ public:
     // Answers removed so far by loop blocking.
     std::uint64_t blocked_answers() const noexcept { return blocked_answers_; }
 
+    // An independent copy of the duel at the pending decision: the engine state (ocgcore fork's
+    // OCG_CloneDuel) and everything this wrapper keeps (observation sessions, the pending request
+    // and observation, loop-guard counts, decision count, recent decisions, config). Given the same
+    // answers, the copy plays on exactly as this duel would. With a seed, the engine's random state
+    // is reseeded instead (config().seed then is that seed). Only while !finished(); the copy does
+    // not depend on this duel, which may be destroyed first.
+    std::unique_ptr<Duel> clone(std::optional<std::uint64_t> seed = std::nullopt) const;
+    const DuelConfig& config() const noexcept { return config_; }
+
 private:
+    Duel(const Duel& source, std::unique_ptr<core::CoreHost> host);
     void advance();
     void publish(protocol::DecisionRequest request);
     void submit(std::vector<std::uint8_t> response);

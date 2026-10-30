@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -66,6 +67,12 @@ public:
     void start_duel();
     ProcessResult process();
     void submit_response(const std::vector<std::uint8_t>& response);
+    // An independent copy of the duel (OCG_CloneDuel of the pinned ocgcore fork) that plays on
+    // exactly as this one would, random state included; with a seed, the engine's random state
+    // and Lua's math.random are reseeded instead. Only while the duel awaits a response (after
+    // process() returned a decision); throws CoreError otherwise. The copy shares the card data
+    // and has its own script store, callback error and log, so it may run on another thread.
+    std::unique_ptr<CoreHost> clone(std::optional<std::uint64_t> seed = std::nullopt) const;
 
     std::uint32_t query_count(std::uint8_t team, std::uint32_t location) const;
     std::vector<std::uint8_t> query(const OCG_QueryInfo& info) const;
@@ -82,6 +89,7 @@ public:
 
 private:
     struct Impl;
+    CoreHost(const CoreHost& source, Impl* impl);
     void throw_if_callback_error(const char* operation) const;
     CoreHostConfig config_;
     Impl* impl_ = nullptr;

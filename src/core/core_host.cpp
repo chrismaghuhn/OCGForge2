@@ -34,6 +34,40 @@ struct CoreHost::Impl {
           scripts(script_root, required_script_codes
           ),
           script_payload(&scripts, &callback_error) {}
+
+    // For a clone: the same card data (shared, read-only) and a copy of the script store. The
+    // callback payloads point into this Impl, never into the source's.
+    explicit Impl(const Impl& source)
+        : options(source.options),
+          card_data(source.card_data),
+          card_data_payload{card_data.get(), &callback_error},
+          scripts(source.scripts),
+          script_payload(&scripts, &callback_error) {
+        options.payload1 = &card_data_payload;
+        options.payload2 = &script_payload;
+        options.payload3 = &log;
+        options.payload4 = nullptr;
+    }
+
+    Impl& operator=(const Impl&) = delete;
+    ~Impl() {
+        if (duel != nullptr) {
+            OCG_DestroyDuel(duel);
+        }
+    }
+
+    OCG_CloneCallbacks clone_callbacks() {
+        OCG_CloneCallbacks callbacks{};
+        callbacks.cardReader = options.cardReader;
+        callbacks.cardPayload = options.payload1;
+        callbacks.scriptReader = options.scriptReader;
+        callbacks.scriptPayload = options.payload2;
+        callbacks.logHandler = options.logHandler;
+        callbacks.logPayload = options.payload3;
+        callbacks.cardReaderDone = options.cardReaderDone;
+        callbacks.cardReaderDonePayload = options.payload4;
+        return callbacks;
+    }
 };
 
 void CoreHost::throw_if_callback_error(const char* operation) const {
@@ -100,6 +134,42 @@ CoreHost::CoreHost(CoreHostConfig config) : config_(std::move(config)) {
         impl_ = nullptr;
         throw;
     }
+}
+
+CoreHost::CoreHost(const CoreHost& source, Impl* impl)
+    : config_(source.config_),
+      impl_(impl),
+      response_submission_count_(source.response_submission_count_),
+      process_call_count_(source.process_call_count_),
+      duel_query_calls_(source.duel_query_calls_),
+      duel_query_location_calls_(source.duel_query_location_calls_),
+      duel_query_field_calls_(source.duel_query_field_calls_),
+      duel_query_count_calls_(source.duel_query_count_calls_),
+      api_major_(source.api_major_),
+      api_minor_(source.api_minor_) {}
+
+std::unique_ptr<CoreHost> CoreHost::clone(std::optional<std::uint64_t> seed) const {
+    auto impl = std::make_unique<Impl>(*impl_);
+    const auto callbacks = impl->clone_callbacks();
+    const int status = seed ? OCG_CloneDuelWithSeed(&impl->duel, impl_->duel, &callbacks, *seed)
+                            : OCG_CloneDuel(&impl->duel, impl_->duel, &callbacks);
+    if (status != OCG_CLONE_SUCCESS || impl->duel == nullptr) {
+        static constexpr const char* kStatus[] = {"success", "invalid argument", "not awaiting a response",
+                                                  "unsupported", "allocation failed"};
+        const auto reason = status >= 0 && status < 5 ? std::string(kStatus[status]) : std::to_string(status);
+        std::string detail = "status=" + std::to_string(status) + " (" + reason + ")";
+        if (!impl->log.empty()) {
+            detail += ": " + impl->log;
+        }
+        throw CoreError(CoreErrorCode::Lifecycle, "OCG_CloneDuel", detail);
+    }
+    if (!impl->callback_error.empty()) {
+        throw CoreError(CoreErrorCode::Callback, "OCG_CloneDuel", impl->callback_error);
+    }
+    // Not make_unique: the constructor is private.
+    std::unique_ptr<CoreHost> host(new CoreHost(*this, impl.get()));
+    impl.release();
+    return host;
 }
 
 CoreHost::~CoreHost() {

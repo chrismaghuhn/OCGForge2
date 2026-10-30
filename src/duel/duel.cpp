@@ -70,6 +70,42 @@ Duel::Duel(DuelConfig config) : config_(std::move(config)) {
     advance();
 }
 
+Duel::Duel(const Duel& source, std::unique_ptr<core::CoreHost> host)
+    : config_(source.config_),
+      host_(std::move(host)),
+      engine_step_(source.engine_step_),
+      decision_count_(source.decision_count_),
+      request_(source.request_),
+      observation_(source.observation_),
+      result_(source.result_),
+      seen_states_(source.seen_states_),
+      answers_(source.answers_),
+      state_(source.state_),
+      blocked_answers_(source.blocked_answers_),
+      recent_(source.recent_) {
+    for (std::uint8_t player = 0; player < 2; ++player) {
+        sessions_[player] = std::make_unique<observation::ObservationSession>(*source.sessions_[player]);
+    }
+}
+
+std::unique_ptr<Duel> Duel::clone(std::optional<std::uint64_t> seed) const {
+    if (!request_) {
+        throw std::logic_error("Duel::clone() needs a pending decision (the duel is over)");
+    }
+    std::unique_ptr<core::CoreHost> host;
+    try {
+        host = host_->clone(seed);
+    } catch (const std::exception& error) {
+        fail(std::string("cannot clone the duel: ") + error.what());
+    }
+    // Not make_unique: the constructor is private.
+    std::unique_ptr<Duel> copy(new Duel(*this, std::move(host)));
+    if (seed) {
+        copy->config_.seed = *seed;
+    }
+    return copy;
+}
+
 Duel::~Duel() = default;
 
 const protocol::DecisionRequest& Duel::request() const {
