@@ -124,8 +124,10 @@ def _batch(samples: list[dict], device: str):
 
 
 def distill(checkpoint: Path, data: list[Path], out: Path, epochs: int = 2, lr: float = 1e-5,
-            batch_size: int = 256, device: str = "cuda", holdout: float = 0.05, seed: int = 0) -> dict:
-    """Trains `checkpoint` on the samples in `data` and saves the result to `out`."""
+            batch_size: int = 256, device: str = "cuda", holdout: float = 0.05, seed: int = 0,
+            micro_batch: int = 64) -> dict:
+    """Trains `checkpoint` on the samples in `data` and saves the result to `out`; each batch is
+    run in `micro_batch` chunks whose gradients add up (GPU memory)."""
     from .model import load_checkpoint, save_checkpoint
 
     model = load_checkpoint(checkpoint, device, dropout=0.0)
@@ -139,8 +141,8 @@ def distill(checkpoint: Path, data: list[Path], out: Path, epochs: int = 2, lr: 
     def evaluate() -> dict:
         model.eval()
         totals, n = {"policy": 0.0, "value": 0.0, "agree": 0.0}, 0
-        for start in range(0, len(held), batch_size):
-            part = held[start:start + batch_size]
+        for start in range(0, len(held), micro_batch):
+            part = held[start:start + micro_batch]
             _, stats = distill_loss(model, *_batch(part, device))
             for key in totals:
                 totals[key] += stats[key] * len(part)
@@ -154,9 +156,12 @@ def distill(checkpoint: Path, data: list[Path], out: Path, epochs: int = 2, lr: 
         model.train()
         rng.shuffle(train)
         for start in range(0, len(train), batch_size):
-            loss, _ = distill_loss(model, *_batch(train[start:start + batch_size], device))
+            batch = train[start:start + batch_size]
             optimizer.zero_grad()
-            loss.backward()
+            for micro in range(0, len(batch), micro_batch):
+                part = batch[micro:micro + micro_batch]
+                loss, _ = distill_loss(model, *_batch(part, device))
+                (loss * len(part) / len(batch)).backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             optimizer.step()
         history.append({"epoch": epoch, **evaluate()})
@@ -189,6 +194,7 @@ def main(argv=None) -> None:
     d.add_argument("--epochs", type=int, default=2)
     d.add_argument("--lr", type=float, default=1e-5)
     d.add_argument("--batch-size", type=int, default=256)
+    d.add_argument("--micro-batch", type=int, default=64, help="chunk of a batch run at once (GPU memory)")
     d.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args(argv)
     if args.command == "generate":
@@ -196,7 +202,8 @@ def main(argv=None) -> None:
                              args.device, args.temperature):
             print(json.dumps(line), flush=True)
     else:
-        summary = distill(args.checkpoint, args.data, args.out, args.epochs, args.lr, args.batch_size, args.device)
+        summary = distill(args.checkpoint, args.data, args.out, args.epochs, args.lr, args.batch_size, args.device,
+                          micro_batch=args.micro_batch)
         print(json.dumps({k: v for k, v in summary.items() if k != "history"}), flush=True)
 
 
