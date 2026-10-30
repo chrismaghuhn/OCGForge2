@@ -142,3 +142,17 @@ def test_collected_template_plays_on_like_the_original(card_index):
     assert template.lua_memory["used"] <= used
     assert duel.lua_memory["used"] == used  # the source is untouched
     assert lockstep(duel.clone(), template.clone(), card_index, random.Random(6), 300) > 0
+
+
+def test_duels_can_be_created_and_encoded_from_threads(card_index):
+    """Duel() and Duel.encode release the GIL; duels built on threads match ones built serially."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def build(seed):
+        duel = new_duel(*PAIRS[seed % len(PAIRS)], seed)
+        return view(duel, card_index)
+
+    seeds = list(range(40, 52))
+    with ThreadPoolExecutor(4) as pool:
+        threaded = list(pool.map(build, seeds))
+    assert threaded == [build(seed) for seed in seeds]

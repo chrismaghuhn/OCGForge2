@@ -273,6 +273,7 @@ NB_MODULE(_core, m) {
                 config.seed = seed;
                 config.starting_player = starting_player;
                 config.max_decisions = max_decisions;
+                nb::gil_scoped_release release;  // creating a duel takes milliseconds of engine work
                 new (self) Duel(std::move(config));
             },
             "card_scripts_root"_a, "card_data_tsv"_a, "deck0"_a, "deck1"_a, "seed"_a, "starting_player"_a,
@@ -289,6 +290,7 @@ NB_MODULE(_core, m) {
                 config.fixture_script = script;
                 config.seed = seed;
                 config.starting_player = starting_player;
+                nb::gil_scoped_release release;
                 return std::make_unique<Duel>(std::move(config));
             },
             "card_scripts_root"_a, "card_data_tsv"_a, "deck0"_a, "deck1"_a, "script"_a, "seed"_a, "starting_player"_a,
@@ -367,7 +369,12 @@ NB_MODULE(_core, m) {
             if (d.observation() == nullptr) {
                 throw std::logic_error("Duel.encode needs a pending decision (the duel is over)");
             }
-            return to_dict(ygo::encode::encode(*d.observation(), d.request(), card_index));
+            ygo::encode::EncodedDecision decision;
+            {
+                nb::gil_scoped_release release;
+                decision = ygo::encode::encode(*d.observation(), d.request(), card_index);
+            }
+            return to_dict(decision);
         }, "card_index"_a, "The pending decision as model input (one row, like features.row).");
 
     using ygo::client::ClientDuel;
