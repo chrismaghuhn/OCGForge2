@@ -59,6 +59,8 @@ class Bot:
         self.name, self.password = name, password
         self.create = create  # host the room (on a server such as Multirole) instead of joining one
         self.seat = None
+        self.host = False  # the room's host starts the duel: we are when we created it, or the room says so
+        self.other_ready = False
         self.duels = duels  # leave after this many duels (0 = keep accepting rematches)
         self.finished = 0
         self.rng = random.Random(seed)
@@ -95,6 +97,11 @@ class Bot:
         if self.record:
             self.record.close()
 
+    def start_if_host(self) -> None:
+        """A room another program hosts (e.g. YGO-Gym's) can make us its host: then we start the duel."""
+        if self.host and self.other_ready and getattr(self, "flags", None) is not None:
+            self.send(p.packet(p.CTOS_HS_START))
+
     def on_packet(self, kind: int, payload: bytes) -> None:
         self.stats[p.STOC_NAMES.get(kind, hex(kind))] += 1
         if kind == p.STOC_JOIN_GAME:
@@ -103,14 +110,17 @@ class Bot:
             print(f"joined the room ({rules})", flush=True)
             self.send(p.update_deck(*self.deck))
             self.send(p.packet(p.CTOS_HS_READY))
+            self.start_if_host()
         elif kind == p.STOC_CREATE_GAME:
             print(f"room {struct.unpack_from('<I', payload)[0]} created", flush=True)
         elif kind == p.STOC_HS_PLAYER_CHANGE:
             # The host starts the duel once the other duelist is ready (the bot always is).
-            if self.create and payload[0] >> 4 != self.seat and payload[0] & 0xF == p.PLAYERCHANGE_READY:
-                self.send(p.packet(p.CTOS_HS_START))
+            if payload[0] >> 4 != self.seat and payload[0] & 0xF == p.PLAYERCHANGE_READY:
+                self.other_ready = True
+                self.start_if_host()
         elif kind == p.STOC_TYPE_CHANGE:
             seat = self.seat = payload[0] & 0xF
+            self.host = self.create or bool(payload[0] & 0x10)
             if seat == 7:  # NETPLAYER_TYPE_OBSERVER: the duelist seats are taken or a duel is running
                 print("joined as a spectator: no free duelist seat (or a duel is running); leaving", flush=True)
                 self.send(p.packet(p.CTOS_LEAVE_GAME))
