@@ -106,6 +106,15 @@ counter is Lua's own byte count, part of the Lua state, so a clone copies it.
 duels): 1.7 MB after creation, peak median 3.6 MB, max 5.2 MB; per deck the highest peak is
 3.9-5.2 MB, so the default leaves >10x headroom below the fork's 256 MiB heap reserve.
 
+Lua runs its generational collector (`CoreHostConfig::lua_generational_gc`, default on, patch
+0007's `OCG_DuelSetLuaGenerationalGC` right after creation; `OCGFORGE_LUA_GC=inc|gen` overrides
+it for A/B runs). Card scripts make mostly short-lived garbage, and the fork's heap region never
+shrinks, so a smaller heap stays smaller: with random play the region grows ~0.9 MB per 1000
+decisions instead of ~2.2 MB (max 5.4 vs 8.9 MB over 6 duels), VectorEnv runs 6-20% more
+decisions/s on one thread and 256 envs used ~7% less RSS after 60 s. Play is the same in both
+modes (tested), and clones copy the generational lists (clone tests, incl. `[slow]`, pass in
+both modes).
+
 `VectorEnv::info(env)` shows the seed, decks and actions of an env's current
 duel (also while `step` runs), which is enough to replay a stuck duel with
 `Duel` alone. Duels that fail to start are counted in `start_failures`.
@@ -130,6 +139,8 @@ Fixed inputs live in `third_party/deps.json` (exact commits) and
 - `0006-lua-memory-budget.patch`: the Lua memory budget above, with
   `OCG_DuelSetLuaMemoryLimit`, `OCG_DuelLuaMemory`, `OCG_DuelLuaMemoryPeak`,
   `OCG_DuelLuaMemoryExceeded` and `OCG_DuelLuaHeapExtent`.
+- `0007-lua-gc-control.patch`: `OCG_DuelSetLuaGenerationalGC` (above) and
+  `OCG_DuelCollectLuaGarbage` (a full collection; see "Clone cost" in `docs/engine-clone.md`).
 
 `tools/setup_deps.py` applies the patches in order to a clean checkout and
 records their hashes in `.cache/ocgcore/.ocgforge-patches`.

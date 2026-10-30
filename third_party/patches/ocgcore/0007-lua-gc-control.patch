@@ -1,0 +1,36 @@
+diff --git a/ocgapi.cpp b/ocgapi.cpp
+--- a/ocgapi.cpp
++++ b/ocgapi.cpp
+@@ -140,6 +140,16 @@
+ 	return static_cast<duel*>(ocg_duel)->lua->heap.extent().second;
+ }
+ 
++int OCG_DuelSetLuaGenerationalGC(OCG_Duel ocg_duel, int generational) {
++	auto* L = static_cast<duel*>(ocg_duel)->lua->lua_state;
++	const int previous = generational ? lua_gc(L, LUA_GCGEN, 0, 0) : lua_gc(L, LUA_GCINC, 0, 0, 0);
++	return previous == LUA_GCGEN;
++}
++
++void OCG_DuelCollectLuaGarbage(OCG_Duel ocg_duel) {
++	lua_gc(static_cast<duel*>(ocg_duel)->lua->lua_state, LUA_GCCOLLECT, 0);
++}
++
+ int OCG_DuelSetStartingPlayer(OCG_Duel ocg_duel, uint8_t player) {
+ 	if(ocg_duel == nullptr)
+ 		return 0;
+diff --git a/ocgapi.h b/ocgapi.h
+--- a/ocgapi.h
++++ b/ocgapi.h
+@@ -75,6 +75,12 @@
+ OCGAPI int OCG_DuelLuaMemoryExceeded(OCG_Duel ocg_duel);
+ /* Size of the region holding the Lua heap (what a clone copies; it never shrinks). */
+ OCGAPI uint64_t OCG_DuelLuaHeapExtent(OCG_Duel ocg_duel);
++/* Switch the duel's Lua collector to generational (nonzero) or incremental (0, Lua's default) mode;
++   returns whether it was generational. Only between engine calls, e.g. right after creation. */
++OCGAPI int OCG_DuelSetLuaGenerationalGC(OCG_Duel ocg_duel, int generational);
++/* A full Lua collection, e.g. on a private clone before cloning it many times. Only while the
++   duel awaits a response or before it starts, never from a callback. */
++OCGAPI void OCG_DuelCollectLuaGarbage(OCG_Duel ocg_duel);
+ 
+ /*** DUEL PROCESSING AND QUERYING ***/
+ OCGAPI int OCG_DuelProcess(OCG_Duel ocg_duel);

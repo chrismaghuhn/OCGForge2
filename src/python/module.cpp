@@ -336,6 +336,9 @@ NB_MODULE(_core, m) {
                      },
                      "Bytes of the engine's Lua state: used now (garbage included), peak, and the size of the "
                      "heap region a clone copies.")
+        .def("collect_lua_garbage", &Duel::collect_lua_garbage, nb::call_guard<nb::gil_scoped_release>(),
+             "A full collection of the engine's Lua heap. Play is unchanged; clones made afterwards have less "
+             "garbage to fix up.")
         .def_prop_ro("reseeds", &Duel::reseeds, "Seeds clone(seed) reseeded this duel with, oldest first.")
         .def_prop_ro("finished", &Duel::finished)
         .def_prop_ro("winner", [](const Duel& d) -> std::optional<std::uint8_t> {

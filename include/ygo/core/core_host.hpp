@@ -31,6 +31,10 @@ struct CoreHostConfig {
     // A duel whose scripts allocate past it fails like one past the Lua call budget.
     std::uint64_t lua_memory_limit = kDefaultLuaMemoryLimit;
     static constexpr std::uint64_t kDefaultLuaMemoryLimit = 64ull << 20;
+    // Lua's generational collector instead of the incremental one (set right after the state is
+    // created; ocgcore patch 0007). Faster and smaller heaps for card scripts, see
+    // docs/ARCHITECTURE.md. The environment variable OCGFORGE_LUA_GC=inc|gen overrides it (A/B runs).
+    bool lua_generational_gc = true;
 
     std::uint8_t effective_starting_player() const noexcept {
         return starting_player.value_or(0);
@@ -95,6 +99,9 @@ public:
     std::size_t process_call_count() const noexcept { return process_call_count_; }
     CoreHostMetrics metrics() const noexcept;
     LuaMemory lua_memory() const noexcept;
+    // A full Lua collection (only while a decision is pending), e.g. on a private clone that is
+    // about to be cloned many times.
+    void collect_lua_garbage();
     int api_major() const noexcept { return api_major_; }
     int api_minor() const noexcept { return api_minor_; }
 

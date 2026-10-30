@@ -128,3 +128,17 @@ def test_concurrent_clones_of_one_duel(card_index):
             moves = random.Random(len(clones))
             for clone in clones[:8]:
                 lockstep(reference.clone(), clone, card_index, random.Random(moves.random()), 40)
+
+
+def test_collected_template_plays_on_like_the_original(card_index):
+    """Search fan-out: collect the garbage of one private clone, then clone that template."""
+    rng = random.Random(5)
+    duel = new_duel("branded", "maliss", 5)
+    for _ in range(150):
+        duel.act(rng.choice(duel.keys()))
+    used = duel.lua_memory["used"]
+    template = duel.clone()
+    template.collect_lua_garbage()
+    assert template.lua_memory["used"] <= used
+    assert duel.lua_memory["used"] == used  # the source is untouched
+    assert lockstep(duel.clone(), template.clone(), card_index, random.Random(6), 300) > 0

@@ -56,6 +56,7 @@ Duel::Duel(DuelConfig config) : config_(std::move(config)) {
     host_config.starting_player = config_.starting_player;
     host_config.required_script_codes = core::card_codes(config_.deck0, config_.deck1);
     host_config.lua_memory_limit = config_.lua_memory_limit;
+    host_config.lua_generational_gc = config_.lua_generational_gc;
 
     host_ = std::make_unique<core::CoreHost>(std::move(host_config));
     if (config_.fixture_script.empty()) {
@@ -112,6 +113,13 @@ Duel::~Duel() = default;
 
 core::LuaMemory Duel::lua_memory() const noexcept {
     return host_->lua_memory();
+}
+
+void Duel::collect_lua_garbage() {
+    if (!request_) {
+        throw std::logic_error("Duel::collect_lua_garbage() needs a pending decision");
+    }
+    host_->collect_lua_garbage();
 }
 
 const protocol::DecisionRequest& Duel::request() const {

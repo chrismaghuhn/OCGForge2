@@ -15,7 +15,8 @@
       "0003-memoize-sum-greater-check.patch",
       "0004-lua-call-budget.patch",
       "0005-own-applied-chain-counters.patch",
-      "0006-lua-memory-budget.patch"
+      "0006-lua-memory-budget.patch",
+      "0007-lua-gc-control.patch"
     ]
   },
   "cardscripts": {

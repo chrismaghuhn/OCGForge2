@@ -1,6 +1,7 @@
 #include "ygo/core/core_host.hpp"
 
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -128,6 +129,13 @@ CoreHost::CoreHost(CoreHostConfig config) : config_(std::move(config)) {
         }
         // Only now: the limit must never apply while the Lua state is being built.
         OCG_DuelSetLuaMemoryLimit(impl_->duel, config_.lua_memory_limit);
+        bool generational = config_.lua_generational_gc;
+        if (const char* mode = std::getenv("OCGFORGE_LUA_GC"); mode != nullptr) {
+            generational = std::string(mode) == "gen" ? true : std::string(mode) == "inc" ? false : generational;
+        }
+        if (generational) {  // the state is built and no Lua code has run yet
+            OCG_DuelSetLuaGenerationalGC(impl_->duel, 1);
+        }
 
         const auto load_global_script = [this](const std::string& name) {
             std::string error;
@@ -348,6 +356,11 @@ std::vector<std::uint8_t> CoreHost::query_field() const {
 CoreHostMetrics CoreHost::metrics() const noexcept {
     return CoreHostMetrics{process_call_count_, duel_query_calls_, duel_query_location_calls_, duel_query_field_calls_,
                            duel_query_count_calls_, impl_->scripts.reader_requests(), impl_->scripts.successful_loads()};
+}
+
+void CoreHost::collect_lua_garbage() {
+    OCG_DuelCollectLuaGarbage(impl_->duel);
+    throw_if_callback_error("OCG_DuelCollectLuaGarbage");
 }
 
 LuaMemory CoreHost::lua_memory() const noexcept {
