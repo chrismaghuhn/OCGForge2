@@ -154,14 +154,28 @@ def expected_location(action: str, name: str = "", others: set[str] = frozenset(
     return None
 
 
+OPPONENT = re.compile(r"\bopp(onent)?('s)?\b", re.IGNORECASE)
+
+
+def ours(combo: cb.Combo, entry: cb.Entry) -> bool:
+    """An entry we play: not the opponent's hand trap of a "vs Fuwalos" line ("Opp chains Fuwalos";
+    the puzzle opponent never acts), and naming a card."""
+    return entry.code is not None and not OPPONENT.search(entry.action) and entry.code not in combo.vs_hand_traps
+
+
+def step_entries(combo: cb.Combo) -> list[tuple[int, cb.Entry]]:
+    """The entries the search follows, with the index of the community step each belongs to."""
+    return [(n, e) for n, step in enumerate(combo.steps) for e in step if ours(combo, e)]
+
+
 def step_groups(combo: cb.Combo) -> list[int]:
     """For each step entry (as in `step_targets`), the index of the community step it belongs to."""
-    return [n for n, step in enumerate(combo.steps) for e in step if e.code is not None]
+    return [n for n, _ in step_entries(combo)]
 
 
 def step_targets(combo: cb.Combo) -> list[tuple[int, int | None]]:
     """The combo's steps as (card, expected location)."""
-    entries = [e for step in combo.steps for e in step if e.code is not None]
+    entries = [e for _, e in step_entries(combo)]
     words = {e.code: _tokens(e.name) for e in [*combo.starting, *entries] if e.code is not None}
     targets = []
     for e in entries:
@@ -214,8 +228,11 @@ def advance(line: Line, targets: list[tuple[int, int | None]], last_key: str | N
             # not past an earlier open step of the same card: the answer summoning a card names it
             # too, before it arrives for that earlier step.
             unblocked = not any(targets[j][0] == code for j in range(progress, i) if j not in ahead)
+            # A card already where its step wants it (Medius's effect in the GY, Welcome Home
+            # placed before) is done when an answer names it there.
             if (location is not None and (code, location) in arrived) or (
-                    location is None and unblocked and named is not None and int(named[1]) == code):
+                    unblocked and named is not None and int(named[1]) == code
+                    and (location is None or (named[2] == "0" and named[3] == str(location)))):
                 hit = i
                 if location is not None:
                     arrived.discard((code, location))
@@ -479,7 +496,8 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
                 done.append(line)
                 continue
             for _, value, bonus, i in sorted(options, reverse=True)[:branch]:
-                intent = 0.0 if keys[i].endswith(".cancel") else max(line.intent, bonus)
+                # the latest card named for a coming step sets the intent (a material choice keeps it)
+                intent = 0.0 if keys[i].endswith(".cancel") else bonus or line.intent
                 children.append((Line(line.keys + [keys[i]], line.progress, line.score + value, line.board,
                                       line.key_cards, line.tried | {(state, keys[i])}, line.skipped, line.ahead,
                                       line.passed, intent), duel))
@@ -514,7 +532,7 @@ def main(argv=None) -> None:
     parser.add_argument("--opponent", type=Path, default=rollout.REPO / "decks" / "salamangreat.ydk")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--shuffles", type=int, default=3, help="deck orders a combo must work in")
-    parser.add_argument("--beam", type=int, default=12)
+    parser.add_argument("--beam", type=int, default=24)
     parser.add_argument("--branch", type=int, default=4, help="answers tried per line and decision")
     parser.add_argument("--title", help="only combos whose title contains this")
     parser.add_argument("--precise", type=Path,
@@ -595,7 +613,7 @@ def main(argv=None) -> None:
                                                       runs[i][0].key_cards))
         line, targets, start, _ = runs[shuffle]
         seconds = sum(r[3] for r in runs)
-        entries = [e for step in combo.steps for e in step if e.code is not None]
+        entries = [e for _, e in step_entries(combo)]
         for i, (e, (_, location)) in enumerate(zip(entries, targets)):
             verb = e.action.strip().lower() or "(use)"
             verbs[verb] += 1

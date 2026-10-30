@@ -112,6 +112,27 @@ def test_advance_named_card_does_not_jump_its_own_earlier_step():
     assert advance(Line(), targets, f"chain.0.0.{FORTUNA}.0.4.1", Counter(), 3, [0, 1, 2])[:2] == (2, (0,))
 
 
+def test_advance_card_already_in_place_is_done_when_named_there():
+    from collections import Counter
+    from ocgforge.combo_check import Line, advance
+    MEDIUS = 97556336
+    targets = [(MEDIUS, 0x10)]  # "Effect in GY"
+    assert advance(Line(), targets, f"chain.0.0.{MEDIUS}.0.16.0", Counter(), 3)[0] == 1
+    assert advance(Line(), targets, f"idle.5.0.{MEDIUS}.0.4.0", Counter(), 3)[0] == 0  # named on the field
+
+
+def test_opponent_entries_are_not_steps():
+    from ocgforge import combos as cb
+    from ocgforge.combo_check import step_targets
+    fuwalos, lucina = 42141493, 13597785
+    combo = cb.Combo("id", "vs Fuwa", "Elfnote", 0, [], [[cb.Entry(lucina, "Elfnote Lucina", "Special Summon")],
+                                                          [cb.Entry(fuwalos, "Mulcharmy Fuwalos", "Opp chains Fuwalos")]])
+    assert step_targets(combo) == [(lucina, 0x4)]
+    combo.steps.append([cb.Entry(fuwalos, "Mulcharmy Fuwalos", "Draw")])
+    combo.vs_hand_traps = [fuwalos]
+    assert step_targets(combo) == [(lucina, 0x4)]
+
+
 def test_offered_bonus_prefers_the_next_step():
     from ocgforge.combo_check import STEP_BONUS, offered_bonus
     assert offered_bonus({1, 2}, [2, 1]) == STEP_BONUS
