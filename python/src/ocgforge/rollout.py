@@ -26,15 +26,18 @@ Policy = Callable[[Sequence[dict]], tuple[list[int], list[float], list[float]]]
 
 
 def vector_env(card_features: CardFeatures, decks: Sequence[Path | str], num_envs: int, seed: int = 0,
-               threads: int = 0, max_decisions: int = 5000, cache: Path = REPO / ".cache"):
-    """A VectorEnv whose card indices match `card_features` (e.g. model.card_features)."""
+               threads: int = 0, max_decisions: int = 5000, cache: Path = REPO / ".cache",
+               skip_forced: bool = False):
+    """A VectorEnv whose card indices match `card_features` (e.g. model.card_features). With
+    skip_forced, decisions with a single candidate are answered in C++ and never handed out
+    (counted in env.forced_decisions)."""
     from ._core import VectorEnv
 
     if card_features.size > features.MAX_COMPACT_CARDS:
         raise ValueError(f"{card_features.size} cards do not fit the compact int16 card indices of features.row")
     return VectorEnv(str(cache / "cardscripts"), str(cache / "card_data.tsv"), [str(d) for d in decks],
                      card_features.index_map(), num_envs=num_envs, seed=seed, threads=threads,
-                     max_decisions=max_decisions)
+                     max_decisions=max_decisions, skip_forced=skip_forced)
 
 
 class RandomPolicy:

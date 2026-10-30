@@ -35,6 +35,10 @@ struct DuelConfig {
     // Model-input observations query only the card properties the encoder uses and carry only
     // the recent events; full ones have every card property and the whole event history.
     bool full_observations = false;
+    // Build each observation on the first observation() call instead of in act(), so decisions
+    // nobody looks at cost no engine queries. The visibility check of the candidates then throws
+    // from observation() instead of act(), and the build runs on the thread that asks for it.
+    bool lazy_observations = false;
 
     // Loop protection. A duel that needs more than max_decisions decisions throws DuelError.
     // An answer given block_after times to the same engine question in the same field state is
@@ -106,8 +110,10 @@ public:
 
     // The pending decision. Only valid while !finished().
     const protocol::DecisionRequest& request() const;
-    // The deciding player's view, or nullptr if observations are disabled.
-    const observation::PlayerObservation* observation() const noexcept;
+    // The deciding player's view, or nullptr if observations are disabled. With
+    // config.lazy_observations it is built here on the first call per decision; then it is not
+    // safe to call from two threads at once.
+    const observation::PlayerObservation* observation() const;
 
     // Applies one candidate (by semantic key) and runs the engine until the
     // next decision or the end of the duel.
@@ -122,6 +128,7 @@ public:
 private:
     void advance();
     void publish(protocol::DecisionRequest request);
+    void build_observation() const;
     void submit(std::vector<std::uint8_t> response);
     void lose_by_loop(std::uint8_t player);
     [[noreturn]] void fail(const std::string& message) const;
@@ -132,7 +139,7 @@ private:
     std::uint64_t engine_step_ = 0;
     std::uint64_t decision_count_ = 0;
     std::optional<protocol::DecisionRequest> request_;
-    std::optional<observation::PlayerObservation> observation_;
+    mutable std::optional<observation::PlayerObservation> observation_;  // lazily built: see lazy_observations
     std::optional<DuelResult> result_;
     std::map<std::string, std::uint32_t> seen_states_;
     // Per question-and-state hash: how often each answer (semantic key) was given.
