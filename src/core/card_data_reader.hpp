@@ -15,8 +15,8 @@ namespace ygo::core::detail {
 
 class CardDataStore final {
 public:
-    // One store per file and process, shared by every duel (read-only, so thread-safe); read
-    // again only once no duel holds it any more.
+    // One store per file and process, shared by every duel (read-only, so thread-safe) and kept
+    // until the process exits; read again only when the file changed.
     static std::shared_ptr<const CardDataStore> shared(const std::filesystem::path& path);
 
     void load(const std::filesystem::path& path);
