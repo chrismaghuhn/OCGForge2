@@ -179,9 +179,16 @@ def test_tempo_weights_results_by_the_turn_the_duel_ended(card_features):
     env = rollout.vector_env(card_features, DECKS, num_envs=2, seed=6)
     tempo = rollout.Tempo(start=0, slope=0.01, floor=0.5)  # every win shrinks with its duel's length
     collector = rollout.AsyncCollector(env, batch_size=1, segment=5000, tempo=tempo)
-    segments, stats = collector.collect(rollout.ModelPolicy(model), steps=3000)
-    finished = [(s, result) for s, result, bootstrap in segments if bootstrap is None and result != 0.0]
-    assert finished and stats.end_turns
+    # A duel of this untrained model runs ~50 turns, so 3000 decisions usually end one duel but now and
+    # then none (which env gets which sample depends on thread timing): collect until one has ended.
+    finished, end_turns = [], []
+    for _ in range(10):
+        segments, stats = collector.collect(rollout.ModelPolicy(model), steps=3000)
+        finished += [(s, result) for s, result, bootstrap in segments if bootstrap is None and result != 0.0]
+        end_turns += stats.end_turns
+        if finished:
+            break
+    assert finished and end_turns
     for decisions, result in finished:
         last_turn = round(float(decisions[-1]["global_numeric"][features.GLOBAL_NUMERIC.index("turn")]) * 20)
         assert result == -1.0 or 0.5 <= result <= tempo.weight(last_turn) + 1e-6  # losses stay -1
