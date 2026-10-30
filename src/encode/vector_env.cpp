@@ -91,7 +91,7 @@ VectorEnv::VectorEnv(VectorEnvConfig config, CardIndex card_index)
     std::vector<std::string> errors(slots_.size());
     pool_.parallel_for(slots_.size(), [&](std::size_t i) {
         try {
-            reset(*slots_[i]);
+            restart(*slots_[i]);
         } catch (const std::exception& error) {
             errors[i] = error.what();
         }
@@ -114,8 +114,8 @@ VectorEnv::~VectorEnv() {
     }
 }
 
-// Starts a fresh duel in the slot and encodes its first decision. A duel that
-// fails before its first decision is retried with the next seed.
+// Starts a fresh duel in the slot and encodes its first decision (with skip_forced: unless it is
+// forced, see restart). A duel that fails before its first decision is retried with the next seed.
 void VectorEnv::reset(Slot& slot) {
     for (int attempt = 0;; ++attempt) {
         duel::DuelConfig config;
@@ -128,6 +128,7 @@ void VectorEnv::reset(Slot& slot) {
         config.seed = slot.rng();
         config.starting_player = static_cast<std::uint8_t>(slot.rng() & 1);
         config.max_decisions = config_.max_decisions;
+        config.lazy_observations = config_.skip_forced;  // forced decisions are never looked at
         ++slot.episode;
         {
             std::lock_guard lock(slot.mutex);
@@ -143,7 +144,9 @@ void VectorEnv::reset(Slot& slot) {
             if (slot.duel->finished()) {
                 continue;  // ended without a single decision; just start another
             }
-            slot.decision = encode(*slot.duel->observation(), slot.duel->request(), card_index_);
+            if (!config_.skip_forced || slot.duel->request().candidates.size() > 1) {
+                slot.decision = encode(*slot.duel->observation(), slot.duel->request(), card_index_);
+            }
             return;
         } catch (const std::exception& error) {  // stuck duel or undecodable first decision
             ++start_failures_;
@@ -166,6 +169,54 @@ const duel::Duel& VectorEnv::live_duel(std::size_t env) const {
                                last_start_failure() + ")");
     }
     return *slot.duel;
+}
+
+// A new duel whose first decisions are forced plays them here. If it ends or fails meanwhile, it
+// counts as a finished duel (it handed nothing out, so no Ready reports it) and another starts.
+void VectorEnv::restart(Slot& slot) {
+    for (int attempt = 0;; ++attempt) {
+        reset(slot);  // throws if no new duel can be started
+        if (!config_.skip_forced || slot.duel->request().candidates.size() > 1) {
+            return;
+        }
+        std::string error;
+        try {
+            answer_forced(slot);
+            if (!slot.duel->finished()) {
+                slot.decision = encode(*slot.duel->observation(), slot.duel->request(), card_index_);
+                return;
+            }
+            loop_losses_ += slot.duel->result()->reason == duel::kLoopLoss ? 1 : 0;
+        } catch (const std::exception& failure) {
+            error = failure.what();
+        }
+        count_finished(slot, error);
+        if (attempt >= 10) {
+            throw std::runtime_error("duels keep ending before their first real choice: " +
+                                     (error.empty() ? std::string("no error") : error));
+        }
+    }
+}
+
+void VectorEnv::count_finished(const Slot& slot, const std::string& error) {
+    ++duels_finished_;
+    duel_errors_ += error.empty() ? 0 : 1;
+    blocked_answers_ += slot.duel->blocked_answers();
+}
+
+void VectorEnv::answer_forced(Slot& slot) {
+    if (!config_.skip_forced) {
+        return;
+    }
+    while (!slot.duel->finished() && slot.duel->request().candidates.size() == 1) {
+        const auto key = slot.duel->request().candidates.front().semantic_key;
+        {
+            std::lock_guard lock(slot.mutex);
+            slot.info.actions.push_back(key);
+        }
+        ++forced_decisions_;
+        slot.duel->act(key);
+    }
 }
 
 void VectorEnv::require_handed_out(std::size_t env) const {
@@ -230,6 +281,7 @@ Ready VectorEnv::play(std::size_t env, std::int64_t action) {
             }
         } not_busy{slot};
         slot.duel->act(key);
+        answer_forced(slot);
         if (!slot.duel->finished()) {
             slot.decision = encode(*slot.duel->observation(), slot.duel->request(), card_index_);
             return result;
@@ -243,10 +295,8 @@ Ready VectorEnv::play(std::size_t env, std::int64_t action) {
         result.done = 1;
         result.error = error.what();
     }
-    ++duels_finished_;
-    duel_errors_ += result.error.empty() ? 0 : 1;
-    blocked_answers_ += slot.duel->blocked_answers();
-    reset(slot);  // throws if no new duel can be started
+    count_finished(slot, result.error);
+    restart(slot);  // throws if no new duel can be started
     return result;
 }
 

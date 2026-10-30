@@ -51,6 +51,11 @@ struct VectorEnvConfig {
     std::size_t threads = 0;  // 0 = hardware concurrency
     std::uint64_t seed = 0;
     std::uint64_t max_decisions = 5000;
+    // Answer decisions with a single candidate on the worker, without building or encoding an
+    // observation; such envs are never handed out. They still count towards max_decisions and are
+    // listed in EnvInfo::actions, but skip the check that a candidate's card is visible to the
+    // player (it runs while building an observation).
+    bool skip_forced = false;
 };
 
 // What an env is doing, for diagnosing a duel that hangs: enough to replay it
@@ -120,6 +125,8 @@ public:
     // blocked, and duels lost by a player who looped anyway.
     std::uint64_t blocked_answers() const noexcept { return blocked_answers_; }
     std::uint64_t loop_losses() const noexcept { return loop_losses_; }
+    // Decisions answered on the worker because they had a single candidate (config.skip_forced).
+    std::uint64_t forced_decisions() const noexcept { return forced_decisions_; }
     // Duels that failed to start (and were replaced by another seed/deck pair), and the
     // last reason. Nonzero usually means a deck or card data problem.
     std::uint64_t start_failures() const noexcept { return start_failures_; }
@@ -128,6 +135,11 @@ public:
 private:
     struct Slot;
     void reset(Slot& slot);
+    // reset, then (with skip_forced) the new duel's forced decisions; throws like reset.
+    void restart(Slot& slot);
+    void count_finished(const Slot& slot, const std::string& error);
+    // With config.skip_forced: plays single-candidate decisions until a real choice or the end.
+    void answer_forced(Slot& slot);
     // Plays one move in one env (restarting it when the duel ends). Throws only when a new
     // duel cannot be started.
     Ready play(std::size_t env, std::int64_t action);
@@ -146,6 +158,7 @@ private:
     std::atomic<std::uint64_t> duel_errors_ = 0;
     std::atomic<std::uint64_t> blocked_answers_ = 0;
     std::atomic<std::uint64_t> loop_losses_ = 0;
+    std::atomic<std::uint64_t> forced_decisions_ = 0;
 
     // recv/send mode
     enum class EnvState : std::uint8_t { Queued, HandedOut, Playing };

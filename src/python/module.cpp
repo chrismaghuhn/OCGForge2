@@ -139,7 +139,7 @@ NB_MODULE(_core, m) {
         .def("__init__",
              [](VectorEnv* self, const std::string& card_scripts_root, const std::string& card_data_tsv,
                 const std::vector<std::string>& decks, const ygo::encode::CardIndex& card_index, std::size_t num_envs,
-                std::uint64_t seed, std::size_t threads, std::uint64_t max_decisions) {
+                std::uint64_t seed, std::size_t threads, std::uint64_t max_decisions, bool skip_forced) {
                  ygo::encode::VectorEnvConfig config;
                  config.card_scripts_root = card_scripts_root;
                  config.card_data_tsv = card_data_tsv;
@@ -150,11 +150,12 @@ NB_MODULE(_core, m) {
                  config.seed = seed;
                  config.threads = threads;
                  config.max_decisions = max_decisions;
+                 config.skip_forced = skip_forced;
                  nb::gil_scoped_release release;
                  new (self) VectorEnv(std::move(config), card_index);
              },
              "card_scripts_root"_a, "card_data_tsv"_a, "decks"_a, "card_index"_a, "num_envs"_a, "seed"_a = 0,
-             "threads"_a = 0, "max_decisions"_a = 5000)
+             "threads"_a = 0, "max_decisions"_a = 5000, "skip_forced"_a = false)
         .def("__len__", &VectorEnv::size)
         .def("observe",
              [](const VectorEnv& env) {
@@ -252,6 +253,8 @@ NB_MODULE(_core, m) {
                      "Answers removed by loop blocking, summed over finished duels.")
         .def_prop_ro("loop_losses", &VectorEnv::loop_losses,
                      "Duels lost by a player who kept looping although answers were blocked.")
+        .def_prop_ro("forced_decisions", &VectorEnv::forced_decisions,
+                     "Decisions with a single candidate answered without handing them out (skip_forced).")
         .def_prop_ro("start_failures", &VectorEnv::start_failures,
                      "Duels that failed to start and were replaced; nonzero usually means a deck problem.")
         .def_prop_ro("last_start_failure", &VectorEnv::last_start_failure);
