@@ -46,7 +46,7 @@ def collect(env, teacher: Model, steps: int, device: str, generator: torch.Gener
         ids, batch, *_ = env.recv_batch(batch_size)
         scores, values = teacher(features.from_padded(batch, device))
         probs = torch.softmax(scores.float(), dim=-1)
-        choices = torch.multinomial(probs, 1, generator=generator).squeeze(1).cpu().tolist()
+        choices = torch.multinomial(probs.cpu(), 1, generator=generator).squeeze(1).tolist()  # generator lives on the CPU
         probs, values = probs.cpu().numpy(), values.float().cpu().numpy()
         counts = np.asarray(batch["candidate_count"])
         for n in range(len(ids)):
