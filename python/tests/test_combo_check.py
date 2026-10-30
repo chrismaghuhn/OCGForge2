@@ -78,3 +78,93 @@ def test_checked_line():
     assert not checked_line(combo, Line(progress=2, skipped=3, key_cards=5), targets)
     assert not checked_line(combo, Line(progress=2, key_cards=3), targets)
     assert not checked_line(combo, Line(progress=1, key_cards=5), targets)
+
+
+def test_advance_steps_of_one_group_in_any_order():
+    from collections import Counter
+    from ocgforge.combo_check import Line, advance
+    STRELITZIA, REGINA, PATRON, TINIA = 42302563, 56651978, 12375297, 59581480
+    targets = [(STRELITZIA, None), (REGINA, None), (PATRON, None), (TINIA, 0x4)]
+    groups = [0, 0, 0, 1]
+    line = Line()
+    named = lambda code: f"unselect.select.0.{code}.0.4.1"  # noqa: E731
+    # Regina before Strelitzia, inside the same community step: no skip, Regina done ahead
+    steps, skipped, ahead = advance(line, targets, named(REGINA), Counter(), 3, groups)
+    assert (steps, skipped, ahead) == (0, (), frozenset({1}))
+    line.ahead = ahead
+    steps, skipped, ahead = advance(line, targets, named(STRELITZIA), Counter(), 3, groups)
+    assert (steps, skipped, ahead) == (2, (), frozenset())
+    line.progress = 2
+    # Tinia arriving on the field before Power Patron was used: a skip
+    steps, skipped, ahead = advance(line, targets, None, Counter({(TINIA, 0x4): 1}), 3, groups)
+    assert (steps, skipped) == (2, (2,))
+
+
+def test_advance_named_card_does_not_jump_its_own_earlier_step():
+    from collections import Counter
+    from ocgforge.combo_check import Line, advance
+    LUCINA, FORTUNA = 13597785, 85976588
+    targets = [(LUCINA, 0x4), (FORTUNA, None), (LUCINA, None)]
+    summon = f"idle.1.0.{LUCINA}.0.2.0"
+    # summoning Lucina names her before she arrives: her later "use" step must wait
+    assert advance(Line(), targets, summon, Counter(), 3, [0, 1, 2])[:2] == (0, ())
+    # a later step of another card may be done by naming it, at the cost of a skip
+    assert advance(Line(), targets, f"chain.0.0.{FORTUNA}.0.4.1", Counter(), 3, [0, 1, 2])[:2] == (2, (0,))
+
+
+def test_offered_bonus_prefers_the_next_step():
+    from ocgforge.combo_check import STEP_BONUS, offered_bonus
+    assert offered_bonus({1, 2}, [2, 1]) == STEP_BONUS
+    assert 0 < offered_bonus({1}, [2, 1]) < STEP_BONUS
+    assert offered_bonus({3}, [2, 1]) == 0.0
+
+
+def test_peek_follows_forced_answers_to_the_next_question():
+    from ocgforge.combo_check import peek
+
+    class Duel:
+        def __init__(self, script, i=0):
+            self.script, self.i, self.player, self.finished = script, i, 0, False
+
+        def clone(self):
+            return Duel(self.script, self.i)
+
+        def keys(self):
+            return self.script[self.i]
+
+        def act(self, key):
+            assert key in self.keys()
+            self.i += 1
+
+    crystal_wing = 50954680
+    script = [["yes_no.no", "yes_no.yes"], ["chain.pass", "chain.0.0.73642296.0.2.2"],
+              [f"position.{crystal_wing}.1", f"position.{crystal_wing}.4"],
+              [f"idle.1.0.{crystal_wing}.0.64.4", "idle.7.0"]]
+    assert peek(Duel(script), "yes_no.no", [], False, set(), lambda c: False, [crystal_wing]) == {crystal_wing}
+
+
+def test_expected_location_reads_the_head_verb_and_its_object():
+    from ocgforge.combo_check import expected_location as loc
+    MZONE, HAND, GRAVE, SZONE, REMOVED = 0x4, 0x2, 0x10, 0x8, 0x20
+    assert loc("Special Summon - Activate Effect", "Elfnote Tinia") == MZONE
+    assert loc("Special Summon to MMZ", "Elfnote Regina") == MZONE
+    assert loc("Synchro Summon -> Search Synchro Rumble", "Crimson Dragon") == MZONE
+    assert loc("Add back to hand", "Elfnote Regina") == HAND
+    assert loc("Send to GY to make Riser Level 6.", "Effect Veiler") == GRAVE
+    assert loc("Banish until EP", "Ecclesia and the Dark Dragon") == REMOVED
+    assert loc("Place", "Elfnotes: Welcome Home") == SZONE
+    assert loc("return to field", "Ecclesia and the Dark Dragon") == MZONE
+    assert loc("SS", "Ecclesia and the Dark Dragon") == MZONE
+    # the verb's object is another card: this one was only used
+    assert loc("Tribute Tinia", "Elfnotes: Welcome Home") is None
+    assert loc("Revive Power Patron", "Synchro Rumble") is None
+    assert loc("Search Lucina (Chain Link 1 Power Patron -> Chain Link 2 Riser)", "Elfnote Power Patron") is None
+    assert loc("Activate Effect -> Place Continuous Trap", "Elfnote Fortuna") is None
+    assert loc("banish fallen and cart", "Albion the Branded Dragon", {"fallen", "cart"}) is None
+    assert loc("Send Albion", "Albion the Branded Dragon") == GRAVE
+    # a material: "into" another card
+    assert loc("Synchro 10 into Baronne De Fleur", "Elfnote Lucina") == GRAVE
+    assert loc("Synchro 10 into Baronne", "Baronne de Fleur") == MZONE
+    assert loc("Resolve Chain link 2", "Guiding Quem") is None
+    assert loc("Rip a card from hand", "PSY-Framelord Omega") is None
+    assert loc("", "Elfnote Fortuna") is None

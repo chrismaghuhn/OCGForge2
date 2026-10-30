@@ -95,21 +95,79 @@ def candidate_logprobs(model, rows: list[dict], device: str) -> list[list[float]
 
 # What a step's action text says happened to its card, as the location the card has to reach. None
 # means "the card was used" (its effect activated, it was selected, ...): any answer naming it.
-VERBS = [
-    (("synchro", "xyz", "link", "fusion", "ritual", "summon", "revive", "special"), worlds.LOCATION_MZONE),
-    (("add", "search", "hand", "draw", "return"), worlds.LOCATION_HAND),
-    (("send", "gy", "grave", "tribute", "discard", "material", "detach", "mill", "dump"), worlds.LOCATION_GRAVE),
-    (("banish",), worlds.LOCATION_REMOVED),
-    (("place", "set", "scale", "field", "szone"), worlds.LOCATION_SZONE),
-]
+# The first verb of the text's head (before "->", "(", ",", " - ") decides; a verb whose object is
+# another card ("Tribute Tinia" on Welcome Home, "Revive Power Patron" on Synchro Rumble, "Search
+# Lucina") means this card was only used.
+SUMMONED = ("summon", "summoned", "special", "ss", "ns", "revive", "synchro", "syncho", "xyz", "link", "fusion",
+            "ritual")
+VERB_LOCATION = {
+    **{w: worlds.LOCATION_MZONE for w in SUMMONED},
+    **{w: worlds.LOCATION_HAND for w in ("add", "search", "return")},
+    **{w: worlds.LOCATION_GRAVE for w in ("send", "tribute", "discard", "discarded", "material", "detach", "mill",
+                                          "dump", "gy", "grave")},
+    "banish": worlds.LOCATION_REMOVED,
+    **{w: worlds.LOCATION_SZONE for w in ("place", "set", "scale")},
+}
+# Words between a verb and its object that do not name a card.
+FILLER = {"to", "from", "the", "a", "an", "back", "it", "itself", "this", "card", "for", "cost", "effect", "summon",
+          "hand", "deck", "gy", "grave", "ed", "extra", "mmz", "emz", "center", "centre", "middle", "main", "monster",
+          "zone", "until", "ep", "end", "phase", "in", "on", "own", "its", "again", "face", "up", "down", "using",
+          "with", "of", "by", "p", "pendulum", "field", "and", "activate", "use", "then", "if", "as", "level"}
+HEAD = re.compile(r"->|=>|\(|,|;|:| - | then ")
 
 
-def expected_location(action: str) -> int | None:
-    text = action.lower()
-    for words, location in VERBS:
-        if any(w in text for w in words):
-            return location
+def _tokens(name: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9]+", name.lower()) if len(w) >= 3}
+
+
+def expected_location(action: str, name: str = "", others: set[str] = frozenset()) -> int | None:
+    """Where the step's card (`name`) has to arrive, from its action text; `others` are name words of
+    the combo's other cards (a lower-case object like "banish fallen and cart" is another card too)."""
+    head = HEAD.split(action, maxsplit=1)[0]
+    words = re.findall(r"[A-Za-z0-9]+", head)
+    lower = [w.lower() for w in words]
+    mine = _tokens(name)
+    for i, w in enumerate(lower):
+        if w not in VERB_LOCATION or (w == "link" and i and lower[i - 1] == "chain"):
+            continue
+        location = VERB_LOCATION[w]
+        rest = lower[i + 1:]
+        if w == "return":  # "return to field" is a summon; back to the Extra Deck is nowhere we track
+            if "field" in rest:
+                return worlds.LOCATION_MZONE
+            if "extra" in rest:
+                return None
+        if "into" in rest:  # "Synchro 10 into Baronne": this card is the material unless it is Baronne
+            target = {t for t in rest[rest.index("into") + 1:] if len(t) >= 3}
+            return worlds.LOCATION_MZONE if target & mine or not target else worlds.LOCATION_GRAVE
+        for j, t in enumerate(rest):
+            if t in FILLER or t.isdigit() or t in VERB_LOCATION:
+                continue
+            if t in mine:
+                break  # names this card
+            if words[i + 1 + j][0].isupper() or t in others:
+                return None  # another card is the object: this one was only used
+            break
+        return location
+    if re.search(r"\b(comes? back|return) to (the )?field\b", head.lower()):
+        return worlds.LOCATION_MZONE
     return None
+
+
+def step_groups(combo: cb.Combo) -> list[int]:
+    """For each step entry (as in `step_targets`), the index of the community step it belongs to."""
+    return [n for n, step in enumerate(combo.steps) for e in step if e.code is not None]
+
+
+def step_targets(combo: cb.Combo) -> list[tuple[int, int | None]]:
+    """The combo's steps as (card, expected location)."""
+    entries = [e for step in combo.steps for e in step if e.code is not None]
+    words = {e.code: _tokens(e.name) for e in [*combo.starting, *entries] if e.code is not None}
+    targets = []
+    for e in entries:
+        others = set().union(*(w for code, w in words.items() if code != e.code)) - words.get(e.code, set())
+        targets.append((e.code, expected_location(e.action, e.name, others)))
+    return targets
 
 
 def board(duel) -> Counter:
@@ -126,35 +184,56 @@ class Line:
     key_cards: int = 0  # book end-board cards on our field now
     tried: frozenset = frozenset()  # (board, answer) pairs this line already played: no loops
     skipped: int = 0  # steps passed over without being done
+    ahead: frozenset = frozenset()  # later steps of the current community step already done
+    passed: tuple = ()  # the skipped steps
+    intent: float = 0.0  # bonus for heading to the next step (its card named), kept until a step is done
     duel: object = field(default=None, repr=False, compare=False)  # the engine at this line's end (a clone)
 
 
 def advance(line: Line, targets: list[tuple[int, int | None]], last_key: str | None, now: Counter,
-            lookahead: int) -> tuple[int, int]:
-    """How many steps the last answer completed, and how many of them it skipped: a step with a
-    location is done when its card arrived there; one without, when the answer named its card. A few
-    steps may be skipped (the combo text names cards the engine never acts on, or an effect that is
-    once per turn), but a skip costs the line rank."""
+            lookahead: int, groups: list[int] | None = None) -> tuple[int, int, frozenset]:
+    """How many steps the last answer completed, how many of them it skipped, and which later steps
+    are done ahead of their turn: a step with a location is done when its card arrived there; one
+    without, when the answer named its card. Entries of one community step (`groups`: "Strelitzia,
+    Regina, Power Patron") may be done in any order at no cost. A few steps may be skipped (the
+    combo text names cards the engine never acts on, or an effect that is once per turn), but a
+    skip costs the line rank."""
     arrived = {code_loc for code_loc, n in (now - line.board).items() if n > 0}
     named = worlds.card_ref(last_key) if last_key else None
-    progress, skipped = line.progress, 0
+    progress, skipped, ahead = line.progress, [], set(line.ahead)
     for _ in range(4):  # one answer can complete several steps (a summon that is also a material)
+        hit = None
         for skip in range(lookahead):
             i = progress + skip
             if i >= len(targets):
                 break
+            if i in ahead:
+                continue
             code, location = targets[i]
-            # A step without a location (the card was used) only as the very next step: the answer
-            # summoning a card names it too, before the card arrives for the step before.
+            # A step without a location (the card was used) is done by an answer naming its card, but
+            # not past an earlier open step of the same card: the answer summoning a card names it
+            # too, before it arrives for that earlier step.
+            unblocked = not any(targets[j][0] == code for j in range(progress, i) if j not in ahead)
             if (location is not None and (code, location) in arrived) or (
-                    location is None and skip == 0 and named is not None and int(named[1]) == code):
-                progress, skipped = i + 1, skipped + skip
+                    location is None and unblocked and named is not None and int(named[1]) == code):
+                hit = i
                 if location is not None:
                     arrived.discard((code, location))
+                else:
+                    named = None  # one answer names one card for one step
                 break
-        else:
+        if hit is None:
             break
-    return progress - line.progress, skipped
+        if groups is not None and groups[hit] == groups[progress]:
+            ahead.add(hit)  # in its own step: no skip
+        else:
+            skipped += [i for i in range(progress, hit) if i not in ahead]
+            ahead = {i for i in ahead if i > hit}
+            progress = hit + 1
+        while progress in ahead:
+            ahead.discard(progress)
+            progress += 1
+    return progress - line.progress, tuple(skipped), frozenset(ahead)
 
 
 def placing(keys: list[str]) -> int | None:
@@ -223,6 +302,48 @@ def grow(children: list[tuple[Line, object]]) -> list[Line]:
     return grown
 
 
+def peek(duel, key: str, history: list[str], upcoming_center: bool, center: set[int], is_extra,
+         ahead: list[int], max_answers: int = 12) -> set[int]:
+    """The cards our next real question offers after `key`, on a clone: optional chain windows are
+    passed and positions and zones fixed (`forced`) on the way. A yes/no question ("reduce
+    Strelitzia's level?") decides whether the plan's next Synchro is still there."""
+    try:
+        copy = duel.clone()
+        copy.act(key)
+        history = history + [key]
+        for _ in range(max_answers):
+            if copy.finished:
+                return set()
+            keys = copy.keys()
+            offered = {int(ref[1]) for k in keys if (ref := worlds.card_ref(k)) is not None}
+            optional_chain = "chain.pass" in keys and all(k.startswith("chain.") for k in keys)
+            if copy.player != 0 or (optional_chain and not offered & set(ahead)):
+                answer = worlds.decline(keys)
+            else:
+                answer = forced(keys, history, upcoming_center, center, is_extra)
+                if answer is None:
+                    return offered
+            copy.act(answer)
+            history = history + [answer]
+    except Exception:
+        return set()
+    return set()
+
+
+STEP_BONUS = 20.0  # for an answer naming the next step's card: above the model's log-probabilities
+
+
+def step_bonus(index: int) -> float:
+    """Bonus for naming the card of the `index`-th coming step (0 = the next)."""
+    return STEP_BONUS * (1.0 - index / 3.0)
+
+
+def offered_bonus(offered: set[int], ahead: list[int]) -> float:
+    """Bonus for an answer after which the next steps' cards are offered (6 for the next one, as
+    for answers naming it)."""
+    return max((step_bonus(i) for i, code in enumerate(ahead) if code in offered), default=0.0)
+
+
 def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12, branch: int = 4,
           max_decisions: int = 150, lookahead: int = 3, center: set[int] = frozenset(),
           is_extra=lambda code: False) -> tuple[Line, list[tuple[int, int | None]]]:
@@ -235,12 +356,19 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
     next step's card when offered (`plan_choice`); optional yes/no questions keep
     both answers in the beam (the board decides, not the model: a level change can break a later
     Synchro); end-board cards on the field are never chosen as material or cost."""
-    targets = [(e.code, expected_location(e.action)) for step in combo.steps for e in step if e.code is not None]
+    targets = step_targets(combo)
+    groups = step_groups(combo)
     key_cards = Counter(combo.end_board)
     plan = {code for code, _ in targets} | set(key_cards)
     center = set(center) & plan
     # Steps first: an end-board card played early (a search taken too soon) must not beat the plan.
-    rank = lambda l: (l.progress - l.skipped, l.key_cards, l.score)  # steps actually done  # noqa: E731
+    # A summon takes several answers (materials, zone) before its step counts: the bonus for naming
+    # the step's card (`intent`) carries the line until then, and is dropped once the step is done or
+    # the summon cancelled. It never adds up over a line, so cancelling and retrying earns nothing.
+    # Heading for the very next step counts as half a step: its materials leave the field before the
+    # summoned card arrives, and the end-board count must not drop the line in between.
+    rank = lambda l: (l.progress - l.skipped + (0.5 if l.intent >= STEP_BONUS else 0.0), l.key_cards,  # noqa: E731
+                      l.score + l.intent)
     first = start()
     if first is None:
         return Line(), targets
@@ -265,9 +393,12 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
                 continue
             now = board(duel)
             mine = next((k for k in reversed(line.keys) if not k.startswith(("chain.pass", "yes_no.no"))), None)
-            steps, skipped = advance(line, targets, mine, now, lookahead)
+            steps, skipped, line.ahead = advance(line, targets, mine, now, lookahead, groups)
             line.progress += steps
-            line.skipped += skipped
+            line.skipped += len(skipped)
+            line.passed += skipped
+            if steps:
+                line.intent = 0.0
             line.board = now
             field_now = Counter({code: n for (code, loc), n in now.items()
                                  if loc in (worlds.LOCATION_MZONE, worlds.LOCATION_SZONE)})
@@ -275,7 +406,7 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
             # The board has no levels or ATK: yes/no answers (a level change, say) tell such states apart.
             choices = tuple(k for k in line.keys if k.startswith(("yes_no.", "effect_yes_no.", "option.")))
             identity = (hash(tuple(sorted(now.items()))), tuple(duel.keys()) if not duel.finished else (),
-                        line.progress, line.skipped, choices)
+                        line.progress, line.skipped, line.ahead, choices)
             if identity in seen:
                 continue
             seen.add(identity)
@@ -291,8 +422,13 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
         for (line, duel), lp in zip(expanded, logprobs):
             keys = duel.keys()
             state = hash(tuple(sorted(line.board.items())))
-            ahead = [code for code, _ in targets[line.progress:line.progress + lookahead]]
+            pending = [i for i in range(line.progress, len(targets)) if i not in line.ahead][:lookahead]
+            ahead = [targets[i][0] for i in pending]
             window = set(ahead)
+            # Cards the last few steps named: an end-board card among them may be a material now
+            # (Strelitzia into Crystal Wing, revived later for the end board).
+            recent = {code for code, _ in targets[max(0, line.progress - 3):line.progress]} | {
+                targets[i][0] for i in line.ahead}
             upcoming = window | set(key_cards)
             later_center = any(code in center for code, _ in targets[line.progress:])
             fixed = forced(keys, line.keys, later_center, center, is_extra)
@@ -306,42 +442,47 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
             for i, key in enumerate(keys):
                 if fixed is not None:
                     if key == fixed:
-                        options.append((0.0, i))
+                        options.append((0.0, 0.0, 0.0, i))
                     continue
                 if (state, key) in line.tried and len(keys) > 1 and not key.startswith(PASSIVE):
                     continue  # same answer on the same board again: a summon cancelled and retried
-                options.append((0.0, i))
+                options.append((0.0, 0.0, 0.0, i))
             if fixed is None:
-                allowed = {i for _, i in options} or set(range(len(keys)))  # all retried: undo still allowed
+                allowed = {o[-1] for o in options} or set(range(len(keys)))  # all retried: undo still allowed
                 options = []
                 allowed = plan_choice(keys, allowed, ahead)
             for i, key in enumerate(keys):
                 if fixed is not None or i not in allowed:
                     continue
                 ref = worlds.card_ref(key)
-                value = lp[i]
+                value, bonus = lp[i], 0.0
                 if chain_window and ref is not None and int(ref[1]) not in window:
                     continue  # our own hand trap or negation on our own chain
                 if (ref is not None and key.startswith(("unselect.", "select.", "card.")) and int(ref[1]) in key_cards
-                        and int(ref[1]) in on_field and int(ref[1]) not in window and len(keys) > 1):
+                        and int(ref[1]) in on_field and int(ref[1]) not in window | recent and len(keys) > 1):
                     continue  # an end-board card as material or cost
                 if key.startswith(("yes_no.", "effect_yes_no.")):
                     value = 0.5 if key.endswith(".yes") else 0.0  # both stay; the board decides
+                    bonus = offered_bonus(peek(duel, key, line.keys, later_center, center, is_extra, ahead), ahead)
                 if ref is not None and int(ref[1]) in window:
-                    value += 6.0 - 2.0 * ahead.index(int(ref[1]))  # the next step's card first
+                    bonus = step_bonus(ahead.index(int(ref[1])))  # the next step's card first
                 elif ref is not None and int(ref[1]) in upcoming:
                     value += 1.0  # an end-board card, but not yet
                 elif ref is not None and int(ref[1]) not in plan and line.progress < len(targets):
                     value -= 8.0  # off-plan card (a hand trap fired at nothing, a wrong Synchro, ...)
                 elif line.progress < len(targets) and PHASE_END.match(key):
                     value -= 20.0  # leaving Main Phase 1 with the combo unfinished
-                options.append((value, i))
+                if key.endswith(".cancel") and len(keys) > 1:
+                    value -= 10.0  # undoing a summon or selection just started: rarely the plan
+                options.append((value + bonus, value, bonus, i))
             if not options:  # every answer filtered out: stop here rather than break a rule
                 done.append(line)
                 continue
-            for value, i in sorted(options, reverse=True)[:branch]:
+            for _, value, bonus, i in sorted(options, reverse=True)[:branch]:
+                intent = 0.0 if keys[i].endswith(".cancel") else max(line.intent, bonus)
                 children.append((Line(line.keys + [keys[i]], line.progress, line.score + value, line.board,
-                                      line.key_cards, line.tried | {(state, keys[i])}, line.skipped), duel))
+                                      line.key_cards, line.tried | {(state, keys[i])}, line.skipped, line.ahead,
+                                      line.passed, intent), duel))
         lines = grow(sorted(children, key=lambda c: rank(c[0]), reverse=True)[:beam])
     best = max(done + lines, key=rank, default=Line())
     return best, targets
@@ -381,6 +522,7 @@ def main(argv=None) -> None:
                              "end_board}): replace the community steps, starting hand and end board of those combos")
     parser.add_argument("--limit", type=int, default=0, help="check only the best-voted N combos")
     parser.add_argument("--workers", type=int, default=4, help="combos/shuffles searched at once (threads)")
+    parser.add_argument("--max-decisions", type=int, default=300, help="our answers per line at most")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--out", type=Path, help="combo book (JSON lines)")
     args = parser.parse_args(argv)
@@ -436,6 +578,7 @@ def main(argv=None) -> None:
         script = scenario_script(combo, decklist, opponent, is_extra, rng, hand=hands.get(combo.id))
         start = start_for(script, rng.getrandbits(32))
         line, targets = check(combo, start, model, card_index, args.device, beam=args.beam, branch=args.branch,
+                              max_decisions=args.max_decisions,
                               center=center, is_extra=is_extra)
         return line, targets, start, time.perf_counter() - began
 
@@ -453,11 +596,11 @@ def main(argv=None) -> None:
         line, targets, start, _ = runs[shuffle]
         seconds = sum(r[3] for r in runs)
         entries = [e for step in combo.steps for e in step if e.code is not None]
-        for i, e in enumerate(entries):
+        for i, (e, (_, location)) in enumerate(zip(entries, targets)):
             verb = e.action.strip().lower() or "(use)"
             verbs[verb] += 1
             verbs_used[verb] += i < line.progress
-            located[expected_location(e.action) is not None] += 1
+            located[location is not None] += 1
         duel = start()  # the line replays from the scenario alone (no clone involved)
         replays = duel is not None
         for key in line.keys if duel is not None else []:
@@ -469,7 +612,8 @@ def main(argv=None) -> None:
         final = end_board(duel) if duel is not None else []
         on_field = [c for c in final if c["location"] in (worlds.LOCATION_MZONE, worlds.LOCATION_SZONE)]
         result = {"combo": combo.id, "title": combo.title, "votes": combo.votes, "steps": len(targets),
-                  "progress": line.progress, "skipped": line.skipped, "checked_shuffles": checked, "shuffles": args.shuffles,
+                  "progress": line.progress, "skipped": line.skipped,
+                  "skipped_steps": [[i, entries[i].name, entries[i].action] for i in line.passed], "checked_shuffles": checked, "shuffles": args.shuffles,
                   "checked": checked == args.shuffles, "shuffle": shuffle, "replays": replays, "line": line.keys,
                   "end_board": final, "field": len(on_field), "book_end_board": combo.end_board,
                   "key_cards_reached": (sum(1 for c in combo.end_board if c in {b["code"] for b in on_field})
