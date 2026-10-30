@@ -156,8 +156,11 @@ def main(argv=None) -> None:
     p.add_argument("--greedy", action="store_true", help="the agent plays its most likely answers")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda")
+    p.add_argument("--torch-threads", type=int, default=4, help="CPU threads for the model")
     p.add_argument("--out", type=Path)
     args = p.parse_args(argv)
+    import torch
+    torch.set_num_threads(args.torch_threads)
 
     table = CardTable.from_cdb()
     types = {card.code: card.type for card in table.cards}
