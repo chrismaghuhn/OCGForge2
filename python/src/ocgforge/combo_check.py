@@ -541,9 +541,12 @@ def main(argv=None) -> None:
     parser.add_argument("--limit", type=int, default=0, help="check only the best-voted N combos")
     parser.add_argument("--workers", type=int, default=4, help="combos/shuffles searched at once (threads)")
     parser.add_argument("--max-decisions", type=int, default=300, help="our answers per line at most")
+    parser.add_argument("--torch-threads", type=int, default=1,
+                        help="CPU threads for the model; the workers already keep --workers cores busy")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--out", type=Path, help="combo book (JSON lines)")
     args = parser.parse_args(argv)
+    torch.set_num_threads(args.torch_threads)
 
     table = CardTable.from_cdb()
     types = {card.code: card.type for card in table.cards}
@@ -647,6 +650,8 @@ def main(argv=None) -> None:
           f"{sum(r['field'] for r in results) / max(1, len(results)):.2f} (checked: "
           f"{sum(r['field'] for r in results if r['checked']) / max(1, passed):.2f}), search "
           f"{sum(r['seconds'] for r in results):.0f}s ({sum(r['seconds'] for r in results) / max(1, len(results)):.1f}s/combo)")
+    print(f"checked in some shuffles: {sum(r['checked_shuffles'] > 0 for r in results)} combos, "
+          f"{sum(r['checked_shuffles'] for r in results)}/{len(results) * args.shuffles} shuffles")
     print(f"steps with a location: {located[True]}, only named: {located[False]}")
     print("verb coverage (used/total):", {v: f"{verbs_used[v]}/{verbs[v]}" for v, _ in verbs.most_common(20)})
     if args.out:
