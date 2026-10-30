@@ -1,0 +1,232 @@
+diff --git a/lua/src/lapi.c b/lua/src/lapi.c
+--- a/lua/src/lapi.c
++++ b/lua/src/lapi.c
+@@ -1484,3 +1484,24 @@
+ LUA_API int lua_callbudgetexceeded (lua_State *L) {
+   return G(L)->callbudgetexceeded;
+ }
++
++
++LUA_API void lua_setmemlimit (lua_State *L, lua_Unsigned limit) {
++  G(L)->memlimit = cast(lu_mem, limit);
++}
++
++
++LUA_API lua_Unsigned lua_memused (lua_State *L) {
++  return gettotalbytes(G(L));
++}
++
++
++LUA_API lua_Unsigned lua_mempeak (lua_State *L) {
++  global_State *g = G(L);
++  return g->mempeak > gettotalbytes(g) ? g->mempeak : gettotalbytes(g);
++}
++
++
++LUA_API int lua_memlimitexceeded (lua_State *L) {
++  return G(L)->memlimitexceeded;
++}
+diff --git a/lua/src/lmem.c b/lua/src/lmem.c
+--- a/lua/src/lmem.c
++++ b/lua/src/lmem.c
+@@ -48,6 +48,38 @@
+ 
+ 
+ /*
++** Memory limit (lua_setmemlimit). It wraps the allocation function: a
++** request that would take the state past the limit fails as if the
++** allocator had run out of memory, so Lua runs an emergency collection
++** and then raises LUA_ERRMEM. It only applies once the limit is set
++** (after the state is built, so never inside lua_newstate) and only where
++** the error can be caught: an allocation made outside every protected call
++** (e.g. ocgcore creating a group from C++) would otherwise abort the
++** process, so it may go past the limit. 'os' of a new block is its type
++** tag, not a size.
++*/
++#define overlimit(L,g,block,os,ns) \
++  ((g)->memlimit != 0 && \
++   (ns) > ((block) ? (os) : 0) && \
++   gettotalbytes(g) + ((ns) - ((block) ? (os) : 0)) > (g)->memlimit && \
++   ((L)->errorJmp != NULL || (g)->mainthread->errorJmp != NULL))
++
++static void *limitedrealloc (lua_State *L, void *block, size_t os,
++                                                        size_t ns) {
++  global_State *g = G(L);
++  if (l_unlikely(overlimit(L, g, block, os, ns)))
++    return NULL;
++  return callfrealloc(g, block, os, ns);
++}
++
++static void notemempeak (global_State *g) {
++  lu_mem total = gettotalbytes(g);
++  if (total > g->mempeak)
++    g->mempeak = total;
++}
++
++
++/*
+ ** When an allocation fails, it will try again after an emergency
+ ** collection, except when it cannot run a collection.  The GC should
+ ** not be called while the state is not fully built, as the collector
+@@ -66,14 +98,14 @@
+ ** fail) and when it cannot try again; this fail will trigger 'tryagain'
+ ** and a full GC cycle at every allocation.
+ */
+-static void *firsttry (global_State *g, void *block, size_t os, size_t ns) {
++static void *firsttry (lua_State *L, global_State *g, void *block, size_t os, size_t ns) {
+   if (ns > 0 && cantryagain(g))
+     return NULL;  /* fail */
+   else  /* normal allocation */
+-    return callfrealloc(g, block, os, ns);
++    return limitedrealloc(L, block, os, ns);
+ }
+ #else
+-#define firsttry(g,block,os,ns)    callfrealloc(g, block, os, ns)
++#define firsttry(L,g,block,os,ns)    limitedrealloc(L, block, os, ns)
+ #endif
+ 
+ 
+@@ -162,11 +194,14 @@
+ static void *tryagain (lua_State *L, void *block,
+                        size_t osize, size_t nsize) {
+   global_State *g = G(L);
++  void *newblock = NULL;
+   if (cantryagain(g)) {
+     luaC_fullgc(L, 1);  /* try to free some memory... */
+-    return callfrealloc(g, block, osize, nsize);  /* try again */
++    newblock = limitedrealloc(L, block, osize, nsize);  /* try again */
+   }
+-  else return NULL;  /* cannot run an emergency collection */
++  if (newblock == NULL && overlimit(L, g, block, osize, nsize))
++    g->memlimitexceeded = 1;  /* failing because of the limit */
++  return newblock;
+ }
+ 
+ 
+@@ -177,7 +212,7 @@
+   void *newblock;
+   global_State *g = G(L);
+   lua_assert((osize == 0) == (block == NULL));
+-  newblock = firsttry(g, block, osize, nsize);
++  newblock = firsttry(L, g, block, osize, nsize);
+   if (l_unlikely(newblock == NULL && nsize > 0)) {
+     newblock = tryagain(L, block, osize, nsize);
+     if (newblock == NULL)  /* still no memory? */
+@@ -185,6 +220,8 @@
+   }
+   lua_assert((nsize == 0) == (newblock == NULL));
+   g->GCdebt = (g->GCdebt + nsize) - osize;
++  if (nsize > osize)
++    notemempeak(g);
+   return newblock;
+ }
+ 
+@@ -203,13 +240,14 @@
+     return NULL;  /* that's all */
+   else {
+     global_State *g = G(L);
+-    void *newblock = firsttry(g, NULL, tag, size);
++    void *newblock = firsttry(L, g, NULL, tag, size);
+     if (l_unlikely(newblock == NULL)) {
+       newblock = tryagain(L, NULL, tag, size);
+       if (newblock == NULL)
+         luaM_error(L);
+     }
+     g->GCdebt += size;
++    notemempeak(g);
+     return newblock;
+   }
+ }
+diff --git a/lua/src/lstate.c b/lua/src/lstate.c
+--- a/lua/src/lstate.c
++++ b/lua/src/lstate.c
+@@ -406,6 +406,9 @@
+   g->callcount = 0;
+   g->callbudget = ~(lua_Unsigned)0;
+   g->callbudgetexceeded = 0;
++  g->memlimit = 0;
++  g->mempeak = 0;
++  g->memlimitexceeded = 0;
+   setivalue(&g->nilvalue, 0);  /* to signal that state is not yet built */
+   setgcparam(g->gcpause, LUAI_GCPAUSE);
+   setgcparam(g->gcstepmul, LUAI_GCMUL);
+diff --git a/lua/src/lstate.h b/lua/src/lstate.h
+--- a/lua/src/lstate.h
++++ b/lua/src/lstate.h
+@@ -256,6 +256,9 @@
+   lua_Unsigned callcount;  /* function calls since lua_setcallbudget */
+   lua_Unsigned callbudget;  /* error once callcount passes this */
+   int callbudgetexceeded;
++  lu_mem memlimit;  /* lua_setmemlimit: allocations past this fail (0: no limit) */
++  lu_mem mempeak;  /* highest gettotalbytes seen */
++  int memlimitexceeded;  /* an allocation failed because of memlimit */
+   lua_Alloc frealloc;  /* function to reallocate memory */
+   void *ud;         /* auxiliary data to 'frealloc' */
+   l_mem totalbytes;  /* number of bytes currently allocated - GCdebt */
+diff --git a/lua/src/lua.h b/lua/src/lua.h
+--- a/lua/src/lua.h
++++ b/lua/src/lua.h
+@@ -471,6 +471,13 @@
+ LUA_API void (lua_setcallbudget) (lua_State *L, lua_Unsigned budget);
+ LUA_API lua_Unsigned (lua_callcount) (lua_State *L);
+ LUA_API int (lua_callbudgetexceeded) (lua_State *L);
++
++/* Memory limit: allocations that would take the state past `limit` bytes
++   fail (LUA_ERRMEM) once the state is built; 0 disables it. */
++LUA_API void (lua_setmemlimit) (lua_State *L, lua_Unsigned limit);
++LUA_API lua_Unsigned (lua_memused) (lua_State *L);
++LUA_API lua_Unsigned (lua_mempeak) (lua_State *L);
++LUA_API int (lua_memlimitexceeded) (lua_State *L);
+ LUA_API lua_Hook (lua_gethook) (lua_State *L);
+ LUA_API int (lua_gethookmask) (lua_State *L);
+ LUA_API int (lua_gethookcount) (lua_State *L);
+diff --git a/ocgapi.cpp b/ocgapi.cpp
+--- a/ocgapi.cpp
++++ b/ocgapi.cpp
+@@ -120,6 +120,26 @@
+ 	return lua_callcount(static_cast<duel*>(ocg_duel)->lua->lua_state);
+ }
+ 
++void OCG_DuelSetLuaMemoryLimit(OCG_Duel ocg_duel, uint64_t bytes) {
++	lua_setmemlimit(static_cast<duel*>(ocg_duel)->lua->lua_state, bytes);
++}
++
++uint64_t OCG_DuelLuaMemory(OCG_Duel ocg_duel) {
++	return lua_memused(static_cast<duel*>(ocg_duel)->lua->lua_state);
++}
++
++uint64_t OCG_DuelLuaMemoryPeak(OCG_Duel ocg_duel) {
++	return lua_mempeak(static_cast<duel*>(ocg_duel)->lua->lua_state);
++}
++
++int OCG_DuelLuaMemoryExceeded(OCG_Duel ocg_duel) {
++	return lua_memlimitexceeded(static_cast<duel*>(ocg_duel)->lua->lua_state);
++}
++
++uint64_t OCG_DuelLuaHeapExtent(OCG_Duel ocg_duel) {
++	return static_cast<duel*>(ocg_duel)->lua->heap.extent().second;
++}
++
+ int OCG_DuelSetStartingPlayer(OCG_Duel ocg_duel, uint8_t player) {
+ 	if(ocg_duel == nullptr)
+ 		return 0;
+diff --git a/ocgapi.h b/ocgapi.h
+--- a/ocgapi.h
++++ b/ocgapi.h
+@@ -65,6 +65,16 @@
+ OCGAPI int OCG_DuelLuaBudgetExceeded(OCG_Duel ocg_duel);
+ /* Lua function calls made by the last process call. */
+ OCGAPI uint64_t OCG_DuelLuaCalls(OCG_Duel ocg_duel);
++/* Lua memory limit in bytes (0: none, the default). Set it after OCG_CreateDuel: allocations that
++   would pass it fail with a Lua memory error (after an emergency collection). */
++OCGAPI void OCG_DuelSetLuaMemoryLimit(OCG_Duel ocg_duel, uint64_t bytes);
++/* Bytes the duel's Lua state uses now, and the most it ever used. */
++OCGAPI uint64_t OCG_DuelLuaMemory(OCG_Duel ocg_duel);
++OCGAPI uint64_t OCG_DuelLuaMemoryPeak(OCG_Duel ocg_duel);
++/* Nonzero once an allocation failed because of the limit; the duel's state is then unreliable. */
++OCGAPI int OCG_DuelLuaMemoryExceeded(OCG_Duel ocg_duel);
++/* Size of the region holding the Lua heap (what a clone copies; it never shrinks). */
++OCGAPI uint64_t OCG_DuelLuaHeapExtent(OCG_Duel ocg_duel);
+ 
+ /*** DUEL PROCESSING AND QUERYING ***/
+ OCGAPI int OCG_DuelProcess(OCG_Duel ocg_duel);

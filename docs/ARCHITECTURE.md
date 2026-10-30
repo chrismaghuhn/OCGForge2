@@ -91,6 +91,21 @@ self-play across all deck pairings this cuts off roughly 3% of duels. The
 budget is counted in Lua's call path (`lua/src/ldo.c`) rather than with a
 count hook, which would make the VM check every instruction (~10% slower).
 
+Patch 0006 adds a Lua memory budget the same way: `CoreHostConfig::lua_memory_limit`
+(default 64 MiB, `DuelConfig::lua_memory_limit`, 0 = none) is set with
+`OCG_DuelSetLuaMemoryLimit` right after `OCG_CreateDuel`, never while the Lua state is
+being built. It wraps the fork's region allocator in Lua's allocation path (`lua/src/lmem.c`):
+a request that would take the state past the limit fails like an out-of-memory, Lua runs an
+emergency collection and then raises a memory error, and `CoreHost` throws
+"Lua memory budget exceeded" (after creation, loading cards and every `process`). Only
+allocations that can raise an error are refused: one made outside every protected call (ocgcore
+creating a group from C++) would abort the process instead, so it may go past the limit. The
+counter is Lua's own byte count, part of the Lua state, so a clone copies it.
+`OCG_DuelLuaMemory` / `OCG_DuelLuaMemoryPeak` / `OCG_DuelLuaHeapExtent` (Python:
+`Duel.lua_memory`) report it. Random duels over every deck pairing (decks/ and holdout, 118
+duels): 1.7 MB after creation, peak median 3.6 MB, max 5.2 MB; per deck the highest peak is
+3.9-5.2 MB, so the default leaves >10x headroom below the fork's 256 MiB heap reserve.
+
 `VectorEnv::info(env)` shows the seed, decks and actions of an env's current
 duel (also while `step` runs), which is enough to replay a stuck duel with
 `Duel` alone. Duels that fail to start are counted in `start_failures`.
@@ -110,6 +125,11 @@ Fixed inputs live in `third_party/deps.json` (exact commits) and
 - `0004-lua-call-budget.patch`: the per-call Lua call budget above, with
   `OCG_DuelLuaBudgetExceeded` and `OCG_DuelLuaCalls`; it also patches the
   bundled Lua (`lua/src`), so `setup_deps.py` resets that submodule too.
+- `0005-own-applied-chain-counters.patch`: frees per-chain-link counter lists
+  of a duel destroyed mid-chain (see `docs/engine-clone.md`).
+- `0006-lua-memory-budget.patch`: the Lua memory budget above, with
+  `OCG_DuelSetLuaMemoryLimit`, `OCG_DuelLuaMemory`, `OCG_DuelLuaMemoryPeak`,
+  `OCG_DuelLuaMemoryExceeded` and `OCG_DuelLuaHeapExtent`.
 
 `tools/setup_deps.py` applies the patches in order to a clean checkout and
 records their hashes in `.cache/ocgcore/.ocgforge-patches`.

@@ -325,6 +325,17 @@ NB_MODULE(_core, m) {
              "clone is not a sampled world. Faster than replaying the actions into a new Duel. Clones of "
              "one duel may be made from several threads at once while nothing acts on it. Raises on a "
              "finished duel.")
+        .def_prop_ro("lua_memory",
+                     [](const Duel& d) {
+                         const auto memory = d.lua_memory();
+                         nb::dict out;
+                         out["used"] = memory.used;
+                         out["peak"] = memory.peak;
+                         out["heap_extent"] = memory.heap_extent;
+                         return out;
+                     },
+                     "Bytes of the engine's Lua state: used now (garbage included), peak, and the size of the "
+                     "heap region a clone copies.")
         .def_prop_ro("reseeds", &Duel::reseeds, "Seeds clone(seed) reseeded this duel with, oldest first.")
         .def_prop_ro("finished", &Duel::finished)
         .def_prop_ro("winner", [](const Duel& d) -> std::optional<std::uint8_t> {

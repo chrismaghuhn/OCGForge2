@@ -16,6 +16,7 @@ add_executable(ocgforge_tests
     protocol/sum_selection_test.cpp
     duel/duel_test.cpp
     duel/clone_test.cpp
+    duel/lua_memory_test.cpp
     encode/encoder_test.cpp
 )
 target_include_directories(ocgforge_tests PRIVATE .)
