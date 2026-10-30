@@ -342,7 +342,9 @@ class AsyncCollector:
 
     With `skip_forced`, decisions with a single candidate (about a third, mostly chain prompts) are
     answered without a forward pass and are not kept for training: they carry no policy gradient,
-    and the segment's GAE then runs over the real choices only."""
+    and the segment's GAE then runs over the real choices only. An env made with
+    vector_env(skip_forced=True) answers them in C++ before they reach Python (cheaper: no
+    observation is built); `steps`, `decisions` and `forced_decisions` count those too."""
 
     def __init__(self, env, batch_size: int, segment: int = 128, league: League | None = None,
                  card_usage: CardUsage | None = None, extra_usage: ExtraDeckUsage | None = None,
@@ -364,7 +366,8 @@ class AsyncCollector:
         Failed duels (including ones that hit the decision limit) drop their unfinished segments."""
         segments: list[tuple[list[dict], float, float | None]] = []
         stats = RolloutStats()
-        while stats.decisions < steps:
+        env_forced = getattr(self.env, "forced_decisions", 0)  # answered in C++ (vector_env(skip_forced=True))
+        while stats.decisions + getattr(self.env, "forced_decisions", 0) - env_forced < steps:
             ids, batch, done, winners, errors = self.env.recv_batch(self.batch_size)
             ids = ids.tolist()
             if not ids:  # every env is still handed out, e.g. by an earlier interrupted call
@@ -436,6 +439,9 @@ class AsyncCollector:
                 seat.append(decision)
             self.env.send(ids, choices)
             stats.decisions += len(ids)
+        env_forced = getattr(self.env, "forced_decisions", 0) - env_forced
+        stats.decisions += env_forced
+        stats.forced_decisions += env_forced
         for key, seat in self.pending.items():
             if len(seat) > 1:
                 segments.append((seat[:-1], 0.0, float(seat[-1]["value"])))

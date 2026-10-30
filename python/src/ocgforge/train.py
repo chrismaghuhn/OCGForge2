@@ -381,7 +381,8 @@ def main(argv=None) -> None:
           flush=True)
 
     env = rollout.vector_env(model.card_features, args.decks, num_envs=args.envs,
-                             seed=args.seed * 1_000_003 + iteration, threads=args.threads)
+                             seed=args.seed * 1_000_003 + iteration, threads=args.threads,
+                             skip_forced=args.skip_forced)
     league = rollout.League(args.league_share, args.league_size, seed=args.seed)
     first: Model | None = None  # first and latest arena checkpoint, for the arena
     previous: Model | None = None
