@@ -55,17 +55,19 @@ void CardDataStore::load(const std::filesystem::path& path) {
 }
 
 std::shared_ptr<const CardDataStore> CardDataStore::shared(const std::filesystem::path& path) {
-    // Never destroyed: worker threads may still start duels while the process exits.
+    // Kept while the process runs, like the compiled card scripts (ScriptCache), so a duel created
+    // after the last one was destroyed does not parse the file again (~7 ms). Card data and
+    // scripts are both read once per process; a process that should see an updated .cache must
+    // be restarted. Never destroyed: worker threads may still start duels while the process exits.
     static auto* mutex = new std::mutex;
-    static auto* cache = new std::map<std::filesystem::path, std::weak_ptr<const CardDataStore>>;
+    static auto* cache = new std::map<std::filesystem::path, std::shared_ptr<const CardDataStore>>;
     std::lock_guard lock(*mutex);
-    auto& weak = (*cache)[path];
-    if (auto store = weak.lock()) {
-        return store;
+    auto& store = (*cache)[path];
+    if (!store) {
+        auto loaded = std::make_shared<CardDataStore>();
+        loaded->load(path);
+        store = std::move(loaded);
     }
-    auto store = std::make_shared<CardDataStore>();
-    store->load(path);
-    weak = store;
     return store;
 }
 

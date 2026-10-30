@@ -11,6 +11,7 @@
 #include <utility>
 #include <vector>
 
+#include "ygo/core/core_host.hpp"
 #include "ygo/core/deck.hpp"
 #include "ygo/observation/player_observation.hpp"
 #include "ygo/protocol/decision_request.hpp"
@@ -54,6 +55,11 @@ struct DuelConfig {
     std::uint64_t max_decisions = 5000;
     std::uint32_t block_after = 8;
     std::uint32_t max_repeats = 64;
+    // Lua memory budget of the engine (bytes, 0: none). A card script allocating past it fails the
+    // duel with a DuelError, like the Lua call budget.
+    std::uint64_t lua_memory_limit = core::CoreHostConfig::kDefaultLuaMemoryLimit;
+    // Lua's generational collector (default) or the incremental one; play is the same either way.
+    bool lua_generational_gc = true;
 };
 
 // DuelResult::reason of a duel lost by looping (see DuelConfig::block_after).
@@ -124,6 +130,10 @@ public:
     DuelSnapshot snapshot() const;
     // Answers removed so far by loop blocking.
     std::uint64_t blocked_answers() const noexcept { return blocked_answers_; }
+    // Memory of the engine's Lua state (current, peak, heap region size).
+    core::LuaMemory lua_memory() const noexcept;
+    // A full collection of the engine's Lua heap (garbage only; play is unchanged).
+    void collect_lua_garbage();
 
     // An independent copy of the duel at the pending decision: the engine state (ocgcore fork's
     // OCG_CloneDuel) and everything this wrapper keeps (observation sessions, the pending request
