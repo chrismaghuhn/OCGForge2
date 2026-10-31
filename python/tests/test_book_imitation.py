@@ -80,6 +80,26 @@ def test_holdout_by_seed_keeps_shared_states_in_training(tmp_path, monkeypatch):
     assert held[0]["token_card"].tolist() == [1, 2]  # after the held-out line summoned Tinia
 
 
+class TwoTurns(Solo):
+    """Like Solo, but ending the turn (idle.7.0) starts turn 2, still with seat 0 choosing."""
+
+    def act(self, key):
+        if key == "idle.7.0":
+            self.turn += 1
+        else:
+            super().act(key)
+
+
+def test_lines_stop_at_the_end_of_turn_1():
+    keys = [f"idle.1.0.{LUCINA}.0.2.0", "chain.pass", "idle.7.0", f"idle.1.0.{REGINA}.0.2.0", "chain.pass"]
+    relevant = {LUCINA, REGINA, TINIA}
+    book = bp.Book({}, {}, relevant, ((), ()))
+    out = bi.line_samples(lambda: TwoTurns([LUCINA, REGINA, TINIA]), keys, book, {})
+    assert len(out) == 2  # Lucina's summon and the end of turn 1; nothing from turn 2
+    walked = bp.ob.walk(lambda: TwoTurns([LUCINA, REGINA, TINIA]), keys, relevant)
+    assert [answer for _, answer, _, _ in walked] == [f"idle.1.{LUCINA}.0.2.0", "idle.7.0"]
+
+
 class Fixed(torch.nn.Module):
     """Scores the candidate at index `best`; value 0.25."""
 

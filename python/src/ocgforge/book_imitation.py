@@ -23,7 +23,6 @@ import numpy as np
 import torch
 
 from . import book_policy as bp
-from . import combo_check as cc
 from . import features
 from . import opening_book as ob
 from . import worlds
@@ -36,11 +35,12 @@ def held_out(seed_id: str, share: float) -> bool:
 
 
 def line_samples(start, keys: list[str], book: bp.Book, card_index) -> list[tuple[str, dict]]:
-    """(state, sample) at each real choice of seat 0 along a line replayed from `start`."""
+    """(state, sample) at each real choice of seat 0 along a line replayed from `start`, in turn 1
+    only (the book's turn, as in `opening_book.walk`)."""
     duel = start()
     out = []
     for key in keys:
-        if duel is None or duel.finished or key not in duel.keys():
+        if duel is None or duel.finished or duel.turn > 1 or key not in duel.keys():
             break
         options = duel.keys()
         if duel.player == 0 and len(options) > 1:
@@ -56,15 +56,11 @@ def line_samples(start, keys: list[str], book: bp.Book, card_index) -> list[tupl
 
 
 def samples(path: Path, card_index, holdout: float = 0.0) -> tuple[list[dict], list[dict]]:
-    """(train, held-out) samples of the book `path`."""
+    """(train, held-out) samples of the book `path`. The lines and their scenario starts come from
+    `book_policy.load`; each line is replayed once more here, as the book build keeps no encodings."""
     book = bp.load(path)
-    stem = path.with_name(path.stem)
-    meta = json.loads(Path(f"{stem}-meta.json").read_text(encoding="utf-8"))
-    deck, opponent = bp.resolve(meta["deck"]), bp.resolve(meta["opponent"])
     train, held = {}, {}
-    for text in Path(f"{stem}-lines.jsonl").read_text(encoding="utf-8").splitlines():
-        result = json.loads(text)
-        start = cc.puzzle_start(deck, opponent, result["script"], result["duel_seed"])
+    for result, start in book.lines:
         into = held if held_out(result["seed"], holdout) else train
         for state, sample in line_samples(start, result["line"], book, card_index):
             into.setdefault(state, sample)

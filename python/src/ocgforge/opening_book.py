@@ -120,11 +120,12 @@ def book_cards(results: list[dict]) -> set[int]:
 
 def walk(start, keys: list[str], relevant: set[int]) -> list[tuple[str, str, int, str]]:
     """(state, answer, depth, loose state) for each of our answers along a line replayed from its
-    scenario. `stay` computes the same keys at the same decisions."""
+    scenario, in turn 1 only (the book's turn; a line that runs on into turn 2 stops there, as
+    `stay` does). `stay` computes the same keys at the same decisions."""
     duel = start()
     out, depth = [], 0
     for key in keys:
-        if duel is None or duel.finished or key not in duel.keys():
+        if duel is None or duel.finished or duel.turn > 1 or key not in duel.keys():
             break
         if duel.player == 0:
             out.append((state_key(duel, relevant), worlds.canonical(key), depth, state_key(duel, relevant, False)))
