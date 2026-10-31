@@ -216,3 +216,14 @@ def test_summary_counts_lines_and_compares_with_the_net():
 def test_trap_pool_prefers_hand_traps_that_stop_a_combo():
     names = {1: "Mulcharmy Fuwalos", 2: "Effect Veiler", 3: "Ash Blossom & Joyous Spring", 4: "Unknown"}
     assert ts.trap_pool({1: set(), 2: set(), 3: set(), 4: set()}, names, 2) == [3, 2]
+
+
+def test_iteration_counts_only_saved_teach_rounds(tmp_path):
+    from ocgforge import turn1_iteration as ti
+
+    assert ti.saved_rounds(5, 2, ok=False) == 4 and ti.saved_rounds(5, 2, ok=True) == 5
+    book = ti.book_path(tmp_path, Path("decks/elfnote.ydk"))
+    assert book.name == "elfnote-t1.jsonl" and not ti.search_done(book, 10)
+    book.write_text("")
+    ti.done_marker(book).write_text("10")
+    assert ti.search_done(book, 10)
