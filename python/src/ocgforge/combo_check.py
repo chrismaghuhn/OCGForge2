@@ -31,6 +31,9 @@ import torch
 
 from . import combos as cb
 from . import features, rollout, worlds
+from .answer_rules import (STEP_BONUS, choice_by_outcome, forced, offered_bonus, peek, plan_choice,  # noqa: F401
+                           step_bonus, trigger_key)
+from .steps import expected_location, step_entries, step_groups, step_loose, step_targets  # noqa: F401
 
 TYPE_EXTRA = 0x40 | 0x2000 | 0x800000 | 0x4000000  # Fusion, Synchro, Xyz, Link
 PHASE_END = re.compile(r"^idle\.[6-9]\.\d+$")  # to Battle Phase / End Phase (no card)
@@ -40,9 +43,7 @@ CENTER = re.compile(r"(this card|Summoned|it)[^.]{0,40}\b(to|in) (the|your) cent
 # Answers that move the duel on and cannot loop: the board stays the same over several chain windows,
 # so the loop guard (same answer on the same board) must not take them away.
 PASSIVE = ("chain.pass", "yes_no.", "effect_yes_no.")
-POS_ATTACK = 0x1
 MAX_SKIPPED = 2  # steps a checked combo may pass over (once-per-turn effects, steps the board cannot show)
-EMZ = (5, 6)
 
 
 def wants_center(text: str) -> bool:
@@ -130,107 +131,6 @@ def candidate_logprobs(model, rows: list[dict], device: str) -> list[list[float]
     return [logprobs[i, : len(r["candidate_kind"])].tolist() for i, r in enumerate(rows)]
 
 
-# What a step's action text says happened to its card, as the location the card has to reach. None
-# means "the card was used" (its effect activated, it was selected, ...): any answer naming it.
-# The first verb of the text's head (before "->", "(", ",", " - ") decides; a verb whose object is
-# another card ("Tribute Tinia" on Welcome Home, "Revive Power Patron" on Synchro Rumble, "Search
-# Lucina") means this card was only used.
-SUMMONED = ("summon", "summoned", "special", "ss", "ns", "revive", "synchro", "syncho", "xyz", "link", "fusion",
-            "ritual")
-VERB_LOCATION = {
-    **{w: worlds.LOCATION_MZONE for w in SUMMONED},
-    **{w: worlds.LOCATION_HAND for w in ("add", "search", "return")},
-    **{w: worlds.LOCATION_GRAVE for w in ("send", "tribute", "discard", "discarded", "material", "detach", "mill",
-                                          "dump", "gy", "grave")},
-    "banish": worlds.LOCATION_REMOVED,
-    **{w: worlds.LOCATION_SZONE for w in ("place", "set", "scale")},
-}
-# Words between a verb and its object that do not name a card.
-FILLER = {"to", "from", "the", "a", "an", "back", "it", "itself", "this", "card", "for", "cost", "effect", "summon",
-          "hand", "deck", "gy", "grave", "ed", "extra", "mmz", "emz", "center", "centre", "middle", "main", "monster",
-          "zone", "until", "ep", "end", "phase", "in", "on", "own", "its", "again", "face", "up", "down", "using",
-          "with", "of", "by", "p", "pendulum", "field", "and", "activate", "use", "then", "if", "as", "level"}
-HEAD = re.compile(r"->|=>|\(|,|;|:| - | then ")
-
-
-def _tokens(name: str) -> set[str]:
-    return {w for w in re.findall(r"[a-z0-9]+", name.lower()) if len(w) >= 3}
-
-
-def expected_location(action: str, name: str = "", others: set[str] = frozenset()) -> int | None:
-    """Where the step's card (`name`) has to arrive, from its action text; `others` are name words of
-    the combo's other cards (a lower-case object like "banish fallen and cart" is another card too)."""
-    head = HEAD.split(action, maxsplit=1)[0]
-    words = re.findall(r"[A-Za-z0-9]+", head)
-    lower = [w.lower() for w in words]
-    mine = _tokens(name)
-    for i, w in enumerate(lower):
-        if w not in VERB_LOCATION or (w == "link" and i and lower[i - 1] == "chain"):
-            continue
-        location = VERB_LOCATION[w]
-        rest = lower[i + 1:]
-        if w == "return":  # "return to field" is a summon; back to the Extra Deck is nowhere we track
-            if "field" in rest:
-                return worlds.LOCATION_MZONE
-            if "extra" in rest:
-                return None
-        if "into" in rest:  # "Synchro 10 into Baronne": this card is the material unless it is Baronne
-            target = {t for t in rest[rest.index("into") + 1:] if len(t) >= 3}
-            return worlds.LOCATION_MZONE if target & mine or not target else worlds.LOCATION_GRAVE
-        for j, t in enumerate(rest):
-            if t in FILLER or t.isdigit() or t in VERB_LOCATION:
-                continue
-            if t in mine:
-                break  # names this card
-            if words[i + 1 + j][0].isupper() or t in others:
-                return None  # another card is the object: this one was only used
-            break
-        return location
-    if re.search(r"\b(comes? back|return) to (the )?field\b", head.lower()):
-        return worlds.LOCATION_MZONE
-    return None
-
-
-OPPONENT = re.compile(r"\bopp(onent)?('s)?\b", re.IGNORECASE)
-
-
-def ours(combo: cb.Combo, entry: cb.Entry) -> bool:
-    """An entry we play: not the opponent's hand trap of a "vs Fuwalos" line ("Opp chains Fuwalos";
-    the puzzle opponent never acts), and naming a card."""
-    return entry.code is not None and not OPPONENT.search(entry.action) and entry.code not in combo.vs_hand_traps
-
-
-def step_entries(combo: cb.Combo) -> list[tuple[int, cb.Entry]]:
-    """The entries the search follows, with the index of the community step each belongs to."""
-    return [(n, e) for n, step in enumerate(combo.steps) for e in step if ours(combo, e)]
-
-
-def step_groups(combo: cb.Combo) -> list[int]:
-    """For each step entry (as in `step_targets`), the index of the community step it belongs to."""
-    return [n for n, _ in step_entries(combo)]
-
-
-EFFECT_FIRST = re.compile(r"^\s*(activate\s+)?(its\s+|own\s+|hand\s+|gy\s+|pendulum\s+)?(effect|eff)\b", re.IGNORECASE)
-
-
-def step_loose(combo: cb.Combo) -> frozenset:
-    """Steps whose text puts "effect" before the verb ("Effect to Revive" on Vidolium, "Activate Eff
-    to SS"): whether the card itself moves or its effect moves another card is open, so naming the
-    card by an answer also does them."""
-    return frozenset(i for i, (_, e) in enumerate(step_entries(combo)) if EFFECT_FIRST.search(e.action))
-
-
-def step_targets(combo: cb.Combo) -> list[tuple[int, int | None]]:
-    """The combo's steps as (card, expected location)."""
-    entries = [e for _, e in step_entries(combo)]
-    words = {e.code: _tokens(e.name) for e in [*combo.starting, *entries] if e.code is not None}
-    targets = []
-    for e in entries:
-        others = set().union(*(w for code, w in words.items() if code != e.code)) - words.get(e.code, set())
-        targets.append((e.code, expected_location(e.action, e.name, others)))
-    return targets
-
-
 def board(duel) -> Counter:
     """(passcode, location) -> count of our cards, for telling what an answer did."""
     return Counter((c["code"], c["location"]) for c in duel.snapshot()["cards"] if c["controller"] == 0)
@@ -302,55 +202,6 @@ def advance(line: Line, targets: list[tuple[int, int | None]], last_key: str | N
     return progress - line.progress, tuple(skipped), frozenset(ahead)
 
 
-def placing(keys: list[str]) -> int | None:
-    """The card a zone question is about: the last summon, activation or card choice of ours
-    (materials and costs are chosen after it, so selections of several cards do not count)."""
-    for key in reversed(keys):
-        if key.startswith(("idle.", "card.", "chain.")):
-            ref = worlds.card_ref(key)
-            if ref is not None:
-                return int(ref[1])
-    return None
-
-
-def forced(keys: list[str], history: list[str], upcoming_center: bool, center: set[int], is_extra) -> str | None:
-    """The answer the rules fix without searching (docs/combo-teacher-design.md, K1 finding), or None.
-    - Position: face-up attack.
-    - Monster zone: the center for a monster that wants it; the Extra Monster Zone for another Extra
-      Deck monster; else a side zone, keeping the center free when the plan still needs it."""
-    if all(k.startswith("position.") for k in keys):
-        attack = [k for k in keys if k.rsplit(".", 1)[-1].isdigit() and int(k.rsplit(".", 1)[-1]) & POS_ATTACK]
-        return (attack or keys)[0]
-    zones = {int(k.split(".")[3]): k for k in keys if k.startswith("place.0.4.") and len(k.split(".")) == 4}
-    if zones and len(zones) == len(keys):
-        code = placing(history)
-        if code in center and 2 in zones:
-            return zones[2]
-        if code is not None and is_extra(code) and code not in center:
-            for z in EMZ:
-                if z in zones:
-                    return zones[z]
-        sides = [z for z in (1, 3, 0, 4) if z in zones]
-        if sides:
-            return zones[sides[0]]
-        return zones[2] if 2 in zones and not upcoming_center else next(iter(zones.values()))
-    return None
-
-
-def plan_choice(keys: list[str], allowed: set[int], ahead: list[int]) -> set[int]:
-    """In a choice of one card (`card.` answers: a search, a target, a monster to summon), only the
-    card of the earliest coming step that is offered; the model must not swap it for another legal
-    card (Welcome Home calling Fortuna where the plan wants Regina). Unchanged when none is offered."""
-    if not all(k.startswith("card.") for k in keys):
-        return allowed
-    codes = {i: int(ref[1]) for i in allowed if (ref := worlds.card_ref(keys[i])) is not None}
-    for code in ahead:
-        chosen = {i for i, c in codes.items() if c == code}
-        if chosen:
-            return chosen
-    return allowed
-
-
 def grow(children: list[tuple[Line, object]]) -> list[Line]:
     """Play each chosen child's last answer on a clone of its parent's duel; the parent's last child
     takes the parent's duel itself. A child whose answer the engine rejects is dropped."""
@@ -366,59 +217,6 @@ def grow(children: list[tuple[Line, object]]) -> list[Line]:
         child.duel = duel
         grown.append(child)
     return grown
-
-
-def peek(duel, key: str, history: list[str], upcoming_center: bool, center: set[int], is_extra,
-         ahead: list[int], max_answers: int = 12) -> set[int]:
-    """The cards our next real question offers after `key`, on a clone: optional chain windows are
-    passed and positions and zones fixed (`forced`) on the way. A yes/no question ("reduce
-    Strelitzia's level?") decides whether the plan's next Synchro is still there."""
-    try:
-        copy = duel.clone()
-        copy.act(key)
-        history = history + [key]
-        for _ in range(max_answers):
-            if copy.finished:
-                return set()
-            keys = copy.keys()
-            offered = {int(ref[1]) for k in keys if (ref := worlds.card_ref(k)) is not None}
-            optional_chain = "chain.pass" in keys and all(k.startswith("chain.") for k in keys)
-            if copy.player != 0 or (optional_chain and not offered & set(ahead)):
-                answer = worlds.decline(keys)
-            else:
-                answer = forced(keys, history, upcoming_center, center, is_extra)
-                if answer is None:
-                    return offered
-            copy.act(answer)
-            history = history + [answer]
-    except Exception:
-        return set()
-    return set()
-
-
-STEP_BONUS = 20.0  # for an answer naming the next step's card: above the model's log-probabilities
-
-
-def step_bonus(index: int) -> float:
-    """Bonus for naming the card of the `index`-th coming step (0 = the next)."""
-    return STEP_BONUS * (1.0 - index / 3.0)
-
-
-def offered_bonus(offered: set[int], ahead: list[int]) -> float:
-    """Bonus for an answer after which the next steps' cards are offered (6 for the next one, as
-    for answers naming it)."""
-    return max((step_bonus(i) for i, code in enumerate(ahead) if code in offered), default=0.0)
-
-
-def trigger_key(row: dict, keys: list[str], i: int, codes: dict[int, int]) -> str | None:
-    """A key naming the card a yes/no answer is about ("activate Power Patron's effect?"), from the
-    encoded decision (candidate source token -> card index -> passcode), or None."""
-    try:
-        token = row["candidate_source"][i]
-        code = codes.get(int(row["token_card"][token])) if token is not None and token >= 0 else None
-    except (KeyError, IndexError, TypeError):
-        return None
-    return f"trigger.{code}.0.0.0" if code else None
 
 
 def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12, branch: int = 4,
@@ -520,7 +318,11 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
                         if n > 0 and loc in (worlds.LOCATION_MZONE, worlds.LOCATION_SZONE)}
             # An optional chain window (a mandatory one has no pass and is never filtered).
             chain_window = "chain.pass" in keys and all(k.startswith("chain.") for k in keys)
-            if chain_window and not any((ref := worlds.card_ref(k)) and int(ref[1]) in window for k in keys):
+            # A card off the plan may chain if its effect brings the next step's card (Power Patron's
+            # search adds Fortuna): a clone shows whether the following question offers it.
+            leads = {k: b for k in keys if chain_window and (ref := worlds.card_ref(k)) and int(ref[1]) not in window
+                     and (b := offered_bonus(peek(duel, k, line.keys, later_center, center, is_extra, ahead), ahead))}
+            if chain_window and not leads and not any((r := worlds.card_ref(k)) and int(r[1]) in window for k in keys):
                 fixed = fixed or ("chain.pass" if "chain.pass" in keys else None)
             options = []
             for i, key in enumerate(keys):
@@ -534,6 +336,8 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
             if fixed is None:
                 allowed = {o[-1] for o in options} or set(range(len(keys)))  # all retried: undo still allowed
                 options = []
+                allowed = choice_by_outcome(duel, keys, allowed, line.board, [targets[i] for i in pending],
+                                            (line.keys, later_center, center, is_extra, ahead))
                 allowed = plan_choice(keys, allowed, ahead)
             for i, key in enumerate(keys):
                 if fixed is not None or i not in allowed:
@@ -541,7 +345,9 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
                 ref = worlds.card_ref(key)
                 value, bonus = lp[i], 0.0
                 if chain_window and ref is not None and int(ref[1]) not in window:
-                    continue  # our own hand trap or negation on our own chain
+                    if key not in leads:
+                        continue  # our own hand trap or negation on our own chain
+                    bonus = leads[key]
                 if (ref is not None and key.startswith(("unselect.", "select.", "card.")) and int(ref[1]) in key_cards
                         and int(ref[1]) in on_field and int(ref[1]) not in window | recent and len(keys) > 1):
                     continue  # an end-board card as material or cost
