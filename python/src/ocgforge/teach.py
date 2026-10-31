@@ -81,6 +81,18 @@ def train_round(student: Model, optimizer, samples: list[dict], device: str, bat
     return {key: round(value / max(n, 1), 4) for key, value in totals.items()}
 
 
+def book_samples(args, teacher: Model) -> tuple[list[dict], list[dict]]:
+    """--book: the books' training and held-out samples, value targets from the teacher."""
+    from .book_imitation import samples, with_values
+
+    train, held = [], []
+    for path in args.book:
+        t, h = samples(path, teacher.card_features.index_map(), args.book_holdout)
+        train += t
+        held += h
+    return with_values(teacher, train, args.device), with_values(teacher, held, args.device)
+
+
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--teacher", type=Path, required=True)
@@ -99,6 +111,10 @@ def main(argv=None) -> None:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--book", type=Path, nargs="*", default=[],
+                   help="opening books whose answers are mixed into every round (book_imitation)")
+    p.add_argument("--book-share", type=float, default=0.2, help="share of book samples in a round")
+    p.add_argument("--book-holdout", type=float, default=0.1, help="share of book seeds held out (agreement only)")
     args = p.parse_args(argv)
 
     teacher = load_checkpoint(args.teacher, args.device, dropout=0.0)
@@ -112,14 +128,26 @@ def main(argv=None) -> None:
     rng = random.Random(args.seed)
     args.out.mkdir(parents=True, exist_ok=True)
     log = open(args.out / "teach.jsonl", "a", encoding="utf-8")
+    book, book_held = book_samples(args, teacher) if args.book else ([], [])
+    if book:
+        from .book_imitation import agreement
+        line = {"round": 0, "book": len(book), "bookHeld": len(book_held),
+                "bookAgree": agreement(student, book, args.device), "bookHeldAgree": agreement(student, book_held, args.device)}
+        log.write(json.dumps(line) + "\n")
+        print(json.dumps(line), flush=True)
     for round_ in range(1, args.rounds + 1):
         start = time.time()
         samples = collect(env, teacher, args.steps, args.device, generator, max(1, args.envs // 2))
+        if book:  # book share s of the round: s / (1 - s) book samples per teacher sample
+            samples += rng.choices(book, k=round(len(samples) * args.book_share / (1 - args.book_share)))
         collected = time.time()
         stats = train_round(student, optimizer, samples, args.device, args.batch_size, args.micro_batch,
                             args.value_coef, rng)
         line = {"round": round_, "samples": len(samples), "collectSeconds": round(collected - start, 1),
                 "trainSeconds": round(time.time() - collected, 1), **stats}
+        if book:
+            line.update(bookAgree=agreement(student, book, args.device),
+                        bookHeldAgree=agreement(student, book_held, args.device))
         log.write(json.dumps(line) + "\n")
         log.flush()
         print(json.dumps(line), flush=True)
