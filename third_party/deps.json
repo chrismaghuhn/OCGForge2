@@ -17,7 +17,8 @@
       "0005-own-applied-chain-counters.patch",
       "0006-get-card-effect-by-code.patch",
       "0007-lua-memory-budget.patch",
-      "0008-lua-gc-control.patch"
+      "0008-lua-gc-control.patch",
+      "0009-reset-phase-cascading-removal.patch"
     ]
   },
   "cardscripts": {
