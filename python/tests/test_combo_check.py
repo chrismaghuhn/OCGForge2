@@ -232,3 +232,39 @@ def test_expected_location_reads_the_head_verb_and_its_object():
     assert loc("Resolve Chain link 2", "Guiding Quem") is None
     assert loc("Rip a card from hand", "PSY-Framelord Omega") is None
     assert loc("", "Elfnote Fortuna") is None
+
+
+class Turns:
+    """Seat 1 answers `seat1` questions, then our turn ends (turn 2) or it is our turn again."""
+
+    def __init__(self, seat1: int, then_turn: int = 1):
+        self.left, self.then_turn = seat1, then_turn
+        self.finished, self.turn, self.player = False, 1, 1 if seat1 else 0
+
+    def keys(self):
+        return ["chain.pass", "chain.0.0.14558127.1.2.0"] if self.turn == 1 else ["idle.1.0.11962031.1.2.0", "idle.7.0"]
+
+    def act(self, key):
+        self.left -= 1
+        if self.left <= 0:
+            self.turn, self.player = self.then_turn, 0 if self.then_turn == 1 else 1
+
+
+def test_opponent_answers_stop_when_our_turn_is_over():
+    from ocgforge.combo_check import opponent_answers
+    history = []
+    opponent_answers(Turns(2), history)
+    assert history == ["chain.pass", "chain.pass"]  # declines, then it is our answer again
+    duel, history = Turns(1, then_turn=2), []
+    opponent_answers(duel, history)
+    assert history == ["chain.pass"] and duel.turn == 2  # our turn ended: no answer in the opponent's turn
+    duel, history = Turns(10 ** 6), []
+    opponent_answers(duel, history, limit=5)
+    assert len(history) == 5  # a looping bot stops
+
+
+def test_opponent_answers_use_the_bot():
+    from ocgforge.combo_check import opponent_answers
+    history = ["idle.5.0.13597785.0.2.0"]
+    opponent_answers(Turns(1), history, lambda duel, h: duel.keys()[1])
+    assert history[-1] == "chain.0.0.14558127.1.2.0"

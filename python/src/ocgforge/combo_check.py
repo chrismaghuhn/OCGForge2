@@ -147,7 +147,7 @@ class Line:
     skipped: int = 0  # steps passed over without being done
     ahead: frozenset = frozenset()  # later steps of the current community step already done
     passed: tuple = ()  # the skipped steps
-    trigger: str | None = None  # for a "yes" to "activate X's effect?": a key naming X (yes/no keys name no card)
+    named: str | None = None  # our last answer if it names a card (a "yes" to X's trigger: a key naming X)
     intent: float = 0.0  # bonus for heading to the next step (its card named), kept until a step is done
     duel: object = field(default=None, repr=False, compare=False)  # the engine at this line's end (a clone)
 
@@ -200,6 +200,23 @@ def advance(line: Line, targets: list[tuple[int, int | None]], last_key: str | N
             ahead.discard(progress)
             progress += 1
     return progress - line.progress, tuple(skipped), frozenset(ahead)
+
+
+NAMES_NOTHING = ("chain.pass", "yes_no.", "effect_yes_no.")  # answers that use no card (a "yes" names its trigger)
+OPPONENT_STEPS = 200  # seat 1 answers in a row at most (a bot that loops must not hang the search)
+
+
+def opponent_answers(duel, history: list[str], opponent=None, limit: int = OPPONENT_STEPS) -> None:
+    """Seat 1 answers (`opponent(duel, history)`, else `worlds.decline`) until it is our turn to
+    answer again; appended to `history`. It stops when our turn is over (turn 2 begins): the end
+    board is what we left, not what the declining opponent does in its own turn (a decline at its
+    idle question would be keys[0], a Normal Summon)."""
+    for _ in range(limit):
+        if duel.finished or duel.player == 0 or duel.turn > 1:
+            return
+        key = opponent(duel, history) if opponent else worlds.decline(duel.keys())
+        duel.act(key)
+        history.append(key)
 
 
 def grow(children: list[tuple[Line, object]]) -> list[Line]:
@@ -264,17 +281,12 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
             if duel is None:
                 continue
             try:
-                while not duel.finished and duel.player != 0:  # the opponent never acts
-                    key = opponent(duel, line.keys) if opponent else worlds.decline(duel.keys())
-                    duel.act(key)
-                    line.keys.append(key)
+                opponent_answers(duel, line.keys, opponent)
             except Exception:  # the engine failed on this line: drop it, not the whole run
                 continue
             now = board(duel)
-            mine = next((k for k in reversed(line.keys) if not k.startswith(("chain.pass", "yes_no.no"))), None)
-            if mine == "yes_no.yes" and line.trigger:
-                mine = line.trigger  # an optional trigger effect was activated: it uses its card
-            steps, skipped, line.ahead = advance(line, targets, mine, now, lookahead, groups, loose)
+            # Our answer, not the opponent's (a hand-trap bot answers after it, before this point).
+            steps, skipped, line.ahead = advance(line, targets, line.named, now, lookahead, groups, loose)
             line.progress += steps
             line.skipped += len(skipped)
             line.passed += skipped
@@ -291,7 +303,7 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
             if identity in seen:
                 continue
             seen.add(identity)
-            if duel.finished or duel.turn > 1 or (line.progress == len(targets) and
+            if duel.finished or duel.turn > 1 or duel.player != 0 or (line.progress == len(targets) and
                                                   line.key_cards >= sum(key_cards.values())):
                 done.append(line)
             else:
@@ -373,10 +385,11 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
             for _, value, bonus, i in sorted(options, reverse=True)[:branch]:
                 # the latest card named for a coming step sets the intent (a material choice keeps it)
                 intent = 0.0 if keys[i].endswith(".cancel") else bonus or line.intent
-                trigger = trigger_key(row, keys, i, codes) if keys[i] == "yes_no.yes" else None
+                named = (trigger_key(row, keys, i, codes) if keys[i] == "yes_no.yes"
+                         else None if keys[i].startswith(NAMES_NOTHING) else keys[i])
                 children.append((Line(line.keys + [keys[i]], line.progress, line.score + value, line.board,
                                       line.key_cards, line.tried | {(state, keys[i])}, line.skipped, line.ahead,
-                                      line.passed, trigger, intent), duel))
+                                      line.passed, named, intent), duel))
         lines = grow(sorted(children, key=lambda c: rank(c[0]), reverse=True)[:beam])
     best = max(done + lines, key=rank, default=Line())
     return best, targets
