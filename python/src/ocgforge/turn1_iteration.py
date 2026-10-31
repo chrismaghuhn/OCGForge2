@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -51,7 +52,8 @@ def run(cmd: list[str], log: Path) -> int:
     with open(log, "a", encoding="utf-8") as out:
         out.write("$ " + " ".join(cmd) + "\n")
         out.flush()
-        return subprocess.call(cmd, stdout=out, stderr=subprocess.STDOUT)
+        env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}  # a shared GPU fragments
+        return subprocess.call(cmd, stdout=out, stderr=subprocess.STDOUT, env=env)
 
 
 def search(args, deck: Path, deck_type: str) -> Path:
@@ -89,6 +91,7 @@ def teach(args, books: list[Path]) -> None:
         code = run([sys.executable, "-m", "ocgforge.teach", "--teacher", str(args.teacher), "--student", str(student),
                     "--book", *map(str, books), "--book-share", str(args.book_share), "--rounds", str(left),
                     "--lr", str(args.lr), "--threads", str(args.workers), "--save-every", str(args.save_every),
+                    "--micro-batch", str(args.micro_batch), "--envs", str(args.envs),
                     "--seed", str(args.teach_seed + state["segment"]), "--out", str(out), "--decks", *decks],
                    out / "teach.log")
         after = sum('"samples"' in t for t in log.read_text().splitlines()) if log.exists() else 0
@@ -117,6 +120,9 @@ def main(argv=None) -> None:
     p.add_argument("--book-share", type=float, default=0.3)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--save-every", type=int, default=2)
+    p.add_argument("--micro-batch", type=int, default=64,
+                   help="teach micro-batch (the gradient is the same; smaller fits beside the desktop on the GPU)")
+    p.add_argument("--envs", type=int, default=512, help="teach self-play envs")
     p.add_argument("--teach-seed", type=int, default=100, help="seed of teach segment 0 (the control used 100)")
     p.add_argument("--search-only", action="store_true")
     args = p.parse_args(argv)
