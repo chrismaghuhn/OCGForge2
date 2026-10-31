@@ -38,3 +38,54 @@ def test_defender_modes():
     assert bb.defend(keys, "pass") == "chain.pass"
     assert bb.defend(keys, "eager") == "chain.0.0.1.0.4.0"
     assert bb.defend(["card.0", "card.1"], "eager") == "card.0"
+
+
+class Script:
+    """A duel that walks through (turn, player, keys) states; act() records who answered what."""
+
+    def __init__(self, states):
+        self.states, self.i, self.acted, self.finished = states, 0, [], False
+
+    @property
+    def turn(self):
+        return self.states[self.i][0]
+
+    @property
+    def player(self):
+        return self.states[self.i][1]
+
+    def keys(self):
+        return self.states[self.i][2]
+
+    def encode(self, card_index):
+        return {"keys": self.keys()}
+
+    def act(self, key):
+        assert key in self.keys()
+        self.acted.append((self.player, key))
+        self.i += 1
+        if self.i >= len(self.states):
+            self.finished = True
+
+
+def test_build_board_plays_seat_zero_and_declines_for_seat_one():
+    states = [(1, 0, ["idle.1.0.13597785.0.2.0", "idle.7.0"]), (1, 1, ["chain.pass", "chain.0.0.14558127.1.2.0"]),
+              (1, 0, ["idle.7.0"]), (2, 1, ["idle.7.0"])]
+    duel = bb.build_board(lambda: Script(states), ["idle.1.0.13597785.0.2.0"])
+    assert duel is not None and duel.turn == 2 and duel.player == 1
+    assert duel.acted == [(0, "idle.1.0.13597785.0.2.0"), (1, "chain.pass"), (0, "idle.7.0")]
+    assert bb.build_board(lambda: Script(states), ["idle.1.9.99999999.0.2.0"]) is None  # the line no longer fits
+
+
+def test_play_turn_asks_the_policy_for_seat_one_only():
+    states = [(2, 1, ["idle.1.0.11111111.1.2.0", "idle.7.0"]), (2, 0, ["chain.pass", "chain.0.0.84815190.0.4.5"]),
+              (3, 0, ["idle.7.0"])]
+    duel = Script(states)
+    asked = []
+
+    def policy(rows):
+        asked.append(rows[0]["keys"])
+        return [[0]]
+    bb.play_turn(duel, policy, None, "eager")
+    assert asked == [["idle.1.0.11111111.1.2.0", "idle.7.0"]]
+    assert duel.acted == [(1, "idle.1.0.11111111.1.2.0"), (0, "chain.0.0.84815190.0.4.5")]
