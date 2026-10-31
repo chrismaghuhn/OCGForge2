@@ -136,7 +136,6 @@ def play_turn(duel, policy, card_index, defender: str, max_steps: int = 600) -> 
 
 
 def main(argv=None) -> None:
-    from ._core import Duel
     from .cards import CardTable
     from .model import load_checkpoint
 
@@ -147,6 +146,7 @@ def main(argv=None) -> None:
     p.add_argument("--book-opponent", type=Path, default=rollout.REPO / "decks" / "salamangreat.ydk",
                    help="combo_check --opponent the book was made with (to rebuild its scenarios)")
     p.add_argument("--agent-deck", type=Path, required=True)
+    p.add_argument("--precise", type=Path, help="combo_check --precise file the book was made with")
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--tries", type=int, default=8, help="agent hands per board")
     p.add_argument("--defender", choices=("pass", "eager"), default="eager")
@@ -167,27 +167,19 @@ def main(argv=None) -> None:
     is_extra = lambda code: bool(types.get(code, 0) & combo_check.TYPE_EXTRA)  # noqa: E731
     names = cb.name_index(table)
     combos = {c.id: c for c in cb.load(args.deck_type, names)}
+    hands: dict[str, list[int]] = {}
+    if args.precise:  # the book was made with combo_check --precise: the same steps, end boards and hands
+        kept, hands = combo_check.apply_precise(list(combos.values()), args.precise, names)
+        combos.update({c.id: c for c in kept})
     decklist = worlds.read_decklist(args.deck)
     book_opponent = worlds.read_decklist(args.book_opponent)[0]
     agent_main, agent_extra = worlds.read_decklist(args.agent_deck)
     model = load_checkpoint(args.checkpoint, args.device, dropout=0.0)
     card_index = model.card_features.index_map()
     policy = rollout.ModelPolicy(model, args.device, sample=not args.greedy, seed=args.seed)
-    cache = rollout.REPO / ".cache"
 
     def make_start(script: str, seed: int, seat_one_deck: Path):
-        def start():
-            try:
-                duel = Duel.world(str(cache / "cardscripts"), str(cache / "card_data.tsv"), str(args.deck),
-                                  str(seat_one_deck), script, seed, 0)
-            except Exception:
-                return None
-            for _ in range(20):  # through the draw and standby phase, as combo_check does
-                if duel.finished or duel.player == 0:
-                    break
-                duel.act(worlds.decline(duel.keys()))
-            return None if duel.finished else duel
-        return start
+        return combo_check.puzzle_start(args.deck, seat_one_deck, script, seed)
 
     entries = [json.loads(line) for line in args.book.read_text(encoding="utf-8").splitlines() if line.strip()]
     entries = [e for e in entries if wanted(e, args.all, args.min_field)]
@@ -199,7 +191,7 @@ def main(argv=None) -> None:
             continue
         # The scenario exactly as combo_check built it (the book line's shuffle), then the agent's cards.
         rng = random.Random(f"{combo.id}-{entry.get('shuffle', 0)}")
-        script = combo_check.scenario_script(combo, decklist, book_opponent, is_extra, rng,
+        script = combo_check.scenario_script(combo, decklist, book_opponent, is_extra, rng, hand=hands.get(combo.id),
                                              filler_rng=combo_check.filler_rng(combo) if entry.get("fixed_hand") else None)
         seed = rng.getrandbits(32)
         answers = own_answers(make_start(script, seed, args.book_opponent), entry["line"])

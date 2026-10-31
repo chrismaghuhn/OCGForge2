@@ -395,6 +395,43 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
     return best, targets
 
 
+def puzzle_start(deck: Path, opponent_deck: Path, script: str, seed: int):
+    """A function that builds the puzzle duel of `script` and advances it through the draw and
+    standby phase to our first decision; None when the engine rejects the scenario."""
+    def start():
+        from ._core import Duel
+        cache = rollout.REPO / ".cache"
+        try:
+            duel = Duel.world(str(cache / "cardscripts"), str(cache / "card_data.tsv"), str(deck),
+                              str(opponent_deck), script, seed, 0)
+            for _ in range(20):
+                if duel.finished or duel.player == 0:
+                    break
+                duel.act(worlds.decline(duel.keys()))
+        except Exception:
+            return None
+        return None if duel.finished else duel
+    return start
+
+
+def apply_precise(combos: list[cb.Combo], path: Path, names: dict[str, int]):
+    """--precise: hand-written engine steps (JSON list of {title, hand, steps: [[card, action]],
+    end_board}) replace the community steps, end board and starting hand of those combos. Returns
+    the combos it covers and their hands (combo id -> passcodes)."""
+    code_of = lambda name: names.get(cb.normalize(name), names.get(cb.loose(name)))  # noqa: E731
+    specs = {spec["title"]: spec for spec in json.loads(Path(path).read_text(encoding="utf-8"))}
+    kept, hands = [], {}
+    for combo in combos:
+        if combo.title not in specs:
+            continue
+        spec = specs[combo.title]
+        combo.steps = [[cb.Entry(code_of(card), card, action)] for card, action in spec["steps"]]
+        combo.end_board = [code_of(card) for card in spec.get("end_board", [])]
+        hands[combo.id] = [code_of(card) for card in spec["hand"]]
+        kept.append(combo)
+    return kept, hands
+
+
 def checked_line(combo: cb.Combo, line: Line, targets: list) -> bool:
     """Checked: every step done in order (at most MAX_SKIPPED passed over) and at least 80 % of the
     book's end-board cards on our field."""
@@ -411,7 +448,6 @@ def end_board(duel) -> list[dict]:
 
 
 def main(argv=None) -> None:
-    from ._core import Duel
     from .cards import CardTable
     from .model import load_checkpoint
 
@@ -450,36 +486,14 @@ def main(argv=None) -> None:
                     key=lambda c: -c.votes)
     hands: dict[str, list[int]] = {}
     if args.precise:
-        code_of = lambda name: names.get(cb.normalize(name), names.get(cb.loose(name)))  # noqa: E731
-        specs = {spec["title"]: spec for spec in json.loads(args.precise.read_text(encoding="utf-8"))}
-        combos = [c for c in combos if c.title in specs]
-        for combo in combos:
-            spec = specs[combo.title]
-            combo.steps = [[cb.Entry(code_of(card), card, action)] for card, action in spec["steps"]]
-            combo.end_board = [code_of(card) for card in spec.get("end_board", [])]
-            hands[combo.id] = [code_of(card) for card in spec["hand"]]
+        combos, hands = apply_precise(combos, args.precise, names)
     if args.title:
         combos = [c for c in combos if args.title in c.title]
     if args.limit:
         combos = combos[: args.limit]
-    cache = rollout.REPO / ".cache"
     verbs = Counter()  # action text -> [used, total]
     verbs_used = Counter()
     located = Counter()  # step texts mapped to a location (True) or only "card named" (False)
-
-    def start_for(script: str, seed: int):
-        def start():
-            try:
-                duel = Duel.world(str(cache / "cardscripts"), str(cache / "card_data.tsv"), str(args.deck),
-                                  str(args.opponent), script, seed, 0)
-                for _ in range(20):  # through the draw and standby phase to our first decision
-                    if duel.finished or duel.player == 0:
-                        break
-                    duel.act(worlds.decline(duel.keys()))
-            except Exception:  # a scenario the engine rejects
-                return None
-            return None if duel.finished else duel
-        return start
 
     def one(combo: cb.Combo, shuffle: int):
         """One deck order of one combo: its own scenario and seed (`scenario(combo, shuffle)`)."""
@@ -487,7 +501,7 @@ def main(argv=None) -> None:
         rng = random.Random(f"{combo.id}-{shuffle}")
         script = scenario_script(combo, decklist, opponent, is_extra, rng, hand=hands.get(combo.id),
                                  filler_rng=filler_rng(combo))
-        start = start_for(script, rng.getrandbits(32))
+        start = puzzle_start(args.deck, args.opponent, script, rng.getrandbits(32))
         line, targets = check(combo, start, model, card_index, args.device, beam=args.beam, branch=args.branch,
                               max_decisions=args.max_decisions,
                               center=center, is_extra=is_extra)
