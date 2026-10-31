@@ -64,6 +64,7 @@ class Combo:
     end_board: list[int] = field(default_factory=list)  # key cards, from a spreadsheet
     vs_hand_traps: list[int] = field(default_factory=list)  # the hand traps this line plays through
     missing: list[str] = field(default_factory=list)  # card names we could not match
+    author: str = ""  # who wrote it (masterduelmeta user name), for crediting sources
 
     @property
     def usable(self) -> bool:
@@ -117,7 +118,7 @@ def load(deck_type: str | None = None, names: dict[str, int] | None = None) -> l
             votes=len(raw.get("upvotes", [])) - len(raw.get("downvotes", [])),
             starting=[_entry(e, names, missing) for e in raw.get("startingCards", [])],
             steps=[[_entry(e, names, missing) for e in step.get("entries", [])] for step in raw.get("steps", [])],
-            notes=raw.get("notes") or "", missing=missing)
+            notes=raw.get("notes") or "", missing=missing, author=(raw.get("author") or {}).get("username", ""))
         sheet = extra.get(combo.id, {})
         for key, target in (("endBoard", combo.end_board), ("vsHandTraps", combo.vs_hand_traps)):
             for e in sheet.get(key) or []:

@@ -3,11 +3,9 @@
     python -m ocgforge.opening_book --deck decks/branded.ydk --deck-type Branded \\
         --sheet .cache/branded-discord/sheet1.csv --checkpoint runs/x/latest --out runs/combo-book/branded-opening.jsonl
 
-Seeds (what a hand should reach) come from the community combos (masterduelmeta: steps, end board,
-the hand traps a line plays through), from a player sheet (CSV: starting hand as text like
-"Aluber + 1 Discard", end board like "Mirrorjade + Banishment + Lost", notes like "plays into
-droll") and from Duelingbook logs (card movements). Each seed becomes several starting hands: its
-cards plus fillers, one random source per hand, and starter x extender hands that no seed covers.
+Seeds (what a hand should reach) come from `seeds` (community combos, player sheets, Duelingbook
+logs, starter x extender hands). Each seed becomes several starting hands: its cards plus
+fillers, one random source per hand.
 The search (`combo_check.check`, beam search on duel clones) plays each hand; the seed's steps and
 end board only guide it, it may find another line.
 
@@ -29,15 +27,12 @@ the book for 5, 10 and 20 of our answers.
 from __future__ import annotations
 
 import argparse
-import csv
 import hashlib
 import json
 import random
-import re
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
@@ -46,263 +41,8 @@ from . import board_break as bb
 from . import combo_check as cc
 from . import combos as cb
 from . import rollout, worlds
-
-HAND_SIZE = 5
-# Player nicknames -> card names (sheets and guides use them; the card database does not).
-ALIASES = {
-    "brafu": "Branded Fusion", "foolish": "Foolish Burial", "dupe": "Fusion Duplication", "lost": "Branded Lost",
-    "tragedy": "Despian Tragedy", "granguinol": "Granguignol the Dusk Dragon",
-    "granguniol": "Granguignol the Dusk Dragon", "banishment": "Branded Banishment", "winda": "El Shaddoll Winda",
-    "masq": "Masquerade the Blazing Dragon", "schism": "Shaddoll Schism", "ad lib": "Ad Libitum of Despia",
-    "adlib": "Ad Libitum of Despia", "sarc": "Gold Sarcophagus", "kitt": "Tri-Brigade Springans Kitt",
-    "king": "Rindbrumm the Striking Dragon", "branded king": "Rindbrumm the Striking Dragon",
-    "lubellion": "Lubellion the Searing Dragon", "cart": "Blazing Cartesia, the Virtuous",
-    "white": "Fallen of the White Dragon", "albaz": "Fallen of Albaz", "abaz": "Fallen of Albaz",
-    "mirrorajde": "Mirrorjade the Iceblade Dragon", "dead mirrorjade": "Mirrorjade the Iceblade Dragon",
-    "dead mirrorajde": "Mirrorjade the Iceblade Dragon", "drago": "Red-Eyes Dark Dragoon",
-    "requiem lock": "Fiendsmith's Requiem", "furious": "Borreload Furious Dragon", "edge imp": "Edge Imp Chain",
-    "high spirit": "Branded in High Spirits", "ash": "Ash Blossom & Joyous Spring",
-    "imperm": "Infinite Impermanence", "veiler": "Effect Veiler", "droll": "Droll & Lock Bird",
-    "belle": "Ghost Belle & Haunted Mansion", "ogre": "Ghost Ogre & Snow Rabbit", "nibiru": "Nibiru, the Primal Being",
-    "maxx c": 'Maxx "C"', "fuwa": "Mulcharmy Fuwalos", "fuwalos": "Mulcharmy Fuwalos", "crow": "D.D. Crow",
-    "mourner": "Ghost Mourner & Moonlit Chill", "harmonia": "Fydraulis Harmonia",
-    "medius": "Medius the Pure", "terminus": "Prohibited Power Patron Portal - Terminus",
-    "dragster": "F.A. Dawn Dragster", "crystal wing": "Crystal Wing Synchro Dragon",
-    "engraver": "Fiendsmith Engraver", "tract": "Fiendsmith's Tract", "levi": "Fabled Levilazebul",
-    "levilazebul": "Fabled Levilazebul", "desirae": "Fiendsmith's Desirae", "lacrima": "Fiendsmith's Lacrima",
-    "agnumday": "Fiendsmith's Agnumday", "sequence": "Fiendsmith's Sequence",
-}
-INTERRUPTERS = {
-    "Ash Blossom & Joyous Spring", "Infinite Impermanence", "Effect Veiler", "Droll & Lock Bird",
-    "Ghost Belle & Haunted Mansion", "Ghost Ogre & Snow Rabbit", "Nibiru, the Primal Being", "D.D. Crow",
-    "Ghost Mourner & Moonlit Chill", "Bystial Magnamhut", "Bystial Saronir", "Bystial Druiswurm", "Bystial Baldrake",
-    "Dominus Impulse", "Dominus Purge", "Fydraulis Harmonia", "Called by the Grave", "Mulcharmy Fuwalos",
-}
-HAND_TRAP_WORDS = ("ash", "imperm", "veiler", "droll", "belle", "ogre", "nibiru", "maxx c", "fuwa", "crow", "mourner")
-DISCARDS = re.compile(r"^(\d+)\s+discards?\b", re.IGNORECASE)
-WHERE = re.compile(r"\s+in\s+(the\s+)?(hand|gy|grave|banish\w*)\.?$", re.IGNORECASE)
-VERSION = re.compile(r"\s*\((version|example|no|otk|winda|dragoon)[^)]*\)\s*$", re.IGNORECASE)
-
-
-@dataclass
-class Seed:
-    id: str
-    title: str
-    source: str  # "community", "sheet", "replay", "grid"
-    hand: list[int]  # starting cards; the rest of the hand is filler
-    combo: cb.Combo  # steps and end board for the search (steps may be empty)
-    vs: list[int] = field(default_factory=list)  # hand traps the seed is said to play through / into
-    first: bool = True  # a going-first line (vs OTKs and going-second lines)
-
-
-def resolver(names: dict[str, int], pool: set[int], card_name: dict[int, str]):
-    """Card name or nickname -> passcode: aliases, exact names, then a unique card of the deck's pool
-    whose name contains the text."""
-    def resolve(text: str) -> int | None:
-        text = VERSION.sub("", WHERE.sub("", text.strip().rstrip("."))).strip()
-        key = text.lower()
-        full = ALIASES.get(key, text)
-        code = names.get(cb.normalize(full), names.get(cb.loose(full)))
-        if code is not None:
-            return code
-        hits = sorted({c for c in pool if key and key in card_name.get(c, "").lower()})
-        return hits[0] if len(hits) == 1 else None
-    return resolve
-
-
-def mentioned_hand_traps(text: str, resolve) -> list[int]:
-    lower = (text or "").lower()
-    found = []
-    for word in HAND_TRAP_WORDS:
-        if re.search(rf"\b{re.escape(word)}\b", lower) and (code := resolve(word)) is not None:
-            found.append(code)
-    return found
-
-
-def sheet_seeds(path: Path, deck_type: str, resolve) -> list[Seed]:
-    """Rows of a player sheet: number, starting hand ("Aluber + 1 Discard"), end board, replay, notes.
-    Generic parts ("any dark monster", "A Normal Summon") and unknown nicknames drop the row."""
-    seeds = []
-    with open(path, encoding="utf-8", newline="") as f:
-        for row in csv.reader(f):
-            if len(row) < 4 or not row[1].strip().isdigit() or not row[2].strip():
-                continue
-            hand, unknown = [], False
-            for part in row[2].split("+"):
-                part = part.strip()
-                if not part or DISCARDS.match(part):
-                    continue  # a discard is any card: the fillers
-                code = resolve(part)
-                if code is None:
-                    unknown = True
-                    break
-                hand.append(code)
-            if unknown or not hand:
-                continue
-            board = [code for part in row[3].split("+") if (code := resolve(part)) is not None]
-            notes = row[5] if len(row) > 5 else ""
-            combo = cb.Combo(f"sheet-{row[1].strip()}", f"{row[2].strip()} -> {row[3].strip()}", deck_type, 0, [], [],
-                             notes=notes, end_board=board)
-            seeds.append(Seed(combo.id, combo.title, "sheet", hand, combo, mentioned_hand_traps(notes, resolve),
-                              first="otk" not in (row[2] + notes).lower()))
-    return seeds
-
-
-def board_parts(text: str, resolve) -> list[int]:
-    """End-board text ("Caesar, Strelitzia, 2 Elves/Dragster, Rhapsodia, 4 cards in hand") -> cards:
-    the first of alternatives, counts and notes ("cards in hand", "burn 1200", "setup") dropped."""
-    cards = []
-    for part in re.split(r"[,+]", text):
-        part = re.sub(r"^\s*\d+\s+", "", part.strip()).split("/")[0].strip()
-        if not part or re.search(r"\b(cards? in hand|burn|setup|draw|lock|otk)\b", part, re.IGNORECASE):
-            continue
-        if (code := resolve(part)) is not None:
-            cards.append(code)
-    return cards
-
-
-def list_seeds(path: Path, deck_type: str, resolve) -> list[Seed]:
-    """Other player sheets: a CSV with columns Card (starting hand, "Lucina + Engraver (Desirae)")
-    and Board (end board), or a TSV whose second column reads "In Hand: Lucina + Discard vs Fuwalos"
-    (hand only: the plan comes from a community seed with the same first card)."""
-    seeds = []
-    text = path.read_text(encoding="utf-8")
-    if path.suffix == ".tsv":
-        rows = [line.split("\t") for line in text.splitlines()]
-        for n, row in enumerate(rows):
-            if len(row) < 2:
-                continue
-            body = re.sub(r"^In Hand:\s*", "", row[1].strip())
-            hand_text, _, vs_text = body.partition(" vs ")
-            parts = [p for p in hand_text.split("+") if not re.search(r"discard|\bany\b", p, re.IGNORECASE)]
-            hand = [c for part in parts if (c := resolve(part)) is not None]
-            if not hand or len(hand) < len(parts):
-                continue
-            vs = [c for part in re.split(r"[+,&]| and ", vs_text)
-                  if (c := resolve(re.sub(r"^\s*(\d+|early|late)\s+", "", part.strip(), flags=re.IGNORECASE)))]
-            combo = cb.Combo(f"{path.stem}-{n}", f"{row[0]}: {row[1]}", deck_type, 0, [], [])
-            seeds.append(Seed(combo.id, combo.title, "sheet", hand, combo, vs))
-        return seeds
-    for n, row in enumerate(csv.DictReader(text.splitlines())):
-        hand_text = re.sub(r"\([^)]*\)", "", row.get("Card") or "")
-        hand = [c for part in hand_text.split("+") if (c := resolve(part)) is not None]
-        board = board_parts(row.get("Board") or "", resolve)
-        if not hand or not board:
-            continue
-        combo = cb.Combo(f"{path.stem}-{n}", f"{row['Card']} -> {row['Board']}", deck_type, 0, [], [],
-                         notes=row.get("Notes") or "", end_board=board)
-        seeds.append(Seed(combo.id, combo.title, "sheet", hand, combo, mentioned_hand_traps(row.get("Notes"), resolve)))
-    return seeds
-
-
-def borrow_plans(seeds: list[Seed]) -> None:
-    """A seed with nothing to aim for (a hand-only sheet row) takes the plan of the first community
-    seed that starts with the same card."""
-    by_first = {}
-    for s in seeds:
-        if s.source == "community":
-            by_first.setdefault(s.hand[0], s)
-    for s in seeds:
-        if not s.combo.steps and not s.combo.end_board and s.hand[0] in by_first:
-            plan = by_first[s.hand[0]].combo
-            s.combo = cb.Combo(s.id, s.title, plan.deck_type, 0, plan.starting, plan.steps, end_board=plan.end_board,
-                               vs_hand_traps=plan.vs_hand_traps)
-
-
-MOVE = re.compile(r'^(?P<what>[^:]+):\s+(?P<verb>\w+(?:\s\w+)?)\s+(banished\s+)?"(?P<card>[^"]+)"\s*(?P<rest>.*)$')
-
-
-def replay_seed(path: Path, deck_type: str, resolve) -> Seed | None:
-    """A Duelingbook log (card movements, "Special Summoned X from Deck to M-3") as precise steps:
-    each movement is a step whose card has to get there. Setup lines (cards returned to the deck
-    before the combo) are dropped, and so is a move undone right away (to the GY and back)."""
-    moves, hand, added = [], [], set()
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.split("#")[0].strip() if not raw.startswith("#") else ""
-        m = MOVE.match(line)
-        if not m:
-            continue
-        verb, card, rest = m["verb"].lower().split()[-1], m["card"], m["rest"].lower()
-        code = resolve(card)
-        if code is None:
-            continue
-        if "from hand" in rest and code not in added and code not in hand and not rest.endswith("of deck"):
-            hand.append(code)
-        if verb == "returned" and ("bottom of deck" in rest or "top of deck" in rest):
-            if moves and moves[-1][0] == code:
-                moves.pop()  # the move this undoes
-            continue
-        if verb == "summoned" or "to m-" in rest or "emz" in rest:
-            action = "Special Summon"
-        elif verb in ("placed", "activated", "set") or "to s-" in rest:
-            action = "Place"
-        elif verb == "sent" and "gy" in rest:
-            action = "Send to GY"
-        elif verb in ("added", "returned") and "to hand" in rest:
-            action = "Add to hand"
-            added.add(code)
-        elif verb == "banished":
-            action = "Banish"
-        else:
-            continue
-        moves.append((code, card, action))
-    if not moves:
-        return None
-    combo = cb.Combo(f"replay-{path.stem}", path.stem, deck_type, 0, [cb.Entry(c, "", "") for c in hand],
-                     [[cb.Entry(code, card, action)] for code, card, action in moves])
-    return Seed(combo.id, combo.title, "replay", hand, combo)
-
-
-def community_seeds(deck_type: str, names: dict[str, int]) -> list[Seed]:
-    seeds = []
-    for combo in sorted((c for c in cb.load(deck_type, names) if c.usable and c.steps), key=lambda c: -c.votes):
-        hand = [e.code for e in combo.starting if e.code is not None]
-        if not hand:
-            continue
-        text = (combo.title + " " + combo.notes).lower()
-        first = not any(w in text for w in ("otk", "going 2nd", "going second", "go 2nd", "2nd", "second"))
-        seeds.append(Seed(combo.id, combo.title, "community", hand, combo, list(combo.vs_hand_traps), first))
-    return seeds
-
-
-def grid_seeds(seeds: list[Seed], deck_main: list[int], limit: int) -> list[Seed]:
-    """Starter x extender hands no seed covers: starters are the cards of one-card seeds,
-    extenders the second card of two-card seeds; each gets the best seed of its starter as plan."""
-    by_starter: dict[int, Seed] = {}
-    extenders: Counter = Counter()
-    covered = {tuple(sorted(s.hand)) for s in seeds}
-    for s in seeds:
-        if len(s.hand) == 1:
-            by_starter.setdefault(s.hand[0], s)
-        elif len(s.hand) == 2:
-            extenders.update(s.hand)
-    grid = []
-    for starter, seed in by_starter.items():
-        for extender, _ in extenders.most_common():
-            if extender == starter or extender not in deck_main or tuple(sorted((starter, extender))) in covered:
-                continue
-            covered.add(tuple(sorted((starter, extender))))
-            grid.append(Seed(f"grid-{starter}-{extender}", f"{seed.title} + extender {extender}", "grid",
-                             [starter, extender], seed.combo, list(seed.vs), seed.first))
-    return grid[:limit]
-
-
-def interruptions(deck_type: str, resolve, extra: dict[str, list[str]] | None = None) -> dict[int, set[int]]:
-    """Hand trap -> choke-point cards: the counters data (cards with impact High/Medium, and the
-    choke points of their entry) plus `extra` rules (hand trap name -> card names, from guides)."""
-    rules: dict[int, set[int]] = {}
-    for entry in cb.latest("counters"):
-        if (entry.get("deckType") or {}).get("name") != deck_type:
-            continue
-        points = {resolve(c.get("name", "")) for c in entry.get("chokepoints") or [] if isinstance(c, dict)} - {None}
-        for counter in entry.get("counterCards") or []:
-            if counter.get("impact") in ("High", "Medium", None) and (code := resolve(counter["card"]["name"])):
-                rules.setdefault(code, set()).update(points)
-    for trap, cards in (extra or {}).items():
-        if (code := resolve(trap)) is not None:
-            rules.setdefault(code, set()).update(c for name in cards if (c := resolve(name)) is not None)
-    return rules
-
+from . import seeds as sd
+from .seeds import HAND_SIZE, Seed
 
 def hand_trap_bot(trap: int, chokepoints: set[int]):
     """Seat 1 with `trap` in hand: activates it the first time it is offered right after we
@@ -376,7 +116,8 @@ def main(argv=None) -> None:
     p.add_argument("--deck-type", required=True)
     p.add_argument("--sheet", type=Path, help="player sheet CSV (starting hand, end board, replay, notes)")
     p.add_argument("--replays", type=Path, nargs="*", default=[], help="Duelingbook logs (card movements)")
-    p.add_argument("--lists", type=Path, nargs="*", default=[], help="other player sheets (Card/Board CSV, In Hand TSV)")
+    p.add_argument("--lists", nargs="*", default=[],
+                   help="other player sheets (Card/Board CSV, In Hand TSV), each as path or path::author")
     p.add_argument("--chokepoints", type=Path, help="JSON {hand trap: [card names]} from guides")
     p.add_argument("--priority", nargs="*", default=[], help="seed titles (substrings) to search first")
     p.add_argument("--opponent", type=Path, default=rollout.REPO / "decks" / "salamangreat.ydk")
@@ -410,43 +151,12 @@ def main(argv=None) -> None:
     pool = set(decklist[0]) | set(decklist[1])
     for combo in cb.load(args.deck_type, names):
         pool |= set(combo.cards()) | set(combo.end_board)
-    resolve = resolver(names, pool, card_name)
+    resolve = sd.resolver(names, pool, card_name)
     model = load_checkpoint(args.checkpoint, args.device, dropout=0.0)
     card_index = model.card_features.index_map()
     cache = rollout.REPO / ".cache"
 
-    seeds = community_seeds(args.deck_type, names)
-    if args.sheet:
-        seeds += sheet_seeds(args.sheet, args.deck_type, resolve)
-    seeds += [s for path in args.replays if (s := replay_seed(path, args.deck_type, resolve)) is not None]
-    for path in args.lists:
-        seeds += list_seeds(path, args.deck_type, resolve)
-    borrow_plans(seeds)
-    seeds += grid_seeds(seeds, decklist[0], args.grid)
-    if args.first_only:
-        seeds = [s for s in seeds if s.first]
-    priority = lambda s: next((i for i, t in enumerate(args.priority) if t.lower() in s.title.lower()),  # noqa: E731
-                              len(args.priority))
-    order = {"replay": 0, "community": 1, "sheet": 2, "grid": 3}
-    seeds.sort(key=lambda s: (priority(s), not s.first, order[s.source]))
-    seeds = [s for s in seeds if s.combo.steps or s.combo.end_board]  # nothing to aim for otherwise
-    unique: dict[tuple, Seed] = {}  # one search per hand and plan; hand traps named by duplicates merge
-    for s in seeds:
-        key = (tuple(sorted(s.hand)), len(s.combo.steps), tuple(s.combo.end_board))
-        if key in unique:
-            unique[key].vs = list(dict.fromkeys(unique[key].vs + s.vs))
-        else:
-            unique[key] = s
-    seeds = list(unique.values())
-    if args.max_seeds:
-        seeds = seeds[:args.max_seeds]
-    extra = json.loads(args.chokepoints.read_text(encoding="utf-8")) if args.chokepoints else None
-    rules = interruptions(args.deck_type, resolve, extra)
-    # Interruptions the bot can play on our turn (floodgates and draw-for-the-opponent cards are no
-    # branch): ordered by how often seeds name them, then by their choke points.
-    rules = {t: points for t, points in rules.items() if card_name.get(t) in INTERRUPTERS}
-    named = Counter(t for s in seeds for t in s.vs if t in rules)
-    feared = sorted(rules, key=lambda t: (-named[t], -len(rules[t])))
+    seeds, rules, feared = sd.load(args, args.deck_type, names, resolve, decklist, card_name)
     print(f"{len(seeds)} seeds ({Counter(s.source for s in seeds)}), hand traps: "
           f"{[card_name.get(t) for t in feared[:8]]}", flush=True)
 
@@ -477,7 +187,7 @@ def main(argv=None) -> None:
     def search(seed: Seed, variant: int, trap: int | None):
         began = time.perf_counter()
         script, seed_value, start = scenario(seed, variant, trap)
-        bot = hand_trap_bot(trap, rules.get(trap, set())) if trap else None
+        bot = hand_trap_bot(trap, rules.get(trap, set()) | seed.chokes.get(trap, set())) if trap else None
         line, targets = cc.check(seed.combo, start, model, card_index, args.device, beam=args.beam, center=center,
                                  is_extra=is_extra, opponent=bot)
         duel = start()
@@ -487,7 +197,8 @@ def main(argv=None) -> None:
             duel.act(key)
         final = cc.end_board(duel) if duel is not None else []
         on_field = [c for c in final if c["location"] in (worlds.LOCATION_MZONE, worlds.LOCATION_SZONE)]
-        return {"seed": seed.id, "title": seed.title, "source": seed.source, "variant": variant,
+        return {"seed": seed.id, "title": seed.title, "source": seed.source, "author": seed.author,
+                "origin": seed.origin, "variant": variant,
                 "trap": trap, "fired": fired(line.keys, trap) if trap else None, "line": line.keys,
                 "steps": len(targets), "progress": line.progress, "skipped": line.skipped,
                 "key_cards": line.key_cards, "book_end_board": seed.combo.end_board, "field": len(on_field),
@@ -505,7 +216,7 @@ def main(argv=None) -> None:
     print(f"{len(jobs)} searches", flush=True)
     if args.dry_run:
         for seed in seeds:
-            print(f"  {seed.source:9s} first={int(seed.first)} hand={[card_name.get(c) for c in seed.hand]} "
+            print(f"  {seed.source:9s} {seed.author[:14]:14s} first={int(seed.first)} hand={[card_name.get(c) for c in seed.hand]} "
                   f"steps={len(cc.step_targets(seed.combo))} board={[card_name.get(c) for c in seed.combo.end_board]} "
                   f"vs={[card_name.get(c) for c in seed.vs]}  {seed.title[:60]}")
         return
