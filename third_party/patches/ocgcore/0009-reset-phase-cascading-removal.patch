@@ -1,0 +1,29 @@
+diff --git a/field.cpp b/field.cpp
+--- a/field.cpp
++++ b/field.cpp
+@@ -1427,13 +1427,19 @@
+ 			oeit.second = nullptr;
+ }
+ void field::reset_phase(uint32_t phase) {
+-	for(auto eit = effects.pheff.begin(); eit != effects.pheff.end();) {
+-		auto rm = eit++;
+-		if((*rm)->reset(phase, RESET_PHASE)) {
+-			if((*rm)->is_flag(EFFECT_FLAG_FIELD_ONLY))
+-				remove_effect((*rm));
++	// Removing an effect can remove others from pheff with it (a grant takes the effects it granted,
++	// e.g. Pendulum.GrantAdditionalPendulumSummon), which frees the node a saved iterator points to.
++	// Walk a copy, in stable creation order since effect addresses change when cloning.
++	std::vector<effect*> reset_effects(effects.pheff.begin(), effects.pheff.end());
++	std::sort(reset_effects.begin(), reset_effects.end(), effect_sort_by_initial_id{});
++	for(auto* peffect : reset_effects) {
++		if(effects.pheff.find(peffect) == effects.pheff.end())
++			continue;
++		if(peffect->reset(phase, RESET_PHASE)) {
++			if(peffect->is_flag(EFFECT_FLAG_FIELD_ONLY))
++				remove_effect(peffect);
+ 			else
+-				(*rm)->handler->remove_effect((*rm));
++				peffect->handler->remove_effect(peffect);
+ 		}
+ 	}
+ }

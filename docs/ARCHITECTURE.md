@@ -151,6 +151,12 @@ Fixed inputs live in `third_party/deps.json` (exact commits) and
   `OCG_DuelLuaMemoryExceeded` and `OCG_DuelLuaHeapExtent`.
 - `0008-lua-gc-control.patch`: `OCG_DuelSetLuaGenerationalGC` (above) and
   `OCG_DuelCollectLuaGarbage` (a full collection; see "Clone cost" in `docs/engine-clone.md`).
+- `0009-reset-phase-cascading-removal.patch`: the end-of-phase reset walked the
+  phase-reset effects with a saved iterator, but removing a grant also removes the
+  effects it granted. When those reset at the same phase (`Pendulum.GrantAdditionalPendulumSummon`:
+  Solfachord Happiness, D/D/D Sky King Zeus Ragnarok, ...) the saved node could be freed,
+  and the engine crashed in `field::reset_phase`. It now walks a copy, skips effects already
+  removed, and resets them in creation order (as `reset_chain` does), not in hash order.
 
 Card script patches live in `third_party/patches/cardscripts/`:
 
