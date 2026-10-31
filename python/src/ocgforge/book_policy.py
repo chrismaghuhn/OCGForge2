@@ -8,17 +8,21 @@ the net:
 - `exact`: the exact key only; `loose`: the exact key, then the loose key (no hand) as long as the
   duel has not left the book (a real choice the book did not know);
 - never when the question names a card the seat cannot see (a face-down or hand card of the
-  opponent): the key's question part would carry its identity.
+  opponent): the key's question part would carry its identity. Such a question is skipped (the
+  net answers it), it does not count as leaving the book.
 The key only reads what the seat legitimately knows: its own hand, field, GY and banished cards,
 the opponent's visible cards (face up, public, in the GY), phase, turn and its own question.
 
-Hits are counted per real choice (more than one answer) in `stats`.
+Hits are counted per real choice (more than one answer) in `stats`, under a lock (one BookPlayer
+may serve several threads). Each seat in each duel needs its own `Track` (`BookPlayer.track`): it
+remembers whether that seat left the book, and is bound to its seat on first use.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -100,6 +104,7 @@ class Book:
     relevant: set[int]
     deck: tuple
     name: str = ""
+    lines: list = field(default_factory=list, repr=False)  # (line result, scenario start) the book was built from
 
 
 def deck_id(path: Path) -> tuple:
@@ -128,23 +133,28 @@ def load(path: Path) -> Book:
         result = json.loads(text)
         lines.append((result, cc.puzzle_start(deck, opponent, result["script"], result["duel_seed"])))
     exact, loose = ob.build_book(lines, relevant)
-    stored = sum(1 for _ in path.open(encoding="utf-8"))
+    with path.open(encoding="utf-8") as stored_lines:
+        stored = sum(1 for _ in stored_lines)
     if stored != len(exact):
         raise ValueError(f"{path.name}: {stored} states stored, {len(exact)} rebuilt from the lines")
     return Book({s: e["answer"] for s, e in exact.items()}, {s: [a for _, a in answers] for s, answers in loose.items()},
-                relevant, deck_id(deck), path.stem)
+                relevant, deck_id(deck), path.stem, lines)
 
 
 @dataclass
 class Track:
-    """One seat in one duel: whether it left the book, and its real choices played from the book."""
+    """One seat in one duel: whether it left the book, and its real choices played from the book.
+    Never shared between seats or duels: `seat` is bound on first use and checked after."""
     left: bool = False
     depth: int = 0
     used: bool = False
+    seat: int | None = None
 
 
 @dataclass
 class BookPlayer:
+    """Answers from the books for one side of a match. `stats` is shared by all its duels and
+    updated under a lock."""
     books: list[Book]
     mode: str = "loose"
     stats: Counter = field(default_factory=Counter)
@@ -153,12 +163,25 @@ class BookPlayer:
         if self.mode not in MODES:
             raise ValueError(f"mode {self.mode!r} not in {MODES}")
         self._by_deck = {b.deck: b for b in self.books}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def track() -> Track:
+        """A new track: one per seat and duel."""
+        return Track()
 
     def book_for(self, deck: Path | tuple) -> Book | None:
         return self._by_deck.get(deck if isinstance(deck, tuple) else deck_id(deck))
 
     def answer(self, duel, seat: int, book: Book, track: Track) -> str | None:
         """The book's answer for `seat` at this decision, or None (ask the net)."""
+        if track.seat is None:
+            track.seat = seat
+        assert track.seat == seat, "a Track belongs to one seat of one duel"
+        with self._lock:
+            return self._answer(duel, seat, book, track)
+
+    def _answer(self, duel, seat: int, book: Book, track: Track) -> str | None:
         if duel.player != seat or duel.turn != 1 or duel.turn_player != seat:
             return None
         keys = duel.keys()
@@ -170,8 +193,8 @@ class BookPlayer:
         self.stats["choices"] += 1
         snapshot = duel.snapshot()
         if names_hidden(duel, seat, snapshot):
-            self.stats["hidden"] += 1
-            return self._miss(track)
+            self.stats["skip"] += 1  # the net answers; the duel has not left the book
+            return None
         found = book.exact.get(seat_key(duel, book.relevant, seat, snapshot=snapshot))
         answer = worlds.match(for_seat(found, seat), keys) if found else None
         if answer is not None:
@@ -199,6 +222,6 @@ class BookPlayer:
         n = max(1, s["choices"])
         return {"mode": self.mode, "duels": s["duels"], "choices": s["choices"],
                 "exact_rate": round(s["exact"] / n, 3), "loose_rate": round(s["loose"] / n, 3),
-                "hit_rate": round((s["exact"] + s["loose"]) / n, 3), "hidden": s["hidden"],
+                "hit_rate": round((s["exact"] + s["loose"]) / n, 3), "skip": s["skip"],
                 "left_at": dict(sorted((int(k[8:]), v) for k, v in s.items() if k.startswith("left_at_"))),
                 "never_left": s["duels"] - sum(v for k, v in s.items() if k.startswith("left_at_"))}

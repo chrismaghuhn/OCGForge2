@@ -152,6 +152,55 @@ def test_real_duel_key_does_not_see_the_opponents_deck():
         assert len(keys) == 1
 
 
+def test_a_hidden_card_question_is_skipped_without_leaving_the_book():
+    seen = Board(OURS, QUESTION)
+    book = book_of(seen, QUESTION[1])
+    player, track = bp.BookPlayer([book], "loose"), bp.BookPlayer.track()
+    asks_hidden = Board(OURS + THEIRS, ("card.0.0.33333333.1.8.1", "chain.pass"))
+    assert player.answer(asks_hidden, 0, book, track) is None
+    assert not track.left and player.stats["skip"] == 1 and player.stats["miss"] == 0
+    other_hand = Board([card(0, HAND, REGINA, 0)] + OURS[1:], QUESTION)
+    assert player.answer(other_hand, 0, book, track) == QUESTION[1]  # the loose fallback is still on
+    assert player.summary()["skip"] == 1
+
+
+def test_a_track_belongs_to_one_seat():
+    seen = Board(OURS, QUESTION)
+    book = book_of(seen, QUESTION[1])
+    player, track = bp.BookPlayer([book], "loose"), bp.BookPlayer.track()
+    player.answer(seen, 0, book, track)
+    with pytest.raises(AssertionError):
+        player.answer(mirrored(seen), 1, book, track)
+
+
+def test_a_real_duel_start_has_the_books_key():
+    """A normal duel start and the book's puzzle start (same hand, same deck): same phase, turn and
+    question at the first decision, so the same exact and loose key."""
+    import random
+
+    from ocgforge import combo_check as cc
+    from ocgforge import combos as cb
+    from ocgforge import rollout, worlds
+    cache = rollout.REPO / ".cache"
+    if not (cache / "cardscripts").exists():
+        pytest.skip("card scripts not fetched")
+    from ocgforge._core import Duel
+    deck, opponent = rollout.REPO / "decks" / "elfnote.ydk", rollout.REPO / "decks" / "salamangreat.ydk"
+    decklist = worlds.read_decklist(deck)
+    relevant = set(decklist[0])
+    for seed in (0, 1):  # seed 0 starts in the main phase, seed 1 with a chain window in the draw phase
+        duel = Duel(str(cache / "cardscripts"), str(cache / "card_data.tsv"), str(deck), str(opponent), seed, 0)
+        while duel.player != 0:
+            duel.act(worlds.decline(duel.keys()))
+        hand = [c["code"] for c in duel.snapshot()["cards"] if c["controller"] == 0 and c["location"] == HAND]
+        script = cc.scenario_script(cb.Combo("t", "t", "Elfnote", 0, [], []), decklist,
+                                    worlds.read_decklist(opponent)[0], lambda c: False, random.Random(seed), hand=hand)
+        puzzle = cc.puzzle_start(deck, opponent, script, seed)()
+        assert (duel.phase, duel.turn, duel.player) == (puzzle.phase, puzzle.turn, puzzle.player)
+        for hand_in_key in (True, False):
+            assert bp.seat_key(duel, relevant, 0, hand_in_key) == ob.state_key(puzzle, relevant, hand_in_key)
+
+
 def test_unknown_mode():
     with pytest.raises(ValueError):
         bp.BookPlayer([], "fuzzy")
