@@ -66,3 +66,68 @@ def test_book_lookup_exact_and_loose():
     other = lambda: Solo([lucina, b], lucina)  # noqa: E731  a hand the book never saw (another relevant card)
     assert ob.stay(other, book, relevant | {b}) == 0
     assert ob.stay(other, book, relevant | {b}, loose) == 1  # the loose key finds Lucina's summon
+
+
+
+def test_book_cards_keep_a_card_another_line_uses_for_real():
+    tinia, regina = 59581480, 56651978
+    as_filler = {"line": [f"card.0.0.{tinia}.0.2.1"], "hand": [regina], "fillers": [tinia], "end_board": []}
+    for_real = {"line": [f"idle.1.0.{tinia}.0.2.0"], "hand": [tinia], "fillers": [], "end_board": []}
+    assert tinia not in ob.book_cards([as_filler])
+    assert tinia in ob.book_cards([as_filler, for_real])
+
+
+class Board:
+    """A snapshot-only duel for state keys."""
+
+    def __init__(self, cards, keys=("idle.7.0",)):
+        self.cards, self._keys, self.phase, self.turn, self.player = cards, list(keys), 4, 1, 0
+
+    def snapshot(self):
+        return {"cards": self.cards}
+
+    def keys(self):
+        return self._keys
+
+
+def card(controller, location, code, position=0x5, public=False):
+    return {"controller": controller, "owner": controller, "location": location, "code": code, "sequence": 0,
+            "position": position, "public": public}
+
+
+def test_state_key_sees_the_opponents_face_up_and_gy_cards():
+    droll, lucina = 94145021, 13597785
+    base = [card(0, 4, lucina)]
+    plain = ob.state_key(Board(base), {lucina})
+    in_gy = ob.state_key(Board(base + [card(1, 0x10, droll)]), {lucina})  # Droll used: in the opponent's GY
+    face_up = ob.state_key(Board(base + [card(1, 8, droll, position=0x1)]), {lucina})
+    face_down = ob.state_key(Board(base + [card(1, 8, droll, position=0xA)]), {lucina})
+    assert plain != in_gy and plain != face_up and face_up != face_down
+    hidden = ob.state_key(Board(base + [card(1, 8, 12345678, position=0xA)]), {lucina})
+    assert face_down == hidden  # a face-down card has no identity in the key
+
+
+def test_walk_and_stay_use_the_same_keys():
+    lucina, a = 13597785, 11111111
+    relevant = {lucina, a}
+    walked = ob.walk(lambda: Solo([lucina, a], lucina), [f"idle.1.0.{lucina}.0.2.0"], relevant)
+    book = {state: {"answer": answer} for state, answer, _, _ in walked}
+    assert ob.stay(lambda: Solo([lucina, a], lucina), book, relevant) == 1
+
+
+def test_score_puts_unrated_lines_below_rated_ones():
+    assert ob.score({"field": 2, "value": {"held": 0.0}}) > ob.score({"field": 9, "value": {"held": None}})
+
+
+def test_from_lines_checks_its_settings(tmp_path):
+    import json
+
+    import pytest
+    lines = tmp_path / "book-lines.jsonl"
+    lines.write_text("", encoding="utf-8")
+    (tmp_path / "book-meta.json").write_text(json.dumps({"deck": "decks/elfnote.ydk", "deck_type": "Elfnote",
+                                                         "opponent": "x.ydk"}), encoding="utf-8")
+    args = ob.parse_args(["--deck", "decks/branded.ydk", "--deck-type", "Branded", "--checkpoint", "c",
+                          "--out", str(tmp_path / "b.jsonl"), "--from-lines", str(lines), "--opponent", "x.ydk"])
+    with pytest.raises(SystemExit, match="other settings"):
+        ob.load_lines(args)
