@@ -297,7 +297,8 @@ def load(args, deck_type: str, names: dict[str, int], resolve, decklist, card_na
     priority = lambda s: next((i for i, t in enumerate(args.priority) if t.lower() in s.title.lower()),  # noqa: E731
                               len(args.priority))
     # Priority titles, then going-first lines, then the sources in the given order, short hands first.
-    seeds.sort(key=lambda s: (priority(s), not s.first, sources.index(s.source), len(s.hand)))
+    seeds.sort(key=lambda s: (priority(s), not s.first, "defunct" in s.title.lower(), sources.index(s.source),
+                              len(s.hand)))
     seeds = [s for s in seeds if s.combo.steps or s.combo.end_board]  # nothing to aim for otherwise
     unique: dict[tuple, Seed] = {}  # one search per hand and plan; hand traps named by duplicates merge
     for s in seeds:

@@ -71,14 +71,17 @@ def fired(history: list[str], trap: int) -> bool:
                and ref[2] == "1" for k in history)
 
 
-def state_key(duel, relevant: set[int]) -> str:
+def state_key(duel, relevant: set[int], hand: bool = True) -> str:
     """The game state as the book sees it: our hand, field (with zone and position), GY and
     banished cards, the opponent's public cards, phase and turn, and the question (its kinds and
     the relevant cards it names). Cards no book line names count only as a number, so a filler card
-    does not split states."""
+    does not split states. Without `hand` (the loose key) the hand and the cards the question
+    names are left out: a fallback for hands the book never saw, checked by the answer itself."""
     parts = []
     for c in duel.snapshot()["cards"]:
         loc = c["location"]
+        if c["controller"] == 0 and loc == worlds.LOCATION_HAND and not hand:
+            continue
         if c["controller"] == 0 and loc in (worlds.LOCATION_HAND, worlds.LOCATION_GRAVE, worlds.LOCATION_REMOVED):
             parts.append((0, loc, c["code"] if c["code"] in relevant else 0, 0))
         elif c["controller"] == 0 and loc in (worlds.LOCATION_MZONE, worlds.LOCATION_SZONE):
@@ -86,21 +89,37 @@ def state_key(duel, relevant: set[int]) -> str:
         elif c["controller"] == 1 and loc in (worlds.LOCATION_MZONE, worlds.LOCATION_SZONE, worlds.LOCATION_GRAVE,
                                               worlds.LOCATION_REMOVED) and c["public"]:
             parts.append((1, loc, c["code"], 0))
-    question = sorted({(k.split(".")[0], worlds.card_ref(k)[1] if worlds.card_ref(k) and
+    question = sorted({(k.split(".")[0], worlds.card_ref(k)[1] if hand and worlds.card_ref(k) and
                         int(worlds.card_ref(k)[1]) in relevant else "") for k in duel.keys()})
     raw = json.dumps([sorted(parts), duel.phase, duel.turn, duel.player, question])
     return hashlib.sha1(raw.encode()).hexdigest()[:20]
 
 
-def walk(start, keys: list[str], relevant: set[int]) -> list[tuple[str, str, int]]:
-    """(state, answer, depth) for each of our answers along a line replayed from its scenario."""
+def book_cards(results: list[dict]) -> set[int]:
+    """The cards the state key tells apart: every card of ours a book line names, the seeds'
+    starting cards and the end-board cards, but not a card that only ever was a filler (a hand with
+    other fillers must reach the same states; a filler used as a cost then leaves the book there)."""
+    named, kept, fillers = set(), set(), set()
+    for result in results:
+        for key in result["line"]:
+            if (ref := worlds.card_ref(key)) is not None and ref[2] == "0":
+                named.add(int(ref[1]))
+        kept |= set(result.get("hand", [])) | {c["code"] for c in result["end_board"]
+                                               if c["location"] in (worlds.LOCATION_MZONE, worlds.LOCATION_SZONE)}
+        fillers |= set(result.get("fillers", []))
+    return (named - fillers) | kept
+
+
+def walk(start, keys: list[str], relevant: set[int]) -> list[tuple[str, str, int, str]]:
+    """(state, answer, depth, loose state) for each of our answers along a line replayed from its
+    scenario."""
     duel = start()
     out, depth = [], 0
     for key in keys:
         if duel is None or duel.finished or key not in duel.keys():
             break
         if duel.player == 0:
-            out.append((state_key(duel, relevant), worlds.canonical(key), depth))
+            out.append((state_key(duel, relevant), worlds.canonical(key), depth, state_key(duel, relevant, False)))
             depth += 1
         duel.act(key)
     return out
@@ -185,6 +204,7 @@ def main(argv=None) -> None:
             except Exception:
                 return None
             return None if duel.finished else duel
+        start.fillers = hand[len(seed.hand):]
         return script, seed_value, start
 
     def search(seed: Seed, variant: int, trap: int | None):
@@ -206,6 +226,7 @@ def main(argv=None) -> None:
                 "steps": len(targets), "progress": line.progress, "skipped": line.skipped,
                 "key_cards": line.key_cards, "book_end_board": seed.combo.end_board, "field": len(on_field),
                 "end_board": final, "script": script, "duel_seed": seed_value, "first": seed.first,
+                "hand": seed.hand, "fillers": start.fillers,
                 "seconds": round(time.perf_counter() - began, 1)}, start
 
     # Base lines first; each hand's interruption branches use the hand traps its seed names first,
@@ -250,28 +271,34 @@ def main(argv=None) -> None:
         # cards): it ranks below the base lines on the states they share, by its field size.
         result["value"] = (rate(result, args, agent_main, agent_extra, policy, card_index, cache, Duel)
                            if result["trap"] is None else {"held": -1.0, "left": None, "tries": 0})
-    relevant = set()
-    for result, _ in lines:
-        for key in result["line"]:
-            if (ref := worlds.card_ref(key)) is not None and ref[2] == "0":
-                relevant.add(int(ref[1]))
-        relevant |= {c["code"] for c in result["end_board"]}
+    relevant = book_cards([r for r, _ in lines])
     book: dict[str, dict] = {}
+    loose: dict[str, list] = {}  # loose state -> answers of the lines through it, best first
     for result, start in lines:
         score = (result["value"]["held"], result["field"])
-        for state, answer, depth in walk(start, result["line"], relevant):
+        for state, answer, depth, wide in walk(start, result["line"], relevant):
             entry = book.get(state)
             if entry is None or tuple(entry["score"]) < score:
-                book[state] = {"state": state, "answer": answer, "score": list(score), "depth": depth,
+                book[state] = {"state": state, "loose": wide, "answer": answer, "score": list(score), "depth": depth,
                                "seed": result["seed"], "trap": result["trap"], "hits": (entry or {}).get("hits", 0)}
             book[state]["hits"] += 1
+            loose.setdefault(wide, []).append((score, answer))
+    for answers in loose.values():
+        answers.sort(key=lambda a: a[0], reverse=True)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text("".join(json.dumps(e) + "\n" for e in book.values()), encoding="utf-8")
     lines_out = args.out.with_name(args.out.stem + "-lines.jsonl")
     lines_out.write_text("".join(json.dumps(r) + "\n" for r, _ in lines), encoding="utf-8")
     meta = {"relevant": sorted(relevant)}
     args.out.with_name(args.out.stem + "-meta.json").write_text(json.dumps(meta), encoding="utf-8")
-    report(lines, book, relevant, args, decklist, opponent, cache, Duel, card_name)
+    # Test hands: the book's own lines (a check of the state key: they must stay to their end), the
+    # seeds' starting cards with other fillers (transpositions), and honest random hands.
+    by_id = {s.id: s for s in seeds}
+    base = [(r, start) for r, start in lines if r["trap"] is None]
+    tests = {"own_lines": [start for _, start in base],
+             "seed_hands": [scenario(by_id[r["seed"]], 1000 + r["variant"], None)[2] for r, _ in base],
+             "random_hands": [random_start(t, args, decklist, opponent, cache, Duel) for t in range(args.test_hands)]}
+    report(lines, book, loose, tests, relevant, args, card_name)
 
 
 def rate(result: dict, args, agent_main, agent_extra, policy, card_index, cache, Duel) -> dict:
@@ -334,48 +361,71 @@ def own(result: dict, args, cache, Duel, keys: list[str]) -> list[str] | None:
     return mine
 
 
-def report(lines, book, relevant, args, decklist, opponent, cache, Duel, card_name) -> None:
-    """Book size, branches per hand trap, end-board values, and how long random test hands stay in
-    the book (our answers played from it before the first state it does not know)."""
+def stay(start, book: dict, relevant: set[int], loose: dict | None = None, max_answers: int = 400) -> int:
+    """How many of our answers a duel plays from the book before the first state it does not know
+    (with `loose`: or whose loose state offers none of the book's answers there)."""
+    duel = start()
+    depth = 0
+    for _ in range(max_answers):
+        if duel is None or duel.finished or duel.turn > 1:
+            break
+        keys = duel.keys()
+        if duel.player != 0:
+            duel.act(worlds.decline(keys))
+            continue
+        entry = book.get(state_key(duel, relevant))
+        answer = worlds.match(entry["answer"], keys) if entry else None
+        if answer is None and loose is not None:
+            answer = next((m for _, a in loose.get(state_key(duel, relevant, False), [])
+                           if (m := worlds.match(a, keys)) is not None), None)
+        if answer is None:
+            break
+        duel.act(answer)
+        depth += 1
+    return depth
+
+
+def report(lines, book, loose, tests: dict[str, list], relevant, args, card_name) -> None:
+    """Book size, branches per hand trap, end-board values, and for each test set (lists of
+    scenario starts) the share of hands that stay in the book for 1, 5, 10 and 20 of our answers."""
     traps = Counter(card_name.get(r["trap"], str(r["trap"])) for r, _ in lines if r["trap"] and r["fired"])
     tried = Counter(card_name.get(r["trap"], str(r["trap"])) for r, _ in lines if r["trap"])
     values = [r["value"]["held"] for r, _ in lines if r["trap"] is None]
-    rng = random.Random(args.seed)
-    stays = []
-    for t in range(args.test_hands):
-        main = list(decklist[0])
-        rng.shuffle(main)
-        hand = main[:HAND_SIZE]
-        combo = cb.Combo(f"test-{t}", "test", args.deck_type, 0, [], [])
-        script = cc.scenario_script(combo, decklist, opponent, lambda c: False, random.Random(f"test-{t}"), hand=hand)
-        try:
-            duel = Duel.world(str(cache / "cardscripts"), str(cache / "card_data.tsv"), str(args.deck),
-                              str(args.opponent), script, t, 0)
-        except Exception:
-            continue
-        depth = 0
-        for _ in range(400):
-            if duel.finished or duel.turn > 1:
-                break
-            keys = duel.keys()
-            if duel.player != 0:
-                duel.act(worlds.decline(keys))
-                continue
-            entry = book.get(state_key(duel, relevant))
-            answer = worlds.match(entry["answer"], keys) if entry else None
-            if answer is None:
-                break
-            duel.act(answer)
-            depth += 1
-        stays.append(depth)
-    n = max(1, len(stays))
     summary = {"states": len(book), "lines": len(lines), "base_lines": len(values),
                "mean_field": round(sum(r["field"] for r, _ in lines if r["trap"] is None) / max(1, len(values)), 2),
                "held_mean": round(sum(values) / max(1, len(values)), 3),
-               "test_hands": len(stays), **{f"stay_{k}": round(sum(d >= k for d in stays) / n, 3) for k in (1, 5, 10, 20)},
                "branches_fired": dict(traps), "branches_tried": dict(tried)}
+    summary["loose_states"] = len(loose)
+    for name, starts in tests.items():
+        for kind, fallback in (("exact", None), ("loose", loose)):
+            depths = [stay(start, book, relevant, fallback) for start in starts]
+            n = max(1, len(depths))
+            summary[f"{name}_{kind}"] = {"hands": len(depths), **{f"stay_{k}": round(sum(d >= k for d in depths) / n, 3)
+                                                                  for k in (1, 5, 10, 20)}}
     print(json.dumps(summary), flush=True)
     args.out.with_name(args.out.stem + "-report.json").write_text(json.dumps(summary, indent=1), encoding="utf-8")
+
+
+def random_start(t: int, args, decklist, opponent, cache, Duel):
+    """A scenario with an honest random hand from the deck (test hand `t`)."""
+    main = list(decklist[0])
+    rng = random.Random(f"{args.seed}-test-{t}")
+    rng.shuffle(main)
+    combo = cb.Combo(f"test-{t}", "test", args.deck_type, 0, [], [])
+    script = cc.scenario_script(combo, decklist, opponent, lambda c: False, rng, hand=main[:HAND_SIZE])
+
+    def start():
+        try:
+            duel = Duel.world(str(cache / "cardscripts"), str(cache / "card_data.tsv"), str(args.deck),
+                              str(args.opponent), script, t, 0)
+            for _ in range(20):
+                if duel.finished or duel.player == 0:
+                    break
+                duel.act(worlds.decline(duel.keys()))
+        except Exception:
+            return None
+        return None if duel.finished else duel
+    return start
 
 
 if __name__ == "__main__":
