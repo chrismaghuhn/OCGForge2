@@ -56,7 +56,7 @@ def filler_rng(combo: cb.Combo) -> random.Random:
 
 def scenario_script(combo: cb.Combo, decklist: tuple[list[int], list[int]], opponent: list[int], is_extra,
                     rng: random.Random, hand_size: int = 5, hand: list[int] | None = None,
-                    filler_rng: random.Random | None = None) -> str:
+                    filler_rng: random.Random | None = None, opponent_hand: list[int] = ()) -> str:
     """The puzzle: our hand (the combo's starting cards, filled up from the decklist), our deck and
     Extra Deck (the decklist plus the combo's cards it lacks), an opponent with a deck and a hand it
     never plays (effects like PSY-Framelord Omega's need one).
@@ -64,7 +64,8 @@ def scenario_script(combo: cb.Combo, decklist: tuple[list[int], list[int]], oppo
     With `filler_rng` the cards filling the hand come from it (one draw per combo, the same in every
     shuffle), and `rng` only orders the decks: the shuffles then test what the combo player cannot
     know (deck order: draws, excavations), not a different starting hand. Without it (books before
-    v3) `rng` picks the fillers too."""
+    v3) `rng` picks the fillers too. `opponent_hand` cards (hand traps for interruption branches) go
+    into the opponent's hand first."""
     main, extra = list(decklist[0]), list(decklist[1])
     for code in combo.cards():  # the combo's cards we do not run
         target = extra if is_extra(code) else main
@@ -94,6 +95,10 @@ def scenario_script(combo: cb.Combo, decklist: tuple[list[int], list[int]], oppo
         lines.append(f"Debug.AddCard({code},0,0,{worlds.LOCATION_HAND},{i},10)")
     opponent = list(opponent)
     rng.shuffle(opponent)
+    for code in reversed(list(opponent_hand)):
+        if code in opponent:
+            opponent.remove(code)
+        opponent.insert(0, code)
     for i, code in enumerate(opponent[hand_size:]):
         lines.append(f"Debug.AddCard({code},1,1,{worlds.LOCATION_DECK},{i},8)")
     for i, code in enumerate(opponent[:hand_size]):  # it never plays them, but effects may target a hand
@@ -418,7 +423,7 @@ def trigger_key(row: dict, keys: list[str], i: int, codes: dict[int, int]) -> st
 
 def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12, branch: int = 4,
           max_decisions: int = 150, lookahead: int = 3, center: set[int] = frozenset(),
-          is_extra=lambda code: False) -> tuple[Line, list[tuple[int, int | None]]]:
+          is_extra=lambda code: False, opponent=None) -> tuple[Line, list[tuple[int, int | None]]]:
     """Beam search through the combo from a fresh puzzle duel (`start()`); returns the best line and
     the steps (card, expected location) it had to follow. Lines rank by steps done, then by how many
     of the book's end-board cards are on the field, then by the model's log-probabilities.
@@ -462,7 +467,7 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
                 continue
             try:
                 while not duel.finished and duel.player != 0:  # the opponent never acts
-                    key = worlds.decline(duel.keys())
+                    key = opponent(duel, line.keys) if opponent else worlds.decline(duel.keys())
                     duel.act(key)
                     line.keys.append(key)
             except Exception:  # the engine failed on this line: drop it, not the whole run
