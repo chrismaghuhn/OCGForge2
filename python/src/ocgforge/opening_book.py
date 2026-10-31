@@ -138,14 +138,16 @@ def main(argv=None) -> None:
     p.add_argument("--lists", nargs="*", default=[],
                    help="other player sheets (Card/Board CSV, In Hand TSV), each as path or path::author")
     p.add_argument("--chokepoints", type=Path, help="JSON {hand trap: [card names]} from guides")
+    p.add_argument("--rotk", type=Path, nargs="*", default=[], help="Road of the King reports (text)")
+    p.add_argument("--pinned", type=Path, help="directory of pinned Discord replays (<id>.txt, descriptions.txt)")
     p.add_argument("--priority", nargs="*", default=[], help="seed titles (substrings) to search first")
     p.add_argument("--opponent", type=Path, default=rollout.REPO / "decks" / "salamangreat.ydk")
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--hands", type=int, default=3, help="starting hands per seed (other fillers)")
     p.add_argument("--max-seeds", type=int, default=0, help="seeds to search at most (0: all)")
     p.add_argument("--grid", type=int, default=40, help="starter x extender hands at most")
-    p.add_argument("--sources", default="replay,sheet,community,grid",
-                   help="seed sources to use, in search order (replay, sheet, community, grid)")
+    p.add_argument("--sources", default="replay,guide,sheet,community,grid",
+                   help="seed sources to use, in search order (replay, guide, sheet, community, grid)")
     p.add_argument("--max-searches", type=int, default=0, help="searches at most, in seed order (0: all)")
     p.add_argument("--traps", type=int, default=3, help="interruption branches per hand (most feared hand traps)")
     p.add_argument("--first-only", action="store_true", help="only going-first seeds")

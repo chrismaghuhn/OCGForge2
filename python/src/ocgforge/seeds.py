@@ -21,6 +21,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import aliases as _aliases
 from . import combos as cb
 from . import db_logs
 
@@ -49,6 +50,7 @@ ALIASES = {
     "levilazebul": "Fabled Levilazebul", "desirae": "Fiendsmith's Desirae", "lacrima": "Fiendsmith's Lacrima",
     "agnumday": "Fiendsmith's Agnumday", "sequence": "Fiendsmith's Sequence",
 }
+ALIASES.update(_aliases.ALIASES)  # the nickname table of aliases.py (checked against the card database)
 INTERRUPTERS = {
     "Ash Blossom & Joyous Spring", "Infinite Impermanence", "Effect Veiler", "Droll & Lock Bird",
     "Ghost Belle & Haunted Mansion", "Ghost Ogre & Snow Rabbit", "Nibiru, the Primal Being", "D.D. Crow",
@@ -202,7 +204,13 @@ def replay_seed(path: Path, deck_type: str, resolve) -> Seed | None:
     moves = [(code, e.card, ACTION[e.kind]) for e in log.events if (code := resolve(e.card)) is not None]
     traps = {code: {c for name in answered if (c := resolve(name)) is not None}
              for trap, answered in log.traps.items() if (code := resolve(trap)) is not None}
-    hand = [c for name in log.hand if (c := resolve(name)) is not None and c not in traps][:HAND_SIZE]
+    first: dict[int, str] = {}
+    for code, _, action in moves:
+        first.setdefault(code, action)
+    # Discard fodder ("+ 2 discards": a hand card whose first move is to the GY) is no seed card:
+    # any filler will do.
+    hand = [c for name in log.hand if (c := resolve(name)) is not None and c not in traps
+            and first.get(c) != ACTION["gy"]][:HAND_SIZE] or [c for name in log.hand[:1] if (c := resolve(name))]
     if not moves or not hand:
         return None
     combo = cb.Combo(f"replay-{path.stem}", log.title or path.stem, deck_type, 0, [cb.Entry(c, "", "") for c in hand],
@@ -286,6 +294,13 @@ def load(args, deck_type: str, names: dict[str, int], resolve, decklist, card_na
     if args.sheet:
         seeds += sheet_seeds(args.sheet, deck_type, resolve)
     seeds += [s for path in args.replays if (s := replay_seed(path, deck_type, resolve)) is not None]
+    if getattr(args, "rotk", None):  # Road of the King reports (rotk.py)
+        from . import rotk
+        for path in args.rotk:
+            seeds += rotk.rotk_seeds(path, deck_type, resolve)
+    if getattr(args, "pinned", None):  # pinned Discord replays with their posts (pinned.py)
+        from . import pinned
+        seeds += pinned.pinned_seeds(args.pinned, deck_type, resolve)
     for item in args.lists:  # "path" or "path::author"
         path, _, author = str(item).partition("::")
         seeds += list_seeds(Path(path), deck_type, resolve, author)

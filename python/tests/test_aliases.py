@@ -37,7 +37,8 @@ def test_with_aliases_wraps_a_resolver():
     cards = {"Mirrorjade the Iceblade Dragon": 2, "Jade Dragon Mech": 3, "Elfnote Power Patron": 4}
     names = {cb.normalize(n): c for n, c in cards.items()}
     base = sd.resolver(names, set(cards.values()), {c: n for n, c in cards.items()})
-    assert base("Jade") is None and base("PP") is None  # ambiguous / unknown in this pool
+    # seeds.ALIASES now includes aliases.ALIASES, so the plain resolver knows the nicknames too
+    assert base("Jade") == 2 and base("PP") == 4
     resolve = aliases.with_aliases(base)
     assert resolve("Jade") == 2 and resolve("Jade in GY.") == 2 and resolve("PP") == 4
     assert resolve("Jade Dragon Mech") == 3
