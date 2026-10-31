@@ -159,6 +159,7 @@ def main(argv=None) -> None:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", type=Path, required=True, help="book (JSON lines: one state per line)")
     p.add_argument("--dry-run", action="store_true", help="list the seeds and searches, search nothing")
+    p.add_argument("--from-lines", type=Path, help="lines of an earlier run (<out>-lines.jsonl): book and report only")
     args = p.parse_args(argv)
     torch.set_num_threads(args.torch_threads)
 
@@ -248,9 +249,16 @@ def main(argv=None) -> None:
                   f"steps={len(cc.step_targets(seed.combo))} board={[card_name.get(c) for c in seed.combo.end_board]} "
                   f"vs={[card_name.get(c) for c in seed.vs]}  {seed.title[:60]}")
         return
-    pool_ex = ThreadPoolExecutor(max(1, args.workers))
-    futures = [pool_ex.submit(search, *job) for job in jobs]
-    lines = []
+    if args.from_lines:  # rebuild book and report from searched lines (values kept)
+        lines = []
+        for text in args.from_lines.read_text(encoding="utf-8").splitlines():
+            result = json.loads(text)
+            lines.append((result, script_start(result["script"], result["duel_seed"], args, cache, Duel)))
+        futures = []
+    else:
+        pool_ex = ThreadPoolExecutor(max(1, args.workers))
+        futures = [pool_ex.submit(search, *job) for job in jobs]
+        lines = []
     for n, future in enumerate(futures):
         try:
             result, start = future.result()
@@ -261,12 +269,13 @@ def main(argv=None) -> None:
         print(f"{n + 1}/{len(futures)} {result['source']:9s} field {result['field']} "
               f"trap {card_name.get(result['trap'], '-')[:20]:20s} fired {result['fired']} {result['seconds']:.0f}s  "
               f"{result['title'][:50]}", flush=True)
-    pool_ex.shutdown()
+    if futures:
+        pool_ex.shutdown()
 
     # End boards rated by board_break: the agent goes second against each.
     agent_main, agent_extra = worlds.read_decklist(args.agent_deck)
     policy = rollout.ModelPolicy(model, args.device, sample=True, seed=args.seed)
-    for result, start in lines:
+    for result, start in lines if not args.from_lines else []:
         # A line with a hand trap fired cannot be rebuilt for board_break (the agent's seat holds other
         # cards): it ranks below the base lines on the states they share, by its field size.
         result["value"] = (rate(result, args, agent_main, agent_extra, policy, card_index, cache, Duel)
@@ -363,7 +372,8 @@ def own(result: dict, args, cache, Duel, keys: list[str]) -> list[str] | None:
 
 def stay(start, book: dict, relevant: set[int], loose: dict | None = None, max_answers: int = 400) -> int:
     """How many of our answers a duel plays from the book before the first state it does not know
-    (with `loose`: or whose loose state offers none of the book's answers there)."""
+    (with `loose`: or whose loose state offers none of the book's answers there). Only real choices
+    count: questions with one answer and passed chain windows do not."""
     duel = start()
     depth = 0
     for _ in range(max_answers):
@@ -381,7 +391,7 @@ def stay(start, book: dict, relevant: set[int], loose: dict | None = None, max_a
         if answer is None:
             break
         duel.act(answer)
-        depth += 1
+        depth += len(keys) > 1 and answer != "chain.pass"  # real choices only: no forced answers, no passes
     return depth
 
 
@@ -404,6 +414,22 @@ def report(lines, book, loose, tests: dict[str, list], relevant, args, card_name
                                                                   for k in (1, 5, 10, 20)}}
     print(json.dumps(summary), flush=True)
     args.out.with_name(args.out.stem + "-report.json").write_text(json.dumps(summary, indent=1), encoding="utf-8")
+
+
+def script_start(script: str, seed: int, args, cache, Duel):
+    """A start function for a stored scenario script (puzzle duel advanced to our first decision)."""
+    def start():
+        try:
+            duel = Duel.world(str(cache / "cardscripts"), str(cache / "card_data.tsv"), str(args.deck),
+                              str(args.opponent), script, seed, 0)
+            for _ in range(20):
+                if duel.finished or duel.player == 0:
+                    break
+                duel.act(worlds.decline(duel.keys()))
+        except Exception:
+            return None
+        return None if duel.finished else duel
+    return start
 
 
 def random_start(t: int, args, decklist, opponent, cache, Duel):
