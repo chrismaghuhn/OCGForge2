@@ -49,11 +49,22 @@ def wants_center(text: str) -> bool:
     return bool(CENTER.search(text or ""))
 
 
+def filler_rng(combo: cb.Combo) -> random.Random:
+    """The random source of a combo's filler cards: the same in every shuffle (see scenario_script)."""
+    return random.Random(f"{combo.id}-hand")
+
+
 def scenario_script(combo: cb.Combo, decklist: tuple[list[int], list[int]], opponent: list[int], is_extra,
-                    rng: random.Random, hand_size: int = 5, hand: list[int] | None = None) -> str:
+                    rng: random.Random, hand_size: int = 5, hand: list[int] | None = None,
+                    filler_rng: random.Random | None = None) -> str:
     """The puzzle: our hand (the combo's starting cards, filled up from the decklist), our deck and
     Extra Deck (the decklist plus the combo's cards it lacks), an opponent with a deck and a hand it
-    never plays (effects like PSY-Framelord Omega's need one)."""
+    never plays (effects like PSY-Framelord Omega's need one).
+
+    With `filler_rng` the cards filling the hand come from it (one draw per combo, the same in every
+    shuffle), and `rng` only orders the decks: the shuffles then test what the combo player cannot
+    know (deck order: draws, excavations), not a different starting hand. Without it (books before
+    v3) `rng` picks the fillers too."""
     main, extra = list(decklist[0]), list(decklist[1])
     for code in combo.cards():  # the combo's cards we do not run
         target = extra if is_extra(code) else main
@@ -65,6 +76,12 @@ def scenario_script(combo: cb.Combo, decklist: tuple[list[int], list[int]], oppo
         if code in main:
             main.remove(code)
         hand.append(code)
+    if filler_rng is not None:
+        pool = sorted(main)
+        filler_rng.shuffle(pool)
+        for code in pool[:max(0, hand_size - len(hand))]:
+            main.remove(code)
+            hand.append(code)
     rng.shuffle(main)
     while len(hand) < hand_size and main:
         hand.append(main.pop())
@@ -188,6 +205,16 @@ def step_groups(combo: cb.Combo) -> list[int]:
     return [n for n, _ in step_entries(combo)]
 
 
+EFFECT_FIRST = re.compile(r"^\s*(activate\s+)?(its\s+|own\s+|hand\s+|gy\s+|pendulum\s+)?(effect|eff)\b", re.IGNORECASE)
+
+
+def step_loose(combo: cb.Combo) -> frozenset:
+    """Steps whose text puts "effect" before the verb ("Effect to Revive" on Vidolium, "Activate Eff
+    to SS"): whether the card itself moves or its effect moves another card is open, so naming the
+    card by an answer also does them."""
+    return frozenset(i for i, (_, e) in enumerate(step_entries(combo)) if EFFECT_FIRST.search(e.action))
+
+
 def step_targets(combo: cb.Combo) -> list[tuple[int, int | None]]:
     """The combo's steps as (card, expected location)."""
     entries = [e for _, e in step_entries(combo)]
@@ -215,12 +242,14 @@ class Line:
     skipped: int = 0  # steps passed over without being done
     ahead: frozenset = frozenset()  # later steps of the current community step already done
     passed: tuple = ()  # the skipped steps
+    trigger: str | None = None  # for a "yes" to "activate X's effect?": a key naming X (yes/no keys name no card)
     intent: float = 0.0  # bonus for heading to the next step (its card named), kept until a step is done
     duel: object = field(default=None, repr=False, compare=False)  # the engine at this line's end (a clone)
 
 
 def advance(line: Line, targets: list[tuple[int, int | None]], last_key: str | None, now: Counter,
-            lookahead: int, groups: list[int] | None = None) -> tuple[int, int, frozenset]:
+            lookahead: int, groups: list[int] | None = None, loose: frozenset = frozenset()
+            ) -> tuple[int, int, frozenset]:
     """How many steps the last answer completed, how many of them it skipped, and which later steps
     are done ahead of their turn: a step with a location is done when its card arrived there; one
     without, when the answer named its card. Entries of one community step (`groups`: "Strelitzia,
@@ -247,7 +276,7 @@ def advance(line: Line, targets: list[tuple[int, int | None]], last_key: str | N
             # placed before) is done when an answer names it there.
             if (location is not None and (code, location) in arrived) or (
                     unblocked and named is not None and int(named[1]) == code
-                    and (location is None or (named[2] == "0" and named[3] == str(location)))):
+                    and (location is None or i in loose or (named[2] == "0" and named[3] == str(location)))):
                 hit = i
                 if location is not None:
                     arrived.discard((code, location))
@@ -376,6 +405,17 @@ def offered_bonus(offered: set[int], ahead: list[int]) -> float:
     return max((step_bonus(i) for i, code in enumerate(ahead) if code in offered), default=0.0)
 
 
+def trigger_key(row: dict, keys: list[str], i: int, codes: dict[int, int]) -> str | None:
+    """A key naming the card a yes/no answer is about ("activate Power Patron's effect?"), from the
+    encoded decision (candidate source token -> card index -> passcode), or None."""
+    try:
+        token = row["candidate_source"][i]
+        code = codes.get(int(row["token_card"][token])) if token is not None and token >= 0 else None
+    except (KeyError, IndexError, TypeError):
+        return None
+    return f"trigger.{code}.0.0.0" if code else None
+
+
 def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12, branch: int = 4,
           max_decisions: int = 150, lookahead: int = 3, center: set[int] = frozenset(),
           is_extra=lambda code: False) -> tuple[Line, list[tuple[int, int | None]]]:
@@ -390,6 +430,10 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
     Synchro); end-board cards on the field are never chosen as material or cost."""
     targets = step_targets(combo)
     groups = step_groups(combo)
+    loose = step_loose(combo)
+    codes: dict[int, int] = {}  # card index -> passcode (originals before alternate artworks)
+    for code, index in card_index.items():
+        codes.setdefault(index, code)
     key_cards = Counter(combo.end_board)
     plan = {code for code, _ in targets} | set(key_cards)
     center = set(center) & plan
@@ -425,7 +469,9 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
                 continue
             now = board(duel)
             mine = next((k for k in reversed(line.keys) if not k.startswith(("chain.pass", "yes_no.no"))), None)
-            steps, skipped, line.ahead = advance(line, targets, mine, now, lookahead, groups)
+            if mine == "yes_no.yes" and line.trigger:
+                mine = line.trigger  # an optional trigger effect was activated: it uses its card
+            steps, skipped, line.ahead = advance(line, targets, mine, now, lookahead, groups, loose)
             line.progress += steps
             line.skipped += len(skipped)
             line.passed += skipped
@@ -449,9 +495,10 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
                 expanded.append((line, duel))
         if not expanded:
             break
-        logprobs = candidate_logprobs(model, [d.encode(card_index) for _, d in expanded], device)
+        rows = [d.encode(card_index) for _, d in expanded]
+        logprobs = candidate_logprobs(model, rows, device)
         children = []
-        for (line, duel), lp in zip(expanded, logprobs):
+        for (line, duel), lp, row in zip(expanded, logprobs, rows):
             keys = duel.keys()
             state = hash(tuple(sorted(line.board.items())))
             pending = [i for i in range(line.progress, len(targets)) if i not in line.ahead][:lookahead]
@@ -496,6 +543,8 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
                 if key.startswith(("yes_no.", "effect_yes_no.")):
                     value = 0.5 if key.endswith(".yes") else 0.0  # both stay; the board decides
                     bonus = offered_bonus(peek(duel, key, line.keys, later_center, center, is_extra, ahead), ahead)
+                    if key == "yes_no.yes" and (named := trigger_key(row, keys, i, codes)):
+                        ref = worlds.card_ref(named)  # yes to a step card's trigger effect counts like naming it
                 if ref is not None and int(ref[1]) in window:
                     bonus = step_bonus(ahead.index(int(ref[1])))  # the next step's card first
                 elif ref is not None and int(ref[1]) in upcoming:
@@ -513,9 +562,10 @@ def check(combo: cb.Combo, start, model, card_index, device: str, beam: int = 12
             for _, value, bonus, i in sorted(options, reverse=True)[:branch]:
                 # the latest card named for a coming step sets the intent (a material choice keeps it)
                 intent = 0.0 if keys[i].endswith(".cancel") else bonus or line.intent
+                trigger = trigger_key(row, keys, i, codes) if keys[i] == "yes_no.yes" else None
                 children.append((Line(line.keys + [keys[i]], line.progress, line.score + value, line.board,
                                       line.key_cards, line.tried | {(state, keys[i])}, line.skipped, line.ahead,
-                                      line.passed, intent), duel))
+                                      line.passed, trigger, intent), duel))
         lines = grow(sorted(children, key=lambda c: rank(c[0]), reverse=True)[:beam])
     best = max(done + lines, key=rank, default=Line())
     return best, targets
@@ -611,7 +661,8 @@ def main(argv=None) -> None:
         """One deck order of one combo: its own scenario and seed (`scenario(combo, shuffle)`)."""
         began = time.perf_counter()
         rng = random.Random(f"{combo.id}-{shuffle}")
-        script = scenario_script(combo, decklist, opponent, is_extra, rng, hand=hands.get(combo.id))
+        script = scenario_script(combo, decklist, opponent, is_extra, rng, hand=hands.get(combo.id),
+                                 filler_rng=filler_rng(combo))
         start = start_for(script, rng.getrandbits(32))
         line, targets = check(combo, start, model, card_index, args.device, beam=args.beam, branch=args.branch,
                               max_decisions=args.max_decisions,
@@ -650,7 +701,7 @@ def main(argv=None) -> None:
         result = {"combo": combo.id, "title": combo.title, "votes": combo.votes, "steps": len(targets),
                   "progress": line.progress, "skipped": line.skipped,
                   "skipped_steps": [[i, entries[i].name, entries[i].action] for i in line.passed], "checked_shuffles": checked, "shuffles": args.shuffles,
-                  "checked": checked == args.shuffles, "shuffle": shuffle, "replays": replays, "line": line.keys,
+                  "checked": checked == args.shuffles, "shuffle": shuffle, "fixed_hand": True, "replays": replays, "line": line.keys,
                   "end_board": final, "field": len(on_field), "book_end_board": combo.end_board,
                   "key_cards_reached": (sum(1 for c in combo.end_board if c in {b["code"] for b in on_field})
                                         / len(combo.end_board)) if combo.end_board else None,

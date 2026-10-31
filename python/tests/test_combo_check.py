@@ -133,6 +133,49 @@ def test_opponent_entries_are_not_steps():
     assert step_targets(combo) == [(lucina, 0x4)]
 
 
+def test_effect_first_steps_are_done_by_naming_the_card():
+    from collections import Counter
+    from ocgforge import combos as cb
+    from ocgforge.combo_check import Line, advance, step_loose, step_targets
+    VIDOLIUM, FALLEN = 70488851, 1
+    combo = cb.Combo("id", "t", "Elfnote", 0, [], [[cb.Entry(VIDOLIUM, "Vidolium", "Effect to Revive")],
+                                                   [cb.Entry(FALLEN, "Fallen", "Special Summon")]])
+    assert step_targets(combo)[0] == (VIDOLIUM, 0x4) and step_loose(combo) == frozenset({0})
+    targets = step_targets(combo)
+    key = f"idle.5.0.{VIDOLIUM}.0.8.4"  # its Pendulum effect activated in the Pendulum Zone
+    assert advance(Line(), targets, key, Counter(), 3, [0, 1], step_loose(combo))[0] == 1
+    assert advance(Line(), targets, key, Counter(), 3, [0, 1])[0] == 0
+
+
+def test_trigger_key_names_the_card_of_an_effect_question():
+    from ocgforge import worlds
+    from ocgforge.combo_check import trigger_key
+    row = {"candidate_source": [2, 2], "token_card": [0, 0, 7]}
+    key = trigger_key(row, ["yes_no.no", "yes_no.yes"], 1, {7: 12375297})
+    assert worlds.card_ref(key)[1] == "12375297"
+    assert trigger_key({"candidate_source": [-1, -1], "token_card": []}, ["yes_no.no", "yes_no.yes"], 1, {}) is None
+
+
+def test_filler_cards_stay_fixed_over_shuffles():
+    import random
+    from ocgforge import combos as cb
+    from ocgforge.combo_check import filler_rng, scenario_script
+    combo = cb.Combo("c1", "t", "Elfnote", 0, [cb.Entry(1, "a", "")], [])
+    decklist = (list(range(1, 41)), [])
+
+    def seat0(script, location):
+        return [line for line in script.splitlines() if line.startswith("Debug.AddCard(") and ",0,0," in line
+                and line.split(",")[3] == str(location)]
+
+    scripts = [scenario_script(combo, decklist, list(range(100, 140)), lambda c: False, random.Random(f"c1-{s}"),
+                               filler_rng=filler_rng(combo)) for s in range(3)]
+    hands = [seat0(s, 2) for s in scripts]
+    assert hands[0] == hands[1] == hands[2] and len(hands[0]) == 5 and hands[0][0].startswith("Debug.AddCard(1,")
+    assert seat0(scripts[0], 1) != seat0(scripts[1], 1)  # the deck order still differs
+    old = [seat0(scenario_script(combo, decklist, [], lambda c: False, random.Random(f"c1-{s}")), 2) for s in range(3)]
+    assert len({tuple(h) for h in old}) > 1  # without filler_rng (books before v3) the fillers vary
+
+
 def test_offered_bonus_prefers_the_next_step():
     from ocgforge.combo_check import STEP_BONUS, offered_bonus
     assert offered_bonus({1, 2}, [2, 1]) == STEP_BONUS

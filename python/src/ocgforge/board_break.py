@@ -199,7 +199,8 @@ def main(argv=None) -> None:
             continue
         # The scenario exactly as combo_check built it (the book line's shuffle), then the agent's cards.
         rng = random.Random(f"{combo.id}-{entry.get('shuffle', 0)}")
-        script = combo_check.scenario_script(combo, decklist, book_opponent, is_extra, rng)
+        script = combo_check.scenario_script(combo, decklist, book_opponent, is_extra, rng,
+                                             filler_rng=combo_check.filler_rng(combo) if entry.get("fixed_hand") else None)
         seed = rng.getrandbits(32)
         answers = own_answers(make_start(script, seed, args.book_opponent), entry["line"])
         if answers is None:
