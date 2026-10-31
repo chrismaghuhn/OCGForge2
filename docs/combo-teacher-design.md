@@ -221,3 +221,23 @@ Stellen nur die Karte des nächsten Schritts zulassen, wenn sie angeboten wird.
 (Welten, `decline`, `card_ref`, `match`), `ocgforge.search` (Best-of-K, ehrliche Suche,
 Phasen), `ocgforge.edopro.windbot` (Benchmark), `runs/diagnose/diagnose.py` (Value-AUC,
 Aktivierungsquoten), `tools/fetch_decks.py` (Namenszuordnung).
+
+## K1 v2 (2026-10-30, Branch `combo-boards`)
+
+- **Tempo:** Beam-Linien klonen das Duell ihres Elternteils (`Duel.clone`) statt die Linie jedes Mal
+  neu nachzuspielen; gleiche Linien wie vorher, 24 s → 5,2 s pro Combo und Mischung (ein Thread).
+  Combos und Mischungen laufen in Threads (`--workers`, `--torch-threads`). Jede Buchlinie wird am
+  Ende aus dem Szenario allein nachgespielt (`replays`, bisher immer wahr).
+- **Regeln:** Aktionstext nach erstem Verb und Objekt („Tribute Tinia“ bei Welcome Home = nur
+  benutzt, „Synchro 10 into Baronne“ beim Material = Friedhof); Einträge eines Community-Schritts in
+  beliebiger Reihenfolge; Gegner-Einträge („Opp chains Fuwalos“) zählen nicht; Bonus für die Karte
+  des nächsten Schritts als „Absicht“, die bis zum Schritt hält (halber Schritt im Rang);
+  Ja/Nein-Fragen mit Vorausschau auf einem Klon; Beam 24.
+- **Ergebnis (3 Mischungen):** Elfnote Schritte 34 % → 51 %, geprüft 0/48 → 0/48 (3 Combos in
+  einzelnen Mischungen); DoomZ 1/19, Artmage 1/18, Branded (Top 40) 1/40, Chaos Ritual 0/9,
+  Magistus Fairy Tail 0/17. Geprüfte Linien enden mit kleinen Boards (1–3 Karten); für
+  `board_break` taugen eher Linien mit großem Feld (`--min-field 5`).
+- **Was am meisten scheitert:** „use“-Schritte ohne Ort (die Karte wird benannt, aber für etwas
+  anderes als im Text gemeint), Pendel-Schritte (Vidolium, Junoldo), Schritte, die eine bestimmte
+  Starthand voraussetzen („Any Elfnote“), und die Forderung „alle 3 Mischungen“, die auch die
+  aufgefüllte Hand ändert.
