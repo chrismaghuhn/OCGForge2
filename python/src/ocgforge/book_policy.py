@@ -107,7 +107,7 @@ def deck_id(path: Path) -> tuple:
     return tuple(sorted(main)), tuple(sorted(extra))
 
 
-def _resolve(path: str) -> Path:
+def resolve(path: str) -> Path:
     p = Path(path)
     if not p.is_absolute():
         p = rollout.REPO / p
@@ -121,7 +121,7 @@ def load(path: Path) -> Book:
     exactly as `opening_book.build_book` does (the loose answers are not stored in the book file)."""
     stem = path.with_name(path.stem)
     meta = json.loads(Path(f"{stem}-meta.json").read_text(encoding="utf-8"))
-    deck, opponent = _resolve(meta["deck"]), _resolve(meta["opponent"])
+    deck, opponent = resolve(meta["deck"]), resolve(meta["opponent"])
     relevant = set(meta["relevant"])
     lines = []
     for text in Path(f"{stem}-lines.jsonl").read_text(encoding="utf-8").splitlines():
