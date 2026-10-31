@@ -42,6 +42,8 @@ from .model import Model, ModelConfig, load_checkpoint, save_checkpoint
 from .ppo import PPOConfig, build_steps, ppo_update
 
 SIZES = {
+    "micro": ModelConfig(d_model=32, heads=2, layers=1, ff=64),
+    "tiny": ModelConfig(d_model=64, heads=4, layers=2, ff=128),
     "small": ModelConfig(d_model=128, heads=4, layers=3, ff=256),
     "base": ModelConfig(d_model=256, heads=8, layers=6, ff=1024),
     "large": ModelConfig(d_model=384, heads=8, layers=8, ff=1536),

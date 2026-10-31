@@ -64,6 +64,7 @@ class Combo:
     end_board: list[int] = field(default_factory=list)  # key cards, from a spreadsheet
     vs_hand_traps: list[int] = field(default_factory=list)  # the hand traps this line plays through
     missing: list[str] = field(default_factory=list)  # card names we could not match
+    author: str = ""  # who wrote it (masterduelmeta user name), for crediting sources
 
     @property
     def usable(self) -> bool:
@@ -96,6 +97,13 @@ def _entry(raw: dict, names: dict[str, int], missing: list[str]) -> Entry:
     return Entry(code, name, raw.get("label") or "")
 
 
+def author_name(author) -> str:
+    """The combo's author: a user object ({"username": ...}) or already a name."""
+    if isinstance(author, dict):
+        return author.get("username") or ""
+    return author if isinstance(author, str) else ""
+
+
 def load(deck_type: str | None = None, names: dict[str, int] | None = None) -> list[Combo]:
     """Combos (optionally of one deck type), with end boards and hand-trap lines from the spreadsheets."""
     names = names or name_index()
@@ -117,7 +125,7 @@ def load(deck_type: str | None = None, names: dict[str, int] | None = None) -> l
             votes=len(raw.get("upvotes", [])) - len(raw.get("downvotes", [])),
             starting=[_entry(e, names, missing) for e in raw.get("startingCards", [])],
             steps=[[_entry(e, names, missing) for e in step.get("entries", [])] for step in raw.get("steps", [])],
-            notes=raw.get("notes") or "", missing=missing)
+            notes=raw.get("notes") or "", missing=missing, author=author_name(raw.get("author")))
         sheet = extra.get(combo.id, {})
         for key, target in (("endBoard", combo.end_board), ("vsHandTraps", combo.vs_hand_traps)):
             for e in sheet.get(key) or []:
