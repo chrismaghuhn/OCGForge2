@@ -41,3 +41,24 @@ def test_choice_by_outcome_prefers_the_card_that_arrives_for_a_coming_step():
     assert [keys[i] for i in chosen] == [k for k in keys if str(CANCELLER) in k]
     # nothing arrives where a step wants it: unchanged
     assert choice_by_outcome(duel, keys, {0, 1, 2}, before, [(REGINA, HAND)], follow_args) == {0, 1, 2}
+
+
+class Draw(Choice):
+    """After the pick, the effect draws the top card of the deck as well."""
+
+    def act(self, key):
+        super().act(key)
+        top = next(code for code, loc in self.cards.items() if loc == DECK)
+        self.cards[top] = HAND
+
+    def clone(self):
+        return Draw(self.cards, self.picked)
+
+
+def test_no_look_ahead_when_the_deck_order_would_show():
+    from ocgforge.answer_rules import follow
+    duel = Draw({REGINA: DECK, CANCELLER: DECK, FORTUNA: DECK})
+    key = duel.keys()[0]
+    assert follow(duel, key, [], False, set(), lambda c: False, []) == (set(), None)
+    plain = Choice({REGINA: DECK, CANCELLER: DECK, FORTUNA: DECK})
+    assert follow(plain, plain.keys()[0], [], False, set(), lambda c: False, [])[1] is not None

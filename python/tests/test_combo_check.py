@@ -196,6 +196,9 @@ def test_peek_follows_forced_answers_to_the_next_question():
         def keys(self):
             return self.script[self.i]
 
+        def snapshot(self):
+            return {"cards": []}
+
         def act(self, key):
             assert key in self.keys()
             self.i += 1

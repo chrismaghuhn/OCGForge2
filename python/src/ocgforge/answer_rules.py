@@ -70,15 +70,31 @@ def peek(duel, key: str, history: list[str], upcoming_center: bool, center: set[
     return follow(duel, key, history, upcoming_center, center, is_extra, ahead, max_answers)[0]
 
 
+def deck_cards(duel) -> Counter:
+    return Counter(c["code"] for c in duel.snapshot()["cards"] if c["controller"] == 0 and c["location"] == worlds.LOCATION_DECK)
+
+
 def follow(duel, key: str, history: list[str], upcoming_center: bool, center: set[int], is_extra,
            ahead: list[int], max_answers: int = 12):
-    """`peek`, plus the clone at that next question (None if it went wrong)."""
+    """`peek`, plus the clone at that next question (None if it went wrong).
+
+    Hidden information: a clone holds the real deck order (`Duel.clone(seed)` only reseeds future
+    randomness, it does not reshuffle; docs/engine-clone.md). Searching a card from the deck is a
+    choice among cards we know, but a draw, excavation or deck mill in between would show what the
+    real deck holds. So when any card leaves our deck that the answer itself did not name, the
+    look-ahead gives nothing (no offered cards, no clone): the search decides without it. Choices
+    that depend on deck order still stay honest only through the shuffles combo_check runs."""
     copy = None
     try:
+        before = deck_cards(duel)
+        named = {int(ref[1]) for ref in [worlds.card_ref(key)] if ref is not None}
         copy = duel.clone()
         copy.act(key)
         history = history + [key]
         for _ in range(max_answers):
+            left = before - deck_cards(copy)
+            if any(code not in named for code in left) or sum(left.values()) > len(named):
+                return set(), None  # the deck order showed: no look-ahead
             if copy.finished:
                 return set(), copy
             keys = copy.keys()
