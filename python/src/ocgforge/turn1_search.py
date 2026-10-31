@@ -30,6 +30,9 @@ clones) looks for the line the net itself rates best:
   book `<out>` and `<out>-meta.json` are built by `opening_book.build_book`, so `book_imitation` and
   `teach --book` read it unchanged. Line values for the book stay unrated (`value.held` None): one
   line per hand and branch, so lines only meet at the shared prefix of a hand's base and trap line.
+- `--min-gain G`: a second book `<out stem>-gain.jsonl` holds only the lines whose mean value
+  beats the net's own line (greedy over the same K scenarios; in a branch, its greedy continuation)
+  by more than G. Where the net's own line was kept, imitation teaches nothing new.
 - Resumable: every finished hand is appended to `<out>-hands.jsonl` (stats) right after its lines;
   `--resume` skips those hands (and drops lines of an unfinished hand).
 - Net calls of all search threads go through one `Evaluator`, which batches them on the GPU.
@@ -594,19 +597,52 @@ def done_hands(out: Path) -> set[str]:
     return done
 
 
-def build(out: Path, deck: Path, opponent: Path, meta: dict) -> dict:
-    """The book of the lines file (opening_book.build_book) beside `out`, its meta and a report."""
+def gains(record: dict) -> float | None:
+    """How much better the kept line is than the net's own play: mean end-of-turn value over the K
+    scenarios minus that of the net's greedy line (in a branch: its greedy continuation after the
+    same prefix); None for records without search stats."""
+    search = record.get("search") or {}
+    if search.get("value") is None or search.get("own_value") is None:
+        return None
+    return search["value"] - search["own_value"]
+
+
+def gain_path(out: Path) -> Path:
+    """The filtered book beside `out` (`--min-gain`): <stem>-gain.jsonl, with its own lines and meta."""
+    return out.with_name(f"{out.stem}-gain.jsonl")
+
+
+def write_book(out: Path, deck: Path, opponent: Path, records: list[dict], meta: dict) -> int:
+    """Book `out`, its lines file and meta (with the relevant cards) from `records`; the number of states."""
     p = paths(out)
-    lines = []
-    for text in p["lines"].read_text(encoding="utf-8").splitlines():
-        result = json.loads(text)
-        lines.append((result, cc.puzzle_start(deck, opponent, result["script"], result["duel_seed"])))
-    relevant = ob.book_cards([r for r, _ in lines])
+    lines = [(r, cc.puzzle_start(deck, opponent, r["script"], r["duel_seed"])) for r in records]
+    relevant = ob.book_cards(records)
     book, _ = ob.build_book(lines, relevant)
+    if not p["lines"].exists() or [json.loads(t) for t in p["lines"].read_text(encoding="utf-8").splitlines()] != records:
+        p["lines"].write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
     out.write_text("".join(json.dumps(e) + "\n" for e in book.values()), encoding="utf-8")
     p["meta"].write_text(json.dumps({**meta, "relevant": sorted(relevant)}), encoding="utf-8")
+    return len(book)
+
+
+def build(out: Path, deck: Path, opponent: Path, meta: dict, min_gain: float | None = None) -> dict:
+    """The book of the lines file (opening_book.build_book) beside `out`, its meta and a report.
+    With `min_gain`, also the book of the lines whose value beats the net's own line by more than
+    that (`gain_path`): a line the net would play anyway (or nearly as well) teaches it nothing.
+    Base and branch lines are filtered alike; a branch line whose base line is dropped keeps the
+    base line's answers before the hand trap."""
+    p = paths(out)
+    records = [json.loads(t) for t in p["lines"].read_text(encoding="utf-8").splitlines() if t.strip()]
+    states = write_book(out, deck, opponent, records, meta)
     report = summarize([json.loads(t) for t in p["hands"].read_text(encoding="utf-8").splitlines() if t.strip()])
-    report.update(states=len(book), lines=len(lines))
+    report.update(states=states, lines=len(records))
+    if min_gain is not None:
+        kept = [r for r in records if (g := gains(r)) is not None and g > min_gain]
+        report["gain"] = {"min_gain": min_gain, "lines": len(kept),
+                          "base": sum(r["trap"] is None for r in kept), "trap": sum(r["trap"] is not None for r in kept),
+                          "base_of": sum(r["trap"] is None for r in records),
+                          "trap_of": sum(r["trap"] is not None for r in records),
+                          "states": write_book(gain_path(out), deck, opponent, kept, {**meta, "min_gain": min_gain})}
     p["report"].write_text(json.dumps(report, indent=1), encoding="utf-8")
     return report
 
@@ -656,6 +692,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--min-gain", type=float, default=None,
+                   help="also build <out stem>-gain.jsonl from the lines whose mean value beats the net's own line "
+                        "by more than this")
     p.add_argument("--build-only", action="store_true", help="build book and report from the lines")
     p.add_argument("--out", type=Path, required=True, help="book (JSON lines); lines, hands, meta, report beside it")
     return p.parse_args(argv)
@@ -672,7 +711,7 @@ def main(argv=None) -> None:
     args.deck, args.opponent = args.deck.resolve(), args.opponent.resolve()
     meta = {"deck": str(args.deck), "deck_type": args.deck_type, "opponent": str(args.opponent), "sources": "turn1"}
     if args.build_only:
-        print(json.dumps(build(args.out, args.deck, args.opponent, meta)), flush=True)
+        print(json.dumps(build(args.out, args.deck, args.opponent, meta, args.min_gain)), flush=True)
         return
     torch.set_num_threads(args.torch_threads)
     table = CardTable.from_cdb()
@@ -729,7 +768,7 @@ def main(argv=None) -> None:
                   f"[{time.perf_counter() - began:.0f}s, {evaluator.rows / max(1, evaluator.calls):.1f} rows/call]",
                   flush=True)
     evaluator.close()
-    print(json.dumps(build(args.out, args.deck, args.opponent, meta)), flush=True)
+    print(json.dumps(build(args.out, args.deck, args.opponent, meta, args.min_gain)), flush=True)
 
 
 if __name__ == "__main__":

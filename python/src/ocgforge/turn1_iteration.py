@@ -57,25 +57,47 @@ def run(cmd: list[str], log: Path) -> int:
 
 
 def search(args, deck: Path, deck_type: str) -> Path:
+    """The book of one deck (the --min-gain book if a minimum gain is set)."""
     book = book_path(args.out, deck)
     for attempt in range(MAX_TRIES):
         if search_done(book, args.hands):
-            return book
+            return chosen(book, args)
         code = run([sys.executable, "-m", "ocgforge.turn1_search", "--deck", str(deck), "--deck-type", deck_type,
                     "--opponent", str(args.opponent), "--checkpoint", str(args.net), "--hands", str(args.hands),
                     "--orders", str(args.orders), "--beam", str(args.beam), "--branch", str(args.branch),
-                    "--workers", str(args.workers), "--seed", str(args.seed), "--resume", "--out", str(book)],
+                    "--workers", str(args.workers), "--seed", str(args.seed), "--resume", "--out", str(book)]
+                   + (["--min-gain", str(args.min_gain)] if args.min_gain is not None else []),
                    args.out / f"{deck.stem}-search.log")
         print(f"search {deck.stem}: attempt {attempt} exit {code}", flush=True)
         if code == 0:
             done_marker(book).write_text(str(args.hands))
     if not search_done(book, args.hands):
         raise SystemExit(f"search {deck.stem} did not finish in {MAX_TRIES} tries")
-    return book
+    return chosen(book, args)
+
+
+def chosen(book: Path, args) -> Path:
+    """The book teach imitates: the --min-gain book (built by the search, or now from its lines)."""
+    if args.min_gain is None:
+        return book
+    from .turn1_search import gain_path
+
+    gain = gain_path(book)
+    meta = gain.with_name(f"{gain.stem}-meta.json")
+    if not gain.exists() or json.loads(meta.read_text()).get("min_gain") != args.min_gain:
+        deck_meta = json.loads(book.with_name(f"{book.stem}-meta.json").read_text())
+        code = run([sys.executable, "-m", "ocgforge.turn1_search", "--deck", deck_meta["deck"], "--deck-type",
+                    deck_meta["deck_type"], "--opponent", deck_meta["opponent"], "--checkpoint", str(args.net),
+                    "--build-only", "--min-gain", str(args.min_gain), "--out", str(book)],
+                   args.out / f"{book.stem}-build.log")
+        if code != 0:
+            raise SystemExit(f"building {gain.name} failed")
+    return gain
 
 
 def teach(args, books: list[Path]) -> None:
-    out = args.out / "student"
+    """teach --book `books` (none: the control, plain distillation) into <out>/student (<out>/ctrl)."""
+    out = args.out / ("student" if books else "ctrl")
     out.mkdir(parents=True, exist_ok=True)
     state_path = out / "driver.json"
     state = json.loads(state_path.read_text()) if state_path.exists() else {"done": 0, "segment": 0}
@@ -89,8 +111,9 @@ def teach(args, books: list[Path]) -> None:
         before = sum('"samples"' in t for t in log.read_text().splitlines()) if log.exists() else 0
         left = args.rounds - state["done"]
         code = run([sys.executable, "-m", "ocgforge.teach", "--teacher", str(args.teacher), "--student", str(student),
-                    "--book", *map(str, books), "--book-share", str(args.book_share), "--rounds", str(left),
-                    "--lr", str(args.lr), "--threads", str(args.workers), "--save-every", str(args.save_every),
+                    *(["--book", *map(str, books), "--book-share", str(args.book_share)] if books else []),
+                    "--rounds", str(left),
+                    "--lr", str(args.lr), "--threads", str(args.teach_threads), "--save-every", str(args.save_every),
                     "--micro-batch", str(args.micro_batch), "--envs", str(args.envs),
                     "--seed", str(args.teach_seed + state["segment"]), "--out", str(out), "--decks", *decks],
                    out / "teach.log")
@@ -114,7 +137,8 @@ def main(argv=None) -> None:
     p.add_argument("--orders", type=int, default=4)
     p.add_argument("--beam", type=int, default=8)
     p.add_argument("--branch", type=int, default=3)
-    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--workers", type=int, default=4, help="search threads")
+    p.add_argument("--teach-threads", type=int, default=4, help="teach engine threads")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--rounds", type=int, default=30)
     p.add_argument("--book-share", type=float, default=0.3)
@@ -124,9 +148,18 @@ def main(argv=None) -> None:
                    help="teach micro-batch (the gradient is the same; smaller fits beside the desktop on the GPU)")
     p.add_argument("--envs", type=int, default=512, help="teach self-play envs")
     p.add_argument("--teach-seed", type=int, default=100, help="seed of teach segment 0 (the control used 100)")
+    p.add_argument("--min-gain", type=float, default=0.1,
+                   help="imitate only lines beating the net's own line by more than this (mean value); negative: all")
     p.add_argument("--search-only", action="store_true")
+    p.add_argument("--control", action="store_true",
+                   help="the control instead: the same teach rounds and seeds without a book, into <out>/ctrl")
     args = p.parse_args(argv)
     args.out.mkdir(parents=True, exist_ok=True)
+    if args.min_gain is not None and args.min_gain < 0:
+        args.min_gain = None
+    if args.control:
+        teach(args, [])
+        return
     books = []
     for spec in args.books:
         deck, _, deck_type = spec.rpartition(":")

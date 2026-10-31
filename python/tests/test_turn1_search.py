@@ -227,3 +227,22 @@ def test_iteration_counts_only_saved_teach_rounds(tmp_path):
     book.write_text("")
     ti.done_marker(book).write_text("10")
     assert ti.search_done(book, 10)
+
+
+def test_gain_book_keeps_only_lines_that_beat_the_net(tmp_path, monkeypatch):
+    records, stats = ts.search_hand(toy_hand(), net(), ts.Settings(beam=4, branch=3), set(), lambda c: False)
+    good = records[0]
+    assert ts.gains(good) == pytest.approx(good["search"]["value"] - good["search"]["own_value"]) and ts.gains(good) > 0.1
+    same = {**good, "seed": "t1-toy-0-1", "search": {**good["search"], "own_value": good["search"]["value"] - 0.05}}
+    out = tmp_path / "toy-t1.jsonl"
+    p = ts.paths(out)
+    p["lines"].write_text("".join(json.dumps(r) + "\n" for r in (good, same)), encoding="utf-8")
+    p["hands"].write_text(json.dumps(stats) + "\n", encoding="utf-8")
+    monkeypatch.setattr(ts.cc, "puzzle_start", lambda deck, opp, script, seed: (lambda: Toy([PLAIN, DRAWER], [GOOD])))
+    report = ts.build(out, Path("toy.ydk"), Path("opp.ydk"), {"deck": "toy.ydk"}, min_gain=0.1)
+    assert report["lines"] == 2 and report["gain"]["lines"] == 1 and report["gain"]["base_of"] == 2
+    gain = ts.gain_path(out)
+    kept = [json.loads(t)["seed"] for t in ts.paths(gain)["lines"].read_text().splitlines()]
+    assert gain.name == "toy-t1-gain.jsonl" and kept == ["t1-toy-0-0"]
+    assert json.loads(ts.paths(gain)["meta"].read_text())["min_gain"] == 0.1
+    assert len(gain.read_text().splitlines()) == report["gain"]["states"] > 0
