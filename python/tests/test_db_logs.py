@@ -72,3 +72,12 @@ def test_comments_are_kept_and_do_not_end_the_setup():
 def test_tab_export():
     log = db_logs.parse(TABS)
     assert log.hand == ["Medius the Pure"] and kinds(log) == [("Medius the Pure", "summon")]
+
+
+
+def test_a_card_given_to_the_opponent_without_an_effect_is_our_move():
+    text = ('# Branded vs Kaiju\nA SS "Gameciel, the Sea Turtle Kaiju" fr hand to M2-1\n'
+            'A SS "Fallen of Albaz" fr hand to M-3\n')
+    log = db_logs.parse(text)
+    assert log.traps == {} and kinds(log)[0] == ("Gameciel, the Sea Turtle Kaiju", "summon")
+    assert "Gameciel, the Sea Turtle Kaiju" in log.hand

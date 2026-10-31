@@ -10,9 +10,10 @@ did. So `parse` drops what is not part of the combo:
 - setup: the leading block of "Returned X to deck" / "Added X to hand" lines builds the test hand
   (the added cards are the starting hand);
 - a move taken back right away (to the GY, then returned to the deck: a misplay);
-- in a "vs hand trap" log the player plays the opponent's hand trap himself: its cards move to the
-  opponent's zones ("to M2-3"), and its declared effect answers the effect declared just before
-  (a choke point). Such cards become `traps`, not events.
+- in a "vs hand trap" log the player plays the opponent's hand trap himself: it moves to the
+  opponent's zones ("to M2-3") and its effect is declared there, answering the effect declared
+  just before (a choke point). Such cards become `traps`, not events. A card put on the opponent's
+  side that never declares an effect (a Kaiju) is our move.
 """
 
 from __future__ import annotations
@@ -80,14 +81,23 @@ def parse(text: str, hand_traps: set[str] = frozenset()) -> Log:
             continue
         verb, card, rest = m["verb"].lower(), m["card"], m["rest"].lower()
         if "to m2-" in rest or "to s2-" in rest:
-            opponent.add(card)  # the opponent's hand trap, put on its side by the logging player
+            # A card put on the opponent's side: the opponent's hand trap played by the logger only if
+            # its effect is then declared there; a Kaiju we summon to its field stays our move.
+            opponent.add(card)
+            started = True
+            if ("fr hand" in rest or "from hand" in rest) and card not in added and card not in log.hand:
+                log.hand.append(card)  # ours until its effect shows it is the opponent's hand trap
+            if (kind := kind_of(verb, rest.replace("to m2-", "to m-").replace("to s2-", "to s-"))) is not None:
+                log.events.append(Event(card, kind))
             continue
-        if card in opponent or ("vs" in log.title.lower() and card in hand_traps
-                                and verb in USE_VERBS | {"sent", "ss"}):
+        trap = (card in opponent and verb in USE_VERBS) or (
+            "vs" in log.title.lower() and card in hand_traps and verb in USE_VERBS | {"sent", "ss"})
+        if trap or card in log.traps:
             if verb in USE_VERBS or verb == "sent":
                 answered = log.traps.setdefault(card, [])
                 if last_use is not None and last_use not in answered:
                     answered.append(last_use)
+                log.events = [e for e in log.events if e.card != card]  # its moves were the opponent's
             continue
         setup = (verb == "returned" and "deck" in rest) or (verb == "added" and "to hand" in rest)
         if not started and setup:
@@ -110,5 +120,5 @@ def parse(text: str, hand_traps: set[str] = frozenset()) -> Log:
         if kind == "hand":
             added.add(card)
         log.events.append(Event(card, kind))
-    log.hand = [c for c in log.hand if c not in log.traps and c not in opponent]
+    log.hand = [c for c in log.hand if c not in log.traps]
     return log

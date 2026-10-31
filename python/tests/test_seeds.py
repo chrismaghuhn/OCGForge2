@@ -92,3 +92,24 @@ def test_authors_are_kept(tmp_path):
     assert sd.log_author("Elfnote vs Handtraps | Lucina vs Droll | GalacticJoey (plays the opponent's Droll)") == "GalacticJoey"
     assert sd.log_author("Branded Elfnote | Medius the Pure | replay 284601-1 | users GalacticJoey (A = first)") == "GalacticJoey"
     assert sd.log_author("Duelingbook replay 1-2 (Elfnote Discord #replays, posted by baguette 13.06.26)") == "baguette"
+
+
+
+def test_going_first():
+    assert sd.going_first("Lucina 1cc (Featuring Walbaz)")
+    assert sd.going_first("use its second effect, then the 2nd copy")
+    assert not sd.going_first("Aluber (otk)") and not sd.going_first("Raye going second board breaker")
+    assert not sd.going_first("Combo for turn 2")
+
+
+def test_plan_key_tells_different_combos_with_the_same_hand_apart():
+    a = cb.Combo("a", "A", "Elfnote", 0, [], [[cb.Entry(11, "Elfnote Lucina", "Special Summon")]])
+    b = cb.Combo("b", "B", "Elfnote", 0, [], [[cb.Entry(7, "Elfnote Tinia", "Special Summon")]])
+    sa, sb = sd.Seed("a", "A", "community", [11], a), sd.Seed("b", "B", "community", [11], b)
+    assert sd.plan_key(sa) != sd.plan_key(sb)
+    assert sd.plan_key(sa) == sd.plan_key(sd.Seed("c", "C", "sheet", [11], a))  # a borrowed plan is the same
+
+
+def test_combo_author_from_object_or_name():
+    assert cb.author_name({"username": "kanna"}) == "kanna"
+    assert cb.author_name("kanna") == "kanna" and cb.author_name(None) == ""

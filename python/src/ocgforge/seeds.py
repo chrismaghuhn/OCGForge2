@@ -24,31 +24,22 @@ from pathlib import Path
 from . import aliases as _aliases
 from . import combos as cb
 from . import db_logs
+from .steps import step_entries
 
 HAND_SIZE = 5
 # Player nicknames -> card names (sheets and guides use them; the card database does not).
-ALIASES = {
-    "brafu": "Branded Fusion", "foolish": "Foolish Burial", "dupe": "Fusion Duplication", "lost": "Branded Lost",
-    "tragedy": "Despian Tragedy", "granguinol": "Granguignol the Dusk Dragon",
-    "granguniol": "Granguignol the Dusk Dragon", "banishment": "Branded Banishment", "winda": "El Shaddoll Winda",
-    "masq": "Masquerade the Blazing Dragon", "schism": "Shaddoll Schism", "ad lib": "Ad Libitum of Despia",
-    "adlib": "Ad Libitum of Despia", "sarc": "Gold Sarcophagus", "kitt": "Tri-Brigade Springans Kitt",
-    "king": "Rindbrumm the Striking Dragon", "branded king": "Rindbrumm the Striking Dragon",
-    "lubellion": "Lubellion the Searing Dragon", "cart": "Blazing Cartesia, the Virtuous",
-    "white": "Fallen of the White Dragon", "albaz": "Fallen of Albaz", "abaz": "Fallen of Albaz",
-    "mirrorajde": "Mirrorjade the Iceblade Dragon", "dead mirrorjade": "Mirrorjade the Iceblade Dragon",
-    "dead mirrorajde": "Mirrorjade the Iceblade Dragon", "drago": "Red-Eyes Dark Dragoon",
-    "requiem lock": "Fiendsmith's Requiem", "furious": "Borreload Furious Dragon", "edge imp": "Edge Imp Chain",
-    "high spirit": "Branded in High Spirits", "ash": "Ash Blossom & Joyous Spring",
+ALIASES = {  # nicknames not in aliases.py (hand traps, Elfnote and Fiendsmith cards); aliases.ALIASES is merged below
+    "winda": "El Shaddoll Winda", "schism": "Shaddoll Schism", "king": "Rindbrumm the Striking Dragon",
+    "branded king": "Rindbrumm the Striking Dragon", "white": "Fallen of the White Dragon",
+    "dead mirrorjade": "Mirrorjade the Iceblade Dragon", "dead mirrorajde": "Mirrorjade the Iceblade Dragon",
+    "drago": "Red-Eyes Dark Dragoon", "requiem lock": "Fiendsmith's Requiem", "ash": "Ash Blossom & Joyous Spring",
     "imperm": "Infinite Impermanence", "veiler": "Effect Veiler", "droll": "Droll & Lock Bird",
-    "belle": "Ghost Belle & Haunted Mansion", "ogre": "Ghost Ogre & Snow Rabbit", "nibiru": "Nibiru, the Primal Being",
-    "maxx c": 'Maxx "C"', "fuwa": "Mulcharmy Fuwalos", "fuwalos": "Mulcharmy Fuwalos", "crow": "D.D. Crow",
-    "mourner": "Ghost Mourner & Moonlit Chill", "harmonia": "Fydraulis Harmonia",
-    "medius": "Medius the Pure", "terminus": "Prohibited Power Patron Portal - Terminus",
-    "dragster": "F.A. Dawn Dragster", "crystal wing": "Crystal Wing Synchro Dragon",
-    "engraver": "Fiendsmith Engraver", "tract": "Fiendsmith's Tract", "levi": "Fabled Levilazebul",
-    "levilazebul": "Fabled Levilazebul", "desirae": "Fiendsmith's Desirae", "lacrima": "Fiendsmith's Lacrima",
-    "agnumday": "Fiendsmith's Agnumday", "sequence": "Fiendsmith's Sequence",
+    "belle": "Ghost Belle & Haunted Mansion", "ogre": "Ghost Ogre & Snow Rabbit",
+    "nibiru": "Nibiru, the Primal Being", "maxx c": 'Maxx "C"', "fuwa": "Mulcharmy Fuwalos",
+    "fuwalos": "Mulcharmy Fuwalos", "crow": "D.D. Crow", "mourner": "Ghost Mourner & Moonlit Chill",
+    "harmonia": "Fydraulis Harmonia", "engraver": "Fiendsmith Engraver", "tract": "Fiendsmith's Tract",
+    "levi": "Fabled Levilazebul", "levilazebul": "Fabled Levilazebul", "desirae": "Fiendsmith's Desirae",
+    "lacrima": "Fiendsmith's Lacrima", "agnumday": "Fiendsmith's Agnumday", "sequence": "Fiendsmith's Sequence",
 }
 ALIASES.update(_aliases.ALIASES)  # the nickname table of aliases.py (checked against the card database)
 INTERRUPTERS = {
@@ -130,7 +121,7 @@ def sheet_seeds(path: Path, deck_type: str, resolve) -> list[Seed]:
             combo = cb.Combo(f"sheet-{row[1].strip()}", f"{row[2].strip()} -> {row[3].strip()}", deck_type, 0, [], [],
                              notes=notes, end_board=board)
             seeds.append(Seed(combo.id, combo.title, "sheet", hand, combo, mentioned_hand_traps(notes, resolve),
-                              first="otk" not in (row[2] + notes).lower(), author=author, origin=path.name))
+                              first=going_first(row[2] + " " + notes), author=author, origin=path.name))
     return seeds
 
 
@@ -231,15 +222,24 @@ ACTION = {"summon": "Special Summon", "place": "Place", "gy": "Send to GY", "han
           "use": ""}
 
 
+GOING_SECOND = re.compile(r"\b(otk|ftk|going (2nd|second)|go(ing)? 2nd|turn 2|as (the )?(2nd|second) player|"
+                          r"(2nd|second) turn|board ?break(er|ing)?)\b", re.IGNORECASE)
+
+
+def going_first(text: str) -> bool:
+    """A going-first line: its title or notes do not say OTK, going second, turn 2 or board
+    breaking ("second effect" or "2nd copy" is no going-second line)."""
+    return not GOING_SECOND.search(text or "")
+
+
 def community_seeds(deck_type: str, names: dict[str, int]) -> list[Seed]:
     seeds = []
     for combo in sorted((c for c in cb.load(deck_type, names) if c.usable and c.steps), key=lambda c: -c.votes):
         hand = [e.code for e in combo.starting if e.code is not None]
         if not hand:
             continue
-        text = (combo.title + " " + combo.notes).lower()
-        first = not any(w in text for w in ("otk", "going 2nd", "going second", "go 2nd", "2nd", "second"))
-        seeds.append(Seed(combo.id, combo.title, "community", hand, combo, list(combo.vs_hand_traps), first,
+        seeds.append(Seed(combo.id, combo.title, "community", hand, combo, list(combo.vs_hand_traps),
+                          going_first(combo.title + " " + combo.notes),
                           author=combo.author, origin="masterduelmeta"))
     return seeds
 
@@ -284,6 +284,13 @@ def interruptions(deck_type: str, resolve, extra: dict[str, list[str]] | None = 
     return rules
 
 
+def plan_key(seed: Seed) -> tuple:
+    """Seeds with this key are the same search: the same starting cards and the same plan (every step
+    in order, the end board). A borrowed plan is the same plan."""
+    steps = tuple((e.code, e.action) for _, e in step_entries(seed.combo))
+    return tuple(sorted(seed.hand)), steps, tuple(sorted(seed.combo.end_board))
+
+
 def load(args, deck_type: str, names: dict[str, int], resolve, decklist, card_name: dict[int, str]):
     """All seeds of a deck (community combos, `args.sheet`, `args.replays`, `args.lists`, grid
     hands), ordered by `args.priority` titles, going first, then source; one per hand and plan.
@@ -307,17 +314,18 @@ def load(args, deck_type: str, names: dict[str, int], resolve, decklist, card_na
     borrow_plans(seeds)
     seeds += grid_seeds(seeds, decklist[0], args.grid) if "grid" in sources else []
     seeds = [s for s in seeds if s.source in sources]  # community seeds may still lend their plans
-    if args.first_only:
-        seeds = [s for s in seeds if s.first]
+    # Every scenario is built with us going first: going-second lines (OTKs, board breakers) would be
+    # searched as first-turn lines, so they stay out.
+    seeds = [s for s in seeds if s.first]
     priority = lambda s: next((i for i, t in enumerate(args.priority) if t.lower() in s.title.lower()),  # noqa: E731
                               len(args.priority))
     # Priority titles, then going-first lines, then the sources in the given order, short hands first.
-    seeds.sort(key=lambda s: (priority(s), not s.first, "defunct" in s.title.lower(), sources.index(s.source),
-                              len(s.hand)))
+    order = -1 if getattr(args, "long_hands_first", False) else 1
+    seeds.sort(key=lambda s: (priority(s), "defunct" in s.title.lower(), sources.index(s.source), order * len(s.hand)))
     seeds = [s for s in seeds if s.combo.steps or s.combo.end_board]  # nothing to aim for otherwise
     unique: dict[tuple, Seed] = {}  # one search per hand and plan; hand traps named by duplicates merge
     for s in seeds:
-        key = (tuple(sorted(s.hand)), len(s.combo.steps), tuple(s.combo.end_board))
+        key = plan_key(s)
         if key in unique:
             unique[key].vs = list(dict.fromkeys(unique[key].vs + s.vs))
             for trap, cards in s.chokes.items():

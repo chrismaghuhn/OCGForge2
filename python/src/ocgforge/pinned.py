@@ -21,7 +21,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import aliases, db_logs
+from . import aliases
 from . import combos as cb
 from . import seeds as sd
 
@@ -77,15 +77,6 @@ def board_cards(text: str, resolve) -> list[int]:
     return cards
 
 
-def discarded_only(log: db_logs.Log, resolve) -> set[int]:
-    """Hand cards whose first move is to the GY: discard fodder ("+ 2 discards"), any card would do."""
-    first: dict[int, str] = {}
-    for event in log.events:
-        if (code := resolve(event.card)) is not None:
-            first.setdefault(code, event.kind)
-    return {code for code, kind in first.items() if kind == "gy"}
-
-
 def pinned_seeds(directory: Path, deck_type: str, resolve) -> list:
     """A seed per "<replay id>.txt" log in `directory` (with `descriptions.txt` beside them)."""
     directory = Path(directory)
@@ -97,9 +88,7 @@ def pinned_seeds(directory: Path, deck_type: str, resolve) -> list:
         if seed is None:
             continue
         text = path.read_text(encoding="utf-8")
-        log = db_logs.parse(text, sd.INTERRUPTERS)
-        fodder = discarded_only(log, resolve)
-        hand = [c for c in dict.fromkeys(seed.hand) if c not in fodder] or seed.hand[:1]
+        hand = list(dict.fromkeys(seed.hand))  # replay_seed already left out the discard fodder
         post = posts.get(path.stem)
         comments = [m["text"] for line in text.splitlines() if (m := COMMENT.match(line.strip()))]
         notes = [h for h in [" | ".join(p for p in (post.hand, post.variant) if p)] if h] + post.lines if post else []
