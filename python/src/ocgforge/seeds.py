@@ -281,6 +281,7 @@ def load(args, deck_type: str, names: dict[str, int], resolve, decklist, card_na
     hands), ordered by `args.priority` titles, going first, then source; one per hand and plan.
     Returns the seeds, the hand-trap rules (hand trap -> choke points; only hand traps the bot can
     play on our turn) and the hand traps by how much they are feared."""
+    sources = [s.strip() for s in args.sources.split(",")]
     seeds = community_seeds(deck_type, names)
     if args.sheet:
         seeds += sheet_seeds(args.sheet, deck_type, resolve)
@@ -289,13 +290,14 @@ def load(args, deck_type: str, names: dict[str, int], resolve, decklist, card_na
         path, _, author = str(item).partition("::")
         seeds += list_seeds(Path(path), deck_type, resolve, author)
     borrow_plans(seeds)
-    seeds += grid_seeds(seeds, decklist[0], args.grid)
+    seeds += grid_seeds(seeds, decklist[0], args.grid) if "grid" in sources else []
+    seeds = [s for s in seeds if s.source in sources]  # community seeds may still lend their plans
     if args.first_only:
         seeds = [s for s in seeds if s.first]
     priority = lambda s: next((i for i, t in enumerate(args.priority) if t.lower() in s.title.lower()),  # noqa: E731
                               len(args.priority))
-    order = {"replay": 0, "community": 1, "sheet": 2, "grid": 3}
-    seeds.sort(key=lambda s: (priority(s), not s.first, order[s.source]))
+    # Priority titles, then going-first lines, then the sources in the given order, short hands first.
+    seeds.sort(key=lambda s: (priority(s), not s.first, sources.index(s.source), len(s.hand)))
     seeds = [s for s in seeds if s.combo.steps or s.combo.end_board]  # nothing to aim for otherwise
     unique: dict[tuple, Seed] = {}  # one search per hand and plan; hand traps named by duplicates merge
     for s in seeds:

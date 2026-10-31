@@ -125,6 +125,9 @@ def main(argv=None) -> None:
     p.add_argument("--hands", type=int, default=3, help="starting hands per seed (other fillers)")
     p.add_argument("--max-seeds", type=int, default=0, help="seeds to search at most (0: all)")
     p.add_argument("--grid", type=int, default=40, help="starter x extender hands at most")
+    p.add_argument("--sources", default="replay,sheet,community,grid",
+                   help="seed sources to use, in search order (replay, sheet, community, grid)")
+    p.add_argument("--max-searches", type=int, default=0, help="searches at most, in seed order (0: all)")
     p.add_argument("--traps", type=int, default=3, help="interruption branches per hand (most feared hand traps)")
     p.add_argument("--first-only", action="store_true", help="only going-first seeds")
     p.add_argument("--beam", type=int, default=16)
@@ -209,10 +212,14 @@ def main(argv=None) -> None:
     # then the most feared ones.
     jobs = []
     for seed in seeds:
-        traps = list(dict.fromkeys([t for t in seed.vs if t in rules] + feared))[:args.traps]
+        # its own hand traps first (a log shows where they hit), then the most feared ones
+        traps = list(dict.fromkeys([t for t in seed.vs if t in rules or card_name.get(t) in sd.INTERRUPTERS]
+                                   + feared))[:args.traps]
         for variant in range(args.hands):
             jobs.append((seed, variant, None))
             jobs += [(seed, variant, t) for t in traps]
+    if args.max_searches:
+        jobs = jobs[:args.max_searches]
     print(f"{len(jobs)} searches", flush=True)
     if args.dry_run:
         for seed in seeds:

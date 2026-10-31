@@ -61,6 +61,14 @@ def test_opponent_zone_marks_a_hand_trap():
     assert kinds(log)[-1] == ("Elfnote Lucina", "use")
 
 
+def test_comments_are_kept_and_do_not_end_the_setup():
+    text = ('# Pure Elfnote | Lucina | GalacticJoey\nA "Lucina is our starter"\n'
+            'A Added "Elfnote Lucina" fr Deck to hand\nA SS "Elfnote Lucina" fr hand to M-3\n')
+    log = db_logs.parse(text)
+    assert log.comments == ["Lucina is our starter"]
+    assert log.hand == ["Elfnote Lucina"] and kinds(log) == [("Elfnote Lucina", "summon")]
+
+
 def test_tab_export():
     log = db_logs.parse(TABS)
     assert log.hand == ["Medius the Pure"] and kinds(log) == [("Medius the Pure", "summon")]

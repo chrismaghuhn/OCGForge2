@@ -39,6 +39,7 @@ class Log:
     hand: list[str] = field(default_factory=list)  # starting hand (setup adds, cards played from hand)
     events: list[Event] = field(default_factory=list)
     traps: dict[str, list[str]] = field(default_factory=dict)  # opponent's hand trap -> cards it answered
+    comments: list[str] = field(default_factory=list)  # the player's comments, in order
 
 
 def kind_of(verb: str, rest: str) -> str | None:
@@ -71,6 +72,9 @@ def parse(text: str, hand_traps: set[str] = frozenset()) -> Log:
             continue
         line = re.sub(r"\s+#.*$", "", raw).strip()
         line = re.sub(r"^[A-Z]\t[^\t]*\t", "", line)  # tab export: actor, category, text
+        if c := re.match(r'^[A-Z]\s+"([^"]+)"\s*$', line):  # the player's comment ("..."), not a move
+            log.comments.append(c[1])
+            continue
         m = LINE.match(line)
         if not m:
             continue
