@@ -60,25 +60,53 @@ def collect(env, teacher: Model, steps: int, device: str, generator: torch.Gener
 
 def train_round(student: Model, optimizer, samples: list[dict], device: str, batch_size: int, micro_batch: int,
                 value_coef: float, rng: random.Random) -> dict:
-    """One pass over a round's samples; returns the mean losses."""
+    """One pass over a round's samples; returns the mean losses. With book samples (marked "book")
+    in the round, also their count and losses apart from the teacher's (each micro-batch is split
+    in the two groups; the gradient is the same)."""
     from .expert import _batch, distill_loss
 
     student.eval()  # like ppo_update: no dropout or name dropout, so the student matches how it will play
     rng.shuffle(samples)
-    totals, n = {"policy": 0.0, "value": 0.0, "agree": 0.0}, 0
+    names = ("policy", "value", "agree")
+    totals = {group: dict.fromkeys(names, 0.0) for group in ("teacher", "book")}
+    counts = {"teacher": 0, "book": 0}
     for start in range(0, len(samples), batch_size):
         batch = samples[start:start + batch_size]
         optimizer.zero_grad()
         for micro in range(0, len(batch), micro_batch):
             part = batch[micro:micro + micro_batch]
-            loss, stats = distill_loss(student, *_batch(part, device), value_coef=value_coef)
-            (loss * len(part) / len(batch)).backward()
-            for key in totals:
-                totals[key] += stats[key] * len(part)
-            n += len(part)
+            for group in ("teacher", "book"):
+                rows = [s for s in part if bool(s.get("book")) == (group == "book")]
+                if not rows:
+                    continue
+                loss, stats = distill_loss(student, *_batch(rows, device), value_coef=value_coef)
+                (loss * len(rows) / len(batch)).backward()
+                for key in names:
+                    totals[group][key] += stats[key] * len(rows)
+                counts[group] += len(rows)
         torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
         optimizer.step()
-    return {key: round(value / max(n, 1), 4) for key, value in totals.items()}
+    n = max(1, counts["teacher"] + counts["book"])
+    out = {key: round((totals["teacher"][key] + totals["book"][key]) / n, 4) for key in names}
+    if counts["book"]:
+        out.update(teacherSamples=counts["teacher"], bookSamples=counts["book"])
+        for group, prefix in (("teacher", "teacher"), ("book", "bookTrain")):
+            for key in names:
+                out[prefix + key.capitalize()] = round(totals[group][key] / max(1, counts[group]), 4)
+    return out
+
+
+def share(text: str) -> float:
+    """--book-share: a float in [0, 1) (1 would mean only book samples, infinitely many)."""
+    value = float(text)
+    if not 0 <= value < 1:
+        raise argparse.ArgumentTypeError(f"{text} is not in [0, 1)")
+    return value
+
+
+def book_count(teacher_samples: int, book_share: float) -> int:
+    """Book samples to add so that they are `book_share` of the round."""
+    return round(teacher_samples * book_share / (1 - book_share))
 
 
 def book_samples(args, teacher: Model) -> tuple[list[dict], list[dict]]:
@@ -90,6 +118,8 @@ def book_samples(args, teacher: Model) -> tuple[list[dict], list[dict]]:
         t, h = samples(path, teacher.card_features.index_map(), args.book_holdout)
         train += t
         held += h
+    for row in train + held:
+        row["book"] = True
     return with_values(teacher, train, args.device), with_values(teacher, held, args.device)
 
 
@@ -111,9 +141,9 @@ def main(argv=None) -> None:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--out", type=Path, required=True)
-    p.add_argument("--book", type=Path, nargs="*", default=[],
+    p.add_argument("--book", type=Path, nargs="+", default=[],
                    help="opening books whose answers are mixed into every round (book_imitation)")
-    p.add_argument("--book-share", type=float, default=0.2, help="share of book samples in a round")
+    p.add_argument("--book-share", type=share, default=0.2, help="share of book samples in a round, in [0, 1)")
     p.add_argument("--book-holdout", type=float, default=0.1, help="share of book seeds held out (agreement only)")
     args = p.parse_args(argv)
 
@@ -134,12 +164,13 @@ def main(argv=None) -> None:
         line = {"round": 0, "book": len(book), "bookHeld": len(book_held),
                 "bookAgree": agreement(student, book, args.device), "bookHeldAgree": agreement(student, book_held, args.device)}
         log.write(json.dumps(line) + "\n")
+        log.flush()
         print(json.dumps(line), flush=True)
     for round_ in range(1, args.rounds + 1):
         start = time.time()
         samples = collect(env, teacher, args.steps, args.device, generator, max(1, args.envs // 2))
         if book:  # book share s of the round: s / (1 - s) book samples per teacher sample
-            samples += rng.choices(book, k=round(len(samples) * args.book_share / (1 - args.book_share)))
+            samples += rng.choices(book, k=book_count(len(samples), args.book_share))
         collected = time.time()
         stats = train_round(student, optimizer, samples, args.device, args.batch_size, args.micro_batch,
                             args.value_coef, rng)
