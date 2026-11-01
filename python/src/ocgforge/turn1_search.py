@@ -55,6 +55,7 @@ from pathlib import Path
 from . import combo_check as cc
 from . import combos as cb
 from . import opening_book as ob
+from . import outcome_eval as oe
 from . import rollout, worlds
 from .answer_rules import deck_cards, forced
 from .seeds import HAND_SIZE, INTERRUPTERS
@@ -319,13 +320,17 @@ class Play:
     on_field: int = 0
     end_board: list = field(default_factory=list)
     error: bool = False
+    score: float | None = None  # what `pick` ranks by: the value, or the scorer's (outcome_eval)
+    t2: dict = field(default_factory=dict)  # turn-2 outcome stats (outcome_eval.summary)
+    sig: object = None  # the position at the end of turn 1 (`position`; set by score_turn2)
 
 
-def play_out(plays: list[Play], net: Net, ctx_of) -> None:
+def play_out(plays: list[Play], net: Net, ctx_of, keep: bool = False) -> None:
     """Plays all `plays` to the end of turn 1 in lockstep: our answers from `pending` while they
     are offered (`worlds.match`; a single answer that does not match is played without using one
     up), then the net's most likely answer; seat 1 by `ctx_of(play).opponent`. Net calls of all
-    plays are batched. Sets value, field and end board."""
+    plays are batched. Sets value (and score), field and end board; `keep` keeps the duels at the
+    end of turn 1 (for the turn-2 rollouts)."""
     active = list(plays)
     while active:
         asking = []
@@ -373,17 +378,57 @@ def play_out(plays: list[Play], net: Net, ctx_of) -> None:
     done = [p for p in plays if not p.error]
     for play, value in zip(done, net.terminal([p.duel for p in done])):
         play.value, play.on_field = value, field_cards(play.duel)
+        play.score = value
         play.end_board = [] if play.duel.finished else cc.end_board(play.duel)
     for play in plays:
-        play.duel = None
+        if not keep or play.error:
+            play.duel = None
 
 
-def judge(candidates: list[list[str]], starts: list, net: Net, ctx_of_k) -> list[list[Play]]:
+def judge(candidates: list[list[str]], starts: list, net: Net, ctx_of_k, keep: bool = False) -> list[list[Play]]:
     """Each candidate (our answers) played in every scenario (a clone of its start duel)."""
     plays = [[Play([], [], start.clone(), list(ours)) for start in starts] for ours in candidates]
     lookup = {id(p): k for row in plays for k, p in enumerate(row)}
-    play_out([p for row in plays for p in row], net, lambda p: ctx_of_k(lookup[id(p)]))
+    play_out([p for row in plays for p in row], net, lambda p: ctx_of_k(lookup[id(p)]), keep)
     return plays
+
+
+def position(duel) -> tuple:
+    """A duel's position for sharing rollouts: every card (hidden ones too) with its place, life
+    points, turn, phase and the pending question."""
+    if duel.finished:
+        return ("finished", duel.winner)
+    snap = duel.snapshot()
+    cards = tuple(sorted((c["controller"], c["location"], c["code"], c["sequence"] if c["location"] in FIELD else 0,
+                          c["position"] if c["location"] in FIELD else 0) for c in snap["cards"]))
+    return cards, tuple(snap["life_points"]), duel.turn, duel.phase, duel.player, tuple(duel.keys())
+
+
+def score_turn2(plays: list[list[Play]], net: Net, s: "Settings", tag: str) -> None:
+    """The turn-2 scorer (`s.scorer` turn2 or mix): every play kept at the end of turn 1 (judge
+    with keep) gets M = `s.rollouts` sampled turn 2s (outcome_eval.play_turn2, all plays in one
+    lockstep), its outcome stats (`t2`) and its score. Rollouts of scenario k use the same seeds for
+    every candidate; candidates that reach the same position in a scenario (`position`: lines that
+    differ only in the order of answers) share its rollouts. Frees the duels."""
+    flat = [(k, p) for row in plays for k, p in enumerate(row) if not p.error and p.duel is not None]
+    if s.scorer != "value" and flat:
+        groups: dict = {}
+        for k, p in flat:
+            try:
+                p.sig = position(p.duel)
+            except Exception:
+                p.sig = ("unique", id(p))
+            groups.setdefault((k, p.sig), []).append(p)
+        firsts = [(key[0], members[0]) for key, members in groups.items()]
+        outs = oe.play_turn2([p.duel for _, p in firsts], net, s.rollouts, [f"{tag}-k{k}" for k, _ in firsts], s.t2_cap)
+        for members, rollouts in zip(groups.values(), outs):
+            t2 = oe.summary(rollouts)
+            for p in members:
+                p.t2 = t2
+                p.score = oe.combine(s.scorer, p.value, t2["t2"], s.mix_weight)
+    for row in plays:
+        for p in row:
+            p.duel = None
 
 
 def mean(values) -> float | None:
@@ -391,15 +436,16 @@ def mean(values) -> float | None:
     return round(statistics.fmean(values), 4) if values else None
 
 
-def pick(plays: list[list[Play]]) -> int | None:
-    """The candidate with the best mean end-of-turn value over the scenarios it was played in
-    without an engine error (scenario 0 must be one; ties: the better value in scenario 0)."""
+def pick(plays: list[list[Play]], by: str = "score") -> int | None:
+    """The candidate with the best mean score (`by`: "score", the scorer's, or "value", the
+    end-of-turn value) over the scenarios it was scored in without an engine error (scenario 0 must
+    be one; ties: the better score in scenario 0)."""
     best, best_key = None, None
     for i, row in enumerate(plays):
-        if row[0].error:
+        if row[0].error or getattr(row[0], by) is None:
             continue
-        values = [p.value for p in row if not p.error]
-        key = (statistics.fmean(values), row[0].value)
+        values = [getattr(p, by) for p in row if not p.error and getattr(p, by) is not None]
+        key = (statistics.fmean(values), getattr(row[0], by))
         if best_key is None or key > best_key:
             best, best_key = i, key
     return best
@@ -467,18 +513,27 @@ class Hand:
     cards: list
     trap: int | None
     orders: int
+    opponents: list = field(default_factory=list)  # (deck path, main, extra): real opponents, one per scenario
+
+    def opponent_of(self, k: int) -> tuple[Path, list, list]:
+        """Seat 1's deck in scenario k: `opponent` without an Extra Deck (it only declines), or, with
+        `opponents`, one of them (a stable choice by hand and k) with its Extra Deck, to play turn 2."""
+        if not self.opponents:
+            return self.opponent, self.opponent_cards, []
+        return self.opponents[random.Random(f"{self.id}-opponent-{k}").randrange(len(self.opponents))]
 
     def script(self, k: int, trap: int | None = None) -> tuple[str, int]:
         """Scenario k: this hand, deck order and opponent hand k (with `trap` in seat 1's hand)."""
         rng = random.Random(f"{self.id}-order-{k}")
         combo = cb.Combo(self.id, "turn1", self.deck_type, 0, [], [])
-        script = cc.scenario_script(combo, self.decklist, self.opponent_cards, lambda code: False, rng,
-                                    hand=self.cards, opponent_hand=[trap] if trap else [])
+        _, main, extra = self.opponent_of(k)
+        script = cc.scenario_script(combo, self.decklist, main, lambda code: False, rng,
+                                    hand=self.cards, opponent_hand=[trap] if trap else [], opponent_extra=extra)
         return script, rng.getrandbits(32)
 
     def start(self, k: int, trap: int | None = None):
         script, seed = self.script(k, trap)
-        return script, seed, cc.puzzle_start(self.deck, self.opponent, script, seed)
+        return script, seed, cc.puzzle_start(self.deck, self.opponent_of(k)[0], script, seed)
 
 
 def random_hand(decklist: tuple, run_seed: int, deck: Path, t: int) -> list[int]:
@@ -501,6 +556,10 @@ class Settings:
     alpha: float = 0.02
     candidates: int = 4
     max_choices: int = 120
+    scorer: str = "value"  # outcome_eval.SCORERS
+    rollouts: int = 2  # M: sampled turn 2s per candidate and scenario
+    mix_weight: float = 0.5  # mix: weight of the end-of-turn-1 value
+    t2_cap: int = 250  # sampled decisions per turn-2 rollout at most
 
 
 def search_branch(hand: Hand, trap: int | None, net: Net, s: Settings, center: set, is_extra,
@@ -537,11 +596,29 @@ def search_branch(hand: Hand, trap: int | None, net: Net, s: Settings, center: s
         if tuple(own[0].ours) not in seen:
             candidates.append(own[0].ours)
         own_index = candidates.index(own[0].ours)
-    plays = judge(candidates, starts, net, lambda k: ctx)
+    turn2 = s.scorer != "value"
+    plays = judge(candidates, starts, net, lambda k: ctx, keep=turn2)
+    if turn2:
+        score_turn2(plays, net, s, f"{hand.id}-{trap or 'base'}")
     best = pick(plays)
     stats.update(finished=len(lines), candidates=len(candidates), seconds=round(time.perf_counter() - began, 1),
                  own_value=mean(p.value for p in own if not p.error), own_field=mean(p.on_field for p in own if not p.error),
                  own_value0=own[0].value, own_field0=own[0].on_field)
+    if turn2:
+        # every candidate's numbers, and the line the value scorer would have kept (on the same hand)
+        stats["cands"] = [{"value": mean(p.value for p in r if not p.error),
+                           "score": mean(p.score for p in r if not p.error and p.score is not None),
+                           "field": mean(p.on_field for p in r if not p.error),
+                           **{key: mean(p.t2.get(key) for p in r if not p.error and p.t2.get(key) is not None)
+                              for key in ("lost", "won", "field3", "lp", "opp_lp", "capped", "decisions")}}
+                          for r in plays]
+        value_index = pick(plays, "value")
+        same = lambda i, j: None if i is None or j is None else [p.sig for p in plays[i]] == [p.sig for p in plays[j]]  # noqa: E731
+        stats.update(scorer=s.scorer, own_index=own_index, best_index=best, value_index=value_index,
+                     own_score=stats["cands"][own_index]["score"] if own_index is not None else None,
+                     # the same positions after turn 1 in every scenario: the lines differ in order only
+                     same_as_value=same(best, value_index), same_as_own=same(best, own_index),
+                     value_same_as_own=same(value_index, own_index))
     if best is None:
         return None, {**stats, "error": "no line"}, []
     row = plays[best]
@@ -549,6 +626,7 @@ def search_branch(hand: Hand, trap: int | None, net: Net, s: Settings, center: s
     keys = row[0].keys
     replays, reveal = reveal_at(start, keys)
     stats.update(value=mean(p.value for p in row if not p.error), field=mean(p.on_field for p in row if not p.error),
+                 score=mean(p.score for p in row if not p.error and p.score is not None),
                  value0=row[0].value, field0=row[0].on_field, pick="own" if best == own_index else "search", beam_value0=lines[0].value if lines else None, diverged=sum(p.diverged for p in row[1:]),
                  replays=replays, reveal_at=reveal, our_answers=len(row[0].ours))
     if not replays:
@@ -559,7 +637,7 @@ def search_branch(hand: Hand, trap: int | None, net: Net, s: Settings, center: s
               "origin": "turn1_search", "variant": 0, "trap": trap, "fired": True if trap else None, "line": keys,
               "steps": 0, "progress": 0, "skipped": 0, "key_cards": 0, "book_end_board": [], "field": row[0].on_field,
               "end_board": row[0].end_board, "script": script, "duel_seed": duel_seed, "first": True,
-              "hand": hand.cards, "fillers": [],
+              "hand": hand.cards, "fillers": [], "opponent": str(hand.opponent_of(0)[0]),
               "value": {"held": None, "left": None, "tries": 0, "unbuildable": 0, "errors": 0},
               "search": {k: v for k, v in stats.items() if k != "trap"}, "seconds": stats["seconds"]}
     return record, stats, row[0].ours
@@ -600,8 +678,12 @@ def done_hands(out: Path) -> set[str]:
 def gains(record: dict) -> float | None:
     """How much better the kept line is than the net's own play: mean end-of-turn value over the K
     scenarios minus that of the net's greedy line (in a branch: its greedy continuation after the
-    same prefix); None for records without search stats."""
+    same prefix); under a turn-2 scorer the same in its score. None for records without search stats."""
     search = record.get("search") or {}
+    if search.get("scorer", "value") != "value":
+        if search.get("score") is None or search.get("own_score") is None:
+            return None
+        return search["score"] - search["own_score"]
     if search.get("value") is None or search.get("own_value") is None:
         return None
     return search["value"] - search["own_value"]
@@ -615,7 +697,8 @@ def gain_path(out: Path) -> Path:
 def write_book(out: Path, deck: Path, opponent: Path, records: list[dict], meta: dict) -> int:
     """Book `out`, its lines file and meta (with the relevant cards) from `records`; the number of states."""
     p = paths(out)
-    lines = [(r, cc.puzzle_start(deck, opponent, r["script"], r["duel_seed"])) for r in records]
+    lines = [(r, cc.puzzle_start(deck, Path(r.get("opponent") or opponent), r["script"], r["duel_seed"]))
+             for r in records]
     relevant = ob.book_cards(records)
     book, _ = ob.build_book(lines, relevant)
     if not p["lines"].exists() or [json.loads(t) for t in p["lines"].read_text(encoding="utf-8").splitlines()] != records:
@@ -668,8 +751,29 @@ def summarize(hands: list[dict]) -> dict:
             "reveals": mean(r["reveal_at"] is not None for r in kept),
             "diverged": mean(r["diverged"] for r in kept), "finished": mean(r["finished"] for r in kept),
             "seconds": mean(r["seconds"] for r in kept)}
+        scored = [r for r in kept if r.get("cands") and r.get("value_index") is not None]
+        if scored:
+            out[branch]["scorer"] = compare(scored)
     out["lines_per_hand"] = round(sum(out.get(b, {}).get("kept", 0) for b in ("base", "trap")) / max(1, len(hands)), 3)
     return out
+
+
+def compare(rows: list[dict]) -> dict:
+    """Turn-2 scorer vs value scorer on the same hands (each hand's candidates were scored both
+    ways): how often they keep another line, and the kept lines of each (and the net's own) by
+    end-of-turn value, turn-2 score, field at the end of turn 1, turn 2 lost, our field and both life
+    points at turn 3."""
+    def side(index_of) -> dict:
+        picked = [r["cands"][index_of(r)] for r in rows if index_of(r) is not None]
+        return {key: mean(c[key] for c in picked if c.get(key) is not None)
+                for key in ("value", "score", "field", "lost", "won", "field3", "lp", "opp_lp", "capped", "decisions")}
+    return {"hands": len(rows), "scorer": rows[0].get("scorer"),
+            # another position after turn 1 (lines that differ in the order of answers count as the same)
+            "differs": mean(not r.get("same_as_value", r["best_index"] == r["value_index"]) for r in rows),
+            "picked_own": mean(bool(r.get("same_as_own", r["best_index"] == r["own_index"])) for r in rows),
+            "value_picked_own": mean(bool(r.get("value_same_as_own", r["value_index"] == r["own_index"])) for r in rows),
+            "kept": side(lambda r: r["best_index"]), "value_kept": side(lambda r: r["value_index"]),
+            "own": side(lambda r: r["own_index"])}
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -677,6 +781,15 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--deck", type=Path, required=True)
     p.add_argument("--deck-type", required=True, help="masterduelmeta deck type (hand traps of the counters data)")
     p.add_argument("--opponent", type=Path, default=rollout.REPO / "decks" / "maliss.ydk")
+    p.add_argument("--opponents-file", type=Path,
+                   help="real opponents instead (one deck per line, relative to the repo): scenario k plays one of "
+                        "them, with its Extra Deck (needed for --score turn2/mix)")
+    p.add_argument("--score", choices=oe.SCORERS, default="value",
+                   help="value: end-of-turn-1 value; turn2: the net's value at our turn 3 after sampled turn 2s "
+                        "(or the result); mix: --mix-weight * value + rest * turn2")
+    p.add_argument("--rollouts", type=int, default=2, help="M: sampled turn 2s per candidate and scenario")
+    p.add_argument("--mix-weight", type=float, default=0.5)
+    p.add_argument("--t2-cap", type=int, default=250, help="sampled decisions per turn-2 rollout at most")
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--hands", type=int, default=200)
     p.add_argument("--first-hand", type=int, default=0)
@@ -709,7 +822,10 @@ def main(argv=None) -> None:
 
     args = parse_args(argv)
     args.deck, args.opponent = args.deck.resolve(), args.opponent.resolve()
-    meta = {"deck": str(args.deck), "deck_type": args.deck_type, "opponent": str(args.opponent), "sources": "turn1"}
+    meta = {"deck": str(args.deck), "deck_type": args.deck_type, "opponent": str(args.opponent), "sources": "turn1",
+            "score": args.score}
+    if args.score != "value" and not args.opponents_file and not args.build_only:
+        raise SystemExit("--score turn2/mix needs --opponents-file (an opponent that can play turn 2)")
     if args.build_only:
         print(json.dumps(build(args.out, args.deck, args.opponent, meta, args.min_gain)), flush=True)
         return
@@ -721,6 +837,12 @@ def main(argv=None) -> None:
     center = {c.code for c in table.cards if cc.wants_center(c.text)}
     decklist = worlds.read_decklist(args.deck)
     opponent_cards = worlds.read_decklist(args.opponent)[0]
+    opponents = []
+    if args.opponents_file:
+        for line in args.opponents_file.read_text(encoding="utf-8").splitlines():
+            if line.strip() and not line.startswith("#"):
+                path = (rollout.REPO / line.strip()).resolve()
+                opponents.append((path, *worlds.read_decklist(path)))
     resolve = sd.resolver(cb.name_index(table), set(decklist[0]) | set(decklist[1]), card_name)
     rules = {t: v for t, v in sd.interruptions(args.deck_type, resolve).items() if card_name.get(t) in INTERRUPTERS}
     traps = trap_pool(rules, card_name, args.traps)
@@ -728,7 +850,8 @@ def main(argv=None) -> None:
     model = load_checkpoint(args.checkpoint, args.device, dropout=0.0)
     evaluator = Evaluator(model_fn(model, args.device))
     net = Net(evaluator, model.card_features.index_map())
-    settings = Settings(args.beam, args.branch, args.alpha, args.candidates, args.max_choices)
+    settings = Settings(args.beam, args.branch, args.alpha, args.candidates, args.max_choices, args.score,
+                        args.rollouts, args.mix_weight, args.t2_cap)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     p = paths(args.out)
     done = done_hands(args.out) if args.resume else set()
@@ -742,7 +865,7 @@ def main(argv=None) -> None:
         if hid not in done:
             hands.append(Hand(hid, args.deck, args.deck_type, args.opponent, decklist, opponent_cards,
                               random_hand(decklist, args.seed, args.deck, t),
-                              traps[t % len(traps)] if traps else None, args.orders))
+                              traps[t % len(traps)] if traps else None, args.orders, opponents))
     print(f"{len(hands)} hands to search ({len(done)} done)", flush=True)
     began = time.perf_counter()
     lock = threading.Lock()
@@ -762,7 +885,8 @@ def main(argv=None) -> None:
                 hands_out.write(json.dumps(stats) + "\n")
                 hands_out.flush()
             b = stats["base"]
-            print(f"{n + 1}/{len(futures)} {stats['hand']} value {b.get('value')} (own {b.get('own_value')}) "
+            score = f"score {b.get('score')} (own {b.get('own_score')}) " if b.get("scorer") else ""
+            print(f"{n + 1}/{len(futures)} {stats['hand']} value {b.get('value')} (own {b.get('own_value')}) {score}"
                   f"field {b.get('field0')} (own {b.get('own_field0')}) pick {b.get('pick')} "
                   f"trap {card_name.get(hands[n].trap, '-')[:12]} lines {len(records)} {b.get('seconds')}s "
                   f"[{time.perf_counter() - began:.0f}s, {evaluator.rows / max(1, evaluator.calls):.1f} rows/call]",
