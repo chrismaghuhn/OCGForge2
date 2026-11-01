@@ -786,7 +786,7 @@ def compare(rows: list[dict]) -> dict:
             "kept": side(lambda r: r["best_index"]), "value_kept": side(lambda r: r["value_index"]),
             "own": side(lambda r: r["own_index"]),
             # fresh rollouts (--validate), on the hands that have them for all three lines
-            "validate": {name: {key: mean(r["validate"][name].get(key) for r in checked)
+            "validate": {name: {key: oe.mean(r["validate"][name].get(key) for r in checked)
                                 for key in ("t2", "lost", "field3", "lp", "opp_lp")}
                          for name in ("kept", "value_kept", "own")
                          for checked in [[r for r in rows if len(r.get("validate") or {}) == 3]] if checked},
