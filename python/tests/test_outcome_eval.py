@@ -215,3 +215,14 @@ def test_shards_split_the_hands_and_merge_in_order(tmp_path):
     ti.merge_shards(book, shards)
     assert ts.paths(book)["lines"].read_text() == '{"seed": "l0"}\n{"seed": "l1"}\n'
     assert ts.paths(book)["hands"].read_text() == '{"hand": "h0"}\n{"hand": "h1"}\n'
+
+
+def test_validation_rescores_the_kept_lines_with_fresh_rollouts():
+    from test_turn1_search import net as toy_t1_net, toy_hand
+
+    _, stats = ts.search_hand(toy_hand(), toy_t1_net(), ts.Settings(beam=4, branch=3, scorer="turn2", validate=2),
+                              set(), lambda c: False)
+    check = stats["base"]["validate"]
+    assert set(check) == {"kept", "value_kept", "own"} and check["kept"]["t2"] == pytest.approx(stats["base"]["score"])
+    out = ts.compare([stats["base"]])
+    assert out["validate"]["kept"]["t2"] == pytest.approx(check["kept"]["t2"]) and out["validate_diff"] is None

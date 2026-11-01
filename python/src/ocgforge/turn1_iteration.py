@@ -68,7 +68,7 @@ def search_cmd(args, deck: Path, deck_type: str, book: Path, first: int, hands: 
              "--hands", str(hands), "--orders", str(args.orders), "--beam", str(args.beam), "--branch", str(args.branch),
              "--traps", str(args.traps), "--workers", str(args.workers), "--seed", str(args.seed),
              "--score", args.score, "--rollouts", str(args.rollouts), "--mix-weight", str(args.mix_weight),
-             "--t2-cap", str(args.t2_cap), "--resume", "--out", str(book)]
+             "--t2-cap", str(args.t2_cap), "--validate", str(args.validate), "--resume", "--out", str(book)]
             + (["--opponents-file", str(args.opponents_file)] if args.opponents_file else [])
             + (["--min-gain", str(args.min_gain)] if min_gain and args.min_gain is not None else []))
 
@@ -230,6 +230,7 @@ def main(argv=None) -> None:
     p.add_argument("--rollouts", type=int, default=2)
     p.add_argument("--mix-weight", type=float, default=0.5)
     p.add_argument("--t2-cap", type=int, default=250)
+    p.add_argument("--validate", type=int, default=0, help="turn1_search --validate")
     p.add_argument("--opponents-file", type=Path, help="turn1_search --opponents-file (needed for turn2/mix)")
     p.add_argument("--teach-threads", type=int, default=4, help="teach engine threads")
     p.add_argument("--seed", type=int, default=0)

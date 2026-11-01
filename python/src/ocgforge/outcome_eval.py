@@ -142,6 +142,12 @@ def summary(rollouts: list[Rollout]) -> dict:
             "capped": mean(r.capped for r in ok), "decisions": mean(r.decisions for r in ok)}
 
 
+def summary_of(summaries: list[dict]) -> dict:
+    """The mean of several `summary` dicts (e.g. one line's scenarios), key by key."""
+    keys = [k for k in (summaries[0] if summaries else {}) if k != "n"]
+    return {k: mean(s.get(k) for s in summaries) for k in keys}
+
+
 def combine(scorer: str, value: float | None, t2: float | None, weight: float = 0.5) -> float | None:
     """A play's score under `scorer` from its end-of-turn-1 value and its mean turn-2 outcome."""
     if scorer == "value":

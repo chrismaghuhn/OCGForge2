@@ -560,6 +560,7 @@ class Settings:
     rollouts: int = 2  # M: sampled turn 2s per candidate and scenario
     mix_weight: float = 0.5  # mix: weight of the end-of-turn-1 value
     t2_cap: int = 250  # sampled decisions per turn-2 rollout at most
+    validate: int = 0  # >0: fresh turn-2 rollouts (this many) of the kept, value-kept and own line
 
 
 def search_branch(hand: Hand, trap: int | None, net: Net, s: Settings, center: set, is_extra,
@@ -619,6 +620,16 @@ def search_branch(hand: Hand, trap: int | None, net: Net, s: Settings, center: s
                      # the same positions after turn 1 in every scenario: the lines differ in order only
                      same_as_value=same(best, value_index), same_as_own=same(best, own_index),
                      value_same_as_own=same(value_index, own_index))
+        if s.validate and best is not None:
+            # fresh rollouts (other seeds) of the kept, the value scorer's and the net's own line:
+            # the scores above chose the line, so they flatter it; these do not
+            picks = {"kept": best, "value_kept": value_index, "own": own_index}
+            chosen = sorted({i for i in picks.values() if i is not None})
+            again = judge([candidates[i] for i in chosen], starts, net, lambda k: ctx, keep=True)
+            score_turn2(again, net, Settings(scorer="turn2", rollouts=s.validate, t2_cap=s.t2_cap),
+                        f"{hand.id}-{trap or 'base'}-validate")
+            fresh = {i: oe.summary_of([p.t2 for p in row if not p.error and p.t2]) for i, row in zip(chosen, again)}
+            stats["validate"] = {name: fresh[i] for name, i in picks.items() if i is not None}
     if best is None:
         return None, {**stats, "error": "no line"}, []
     row = plays[best]
@@ -773,7 +784,24 @@ def compare(rows: list[dict]) -> dict:
             "picked_own": mean(bool(r.get("same_as_own", r["best_index"] == r["own_index"])) for r in rows),
             "value_picked_own": mean(bool(r.get("value_same_as_own", r["value_index"] == r["own_index"])) for r in rows),
             "kept": side(lambda r: r["best_index"]), "value_kept": side(lambda r: r["value_index"]),
-            "own": side(lambda r: r["own_index"])}
+            "own": side(lambda r: r["own_index"]),
+            # fresh rollouts (--validate), on the hands that have them for all three lines
+            "validate": {name: {key: mean(r["validate"][name].get(key) for r in checked)
+                                for key in ("t2", "lost", "field3", "lp", "opp_lp")}
+                         for name in ("kept", "value_kept", "own")
+                         for checked in [[r for r in rows if len(r.get("validate") or {}) == 3]] if checked},
+            "validate_diff": paired([r["validate"]["kept"]["t2"] - r["validate"]["value_kept"]["t2"] for r in rows
+                                     if len(r.get("validate") or {}) == 3 and not r.get("same_as_value")
+                                     and r["validate"]["kept"]["t2"] is not None
+                                     and r["validate"]["value_kept"]["t2"] is not None])}
+
+
+def paired(diffs: list[float]) -> dict | None:
+    """Mean of paired differences with its standard error."""
+    if len(diffs) < 2:
+        return None
+    return {"n": len(diffs), "mean": round(statistics.fmean(diffs), 4),
+            "se": round(statistics.stdev(diffs) / len(diffs) ** 0.5, 4)}
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -790,6 +818,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--rollouts", type=int, default=2, help="M: sampled turn 2s per candidate and scenario")
     p.add_argument("--mix-weight", type=float, default=0.5)
     p.add_argument("--t2-cap", type=int, default=250, help="sampled decisions per turn-2 rollout at most")
+    p.add_argument("--validate", type=int, default=0,
+                   help="fresh turn-2 rollouts per scenario of the kept, value-kept and own line (unbiased check)")
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--hands", type=int, default=200)
     p.add_argument("--first-hand", type=int, default=0)
@@ -851,7 +881,7 @@ def main(argv=None) -> None:
     evaluator = Evaluator(model_fn(model, args.device))
     net = Net(evaluator, model.card_features.index_map())
     settings = Settings(args.beam, args.branch, args.alpha, args.candidates, args.max_choices, args.score,
-                        args.rollouts, args.mix_weight, args.t2_cap)
+                        args.rollouts, args.mix_weight, args.t2_cap, args.validate)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     p = paths(args.out)
     done = done_hands(args.out) if args.resume else set()
