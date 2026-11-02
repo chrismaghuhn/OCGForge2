@@ -131,7 +131,9 @@ def load(path: Path) -> Book:
     lines = []
     for text in Path(f"{stem}-lines.jsonl").read_text(encoding="utf-8").splitlines():
         result = json.loads(text)
-        lines.append((result, cc.puzzle_start(deck, opponent, result["script"], result["duel_seed"])))
+        # a line may name its own opponent deck (turn1_search with real opponents)
+        seat_one = resolve(result["opponent"]) if result.get("opponent") else opponent
+        lines.append((result, cc.puzzle_start(deck, seat_one, result["script"], result["duel_seed"])))
     exact, loose = ob.build_book(lines, relevant)
     with path.open(encoding="utf-8") as stored_lines:
         stored = sum(1 for _ in stored_lines)

@@ -57,7 +57,8 @@ def filler_rng(combo: cb.Combo) -> random.Random:
 
 def scenario_script(combo: cb.Combo, decklist: tuple[list[int], list[int]], opponent: list[int], is_extra,
                     rng: random.Random, hand_size: int = 5, hand: list[int] | None = None,
-                    filler_rng: random.Random | None = None, opponent_hand: list[int] = ()) -> str:
+                    filler_rng: random.Random | None = None, opponent_hand: list[int] = (),
+                    opponent_extra: list[int] = ()) -> str:
     """The puzzle: our hand (the combo's starting cards, filled up from the decklist), our deck and
     Extra Deck (the decklist plus the combo's cards it lacks), an opponent with a deck and a hand it
     never plays (effects like PSY-Framelord Omega's need one).
@@ -66,7 +67,8 @@ def scenario_script(combo: cb.Combo, decklist: tuple[list[int], list[int]], oppo
     shuffle), and `rng` only orders the decks: the shuffles then test what the combo player cannot
     know (deck order: draws, excavations), not a different starting hand. Without it (books before
     v3) `rng` picks the fillers too. `opponent_hand` cards (hand traps for interruption branches) go
-    into the opponent's hand first."""
+    into the opponent's hand first; `opponent_extra` is its Extra Deck (none by default: an opponent
+    that never plays needs none)."""
     main, extra = list(decklist[0]), list(decklist[1])
     for code in combo.cards():  # the combo's cards we do not run
         target = extra if is_extra(code) else main
@@ -104,6 +106,8 @@ def scenario_script(combo: cb.Combo, decklist: tuple[list[int], list[int]], oppo
         lines.append(f"Debug.AddCard({code},1,1,{worlds.LOCATION_DECK},{i},8)")
     for i, code in enumerate(opponent[:hand_size]):  # it never plays them, but effects may target a hand
         lines.append(f"Debug.AddCard({code},1,1,{worlds.LOCATION_HAND},{i},10)")
+    for code in opponent_extra:
+        lines.append(f"Debug.AddCard({code},1,1,{worlds.LOCATION_EXTRA},0,8)")
     lines.append("Debug.ReloadFieldEnd()")
     return "\n".join(lines) + "\n"
 
