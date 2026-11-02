@@ -207,14 +207,49 @@ def test_shards_split_the_hands_and_merge_in_order(tmp_path):
 
     assert ti.shard_ranges(10, 3) == [(0, 4), (4, 3), (7, 3)] and ti.shard_ranges(2, 4) == [(0, 1), (1, 1)]
     book = ti.book_path(tmp_path, Path("decks/elfnote.ydk"))
-    shards = [ti.shard_book(book, i) for i in range(2)]
+    shards = [ti.shard_book(book, 0, 1), ti.shard_book(book, 1, 2)]
     shards[0].parent.mkdir()
     for i, shard in enumerate(shards):
-        ts.paths(shard)["lines"].write_text(f'{{"seed": "l{i}"}}\n')
+        ts.paths(shard)["lines"].write_text(f'{{"seed": "h{i}", "trap": null}}\n')
         ts.paths(shard)["hands"].write_text(f'{{"hand": "h{i}"}}\n')
-    ti.merge_shards(book, shards)
-    assert ts.paths(book)["lines"].read_text() == '{"seed": "l0"}\n{"seed": "l1"}\n'
-    assert ts.paths(book)["hands"].read_text() == '{"hand": "h0"}\n{"hand": "h1"}\n'
+        ts.paths(shard)["rollouts"].write_text(f'{{"hand": "h{i}", "score": {i}}}\n')
+    # a stale shard of an earlier --shards count also holds h1 (and a torn last line): taken once
+    stale = ti.shard_book(book, 1, 3)
+    ts.paths(stale)["lines"].write_text('{"seed": "h1", "trap": null}\n{"seed": "h2", "trap": null}\n')
+    ts.paths(stale)["hands"].write_text('{"hand": "h1"}\n{"hand": "h2"}\n{"hand": ')
+    ti.merge_shards(book, shards + [stale])
+    assert ts.paths(book)["lines"].read_text() == ('{"seed": "h0", "trap": null}\n{"seed": "h1", "trap": null}\n'
+                                                    '{"seed": "h2", "trap": null}\n')
+    assert ts.paths(book)["hands"].read_text() == '{"hand": "h0"}\n{"hand": "h1"}\n{"hand": "h2"}\n'
+    assert ts.paths(book)["rollouts"].read_text() == '{"hand": "h0", "score": 0}\n{"hand": "h1", "score": 1}\n'
+
+
+def test_shard_processes_never_outlive_the_driver(tmp_path, monkeypatch):
+    from ocgforge import turn1_iteration as ti
+
+    started = []
+
+    class Proc:
+        def __init__(self, *a, **k):
+            self.stopped = self.waited = False
+            started.append(self)
+
+        def poll(self):
+            raise KeyboardInterrupt  # Ctrl-C while the shards run
+
+        def terminate(self):
+            self.stopped = True
+
+        def wait(self, timeout=None):
+            self.waited = True
+
+    monkeypatch.setattr(ti.subprocess, "Popen", Proc)
+    book = ti.book_path(tmp_path, Path("decks/elfnote.ydk"))
+    jobs = [(["echo"], tmp_path / f"s{i}.log", ti.shard_book(book, i, 1), {"first": i, "hands": 1, "seed": 0})
+            for i in range(2)]
+    with pytest.raises(KeyboardInterrupt):
+        ti.run_shards(jobs, "elfnote")
+    assert len(started) == 2 and all(p.stopped and p.waited for p in started)
 
 
 def test_validation_rescores_the_kept_lines_with_fresh_rollouts():

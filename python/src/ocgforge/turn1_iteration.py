@@ -49,9 +49,29 @@ def done_marker(book: Path) -> Path:
     return book.with_name(f"{book.stem}-done")
 
 
-def search_done(book: Path, hands: int) -> bool:
-    """Finished: a run went through every hand (hands whose search raised are not retried) and built the book."""
-    return done_marker(book).exists() and book.exists()
+FAILED_HANDS = 3  # turn1_search's exit code: it went through, but some hands failed
+FAILED_TRIES = 3  # runs that end with failed hands before the driver accepts them (deterministic failures)
+
+
+def search_done(book: Path, expected: dict) -> bool:
+    """Finished: the done marker holds `expected` (the hand range and seed it was searched for) and
+    the book exists. A marker for other hands (an earlier run with other settings in the same
+    --out) stops the driver instead of reusing a stale book."""
+    marker = done_marker(book)
+    if not marker.exists():
+        return False
+    try:
+        found = json.loads(marker.read_text())
+    except ValueError:
+        found = None
+    held = {k: found.get(k) for k in expected} if isinstance(found, dict) else found
+    if held != expected:
+        raise SystemExit(f"{marker} is for {found}, not {expected}: remove it (and the book) or use another --out")
+    return book.exists()
+
+
+def mark_done(book: Path, expected: dict, failed: list | None = None) -> None:
+    done_marker(book).write_text(json.dumps({**expected, **({"failed": failed} if failed else {})}))
 
 
 def run(cmd: list[str], log: Path) -> int:
@@ -68,9 +88,18 @@ def search_cmd(args, deck: Path, deck_type: str, book: Path, first: int, hands: 
              "--hands", str(hands), "--orders", str(args.orders), "--beam", str(args.beam), "--branch", str(args.branch),
              "--traps", str(args.traps), "--workers", str(args.workers), "--seed", str(args.seed),
              "--score", args.score, "--rollouts", str(args.rollouts), "--mix-weight", str(args.mix_weight),
-             "--t2-cap", str(args.t2_cap), "--validate", str(args.validate), "--resume", "--out", str(book)]
+             "--t2-cap", str(args.t2_cap), "--validate", str(args.validate), "--gain-orders", str(args.gain_orders),
+             "--gain-rollouts", str(args.gain_rollouts), "--resume", "--out", str(book)]
+            + (["--race", "--race-k1", str(args.race_k1), "--race-k2", str(args.race_k2), "--race-se", str(args.race_se),
+                "--race-frac", str(args.race_frac), "--race-margin", str(args.race_margin), "--race-c", str(args.race_c)]
+               if args.race else [])
             + (["--opponents-file", str(args.opponents_file)] if args.opponents_file else [])
-            + (["--min-gain", str(args.min_gain)] if min_gain and args.min_gain is not None else []))
+            + (gain_args(args) if min_gain else []))
+
+
+def gain_args(args) -> list[str]:
+    return ((["--min-gain", str(args.min_gain)] if args.min_gain is not None else [])
+            + (["--min-gain-se", str(args.min_gain_se)] if args.min_gain_se is not None else []))
 
 
 def shard_ranges(hands: int, shards: int) -> list[tuple[int, int]]:
@@ -85,80 +114,130 @@ def shard_ranges(hands: int, shards: int) -> list[tuple[int, int]]:
     return out
 
 
-def shard_book(book: Path, i: int) -> Path:
-    return book.parent / "shards" / f"{book.stem}-s{i}.jsonl"
+def shard_book(book: Path, first: int, hands: int) -> Path:
+    """A shard's files, named by its hand range: another --shards count gets other files, never a
+    shard of other hands."""
+    return book.parent / "shards" / f"{book.stem}-h{first}-{first + hands}.jsonl"
 
 
 def merge_shards(book: Path, shards: list[Path]) -> None:
-    """The deck's lines and hands files from the shards' (in shard order)."""
+    """The deck's lines, hands and rollouts files from the shards' (in shard order); a hand that more
+    than one shard holds is taken once, from the first."""
+    from .turn1_search import paths, read_jsonl
+
+    hands, owner = [], {}
+    for i, shard in enumerate(shards):
+        for h in read_jsonl(paths(shard)["hands"]) if paths(shard)["hands"].exists() else []:
+            if h["hand"] not in owner:
+                owner[h["hand"]] = i
+                hands.append(h)
+    out = {"hands": hands, "lines": [], "rollouts": []}
+    seen_lines = set()
+    for i, shard in enumerate(shards):
+        for kind, key in (("lines", "seed"), ("rollouts", "hand")):
+            if not paths(shard)[kind].exists():
+                continue
+            for r in read_jsonl(paths(shard)[kind]):
+                if owner.get(r.get(key)) != i:
+                    continue
+                if kind == "lines":
+                    ident = (r["seed"], r.get("trap"))
+                    if ident in seen_lines:
+                        continue
+                    seen_lines.add(ident)
+                out[kind].append(r)
+    for kind, rows in out.items():
+        paths(book)[kind].write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+
+def accept(code: int, tries: int) -> bool:
+    """A search run counts as finished: it succeeded, or it keeps failing the same hands."""
+    return code == 0 or (code == FAILED_HANDS and tries >= FAILED_TRIES)
+
+
+def failed_hands(book: Path) -> list:
     from .turn1_search import paths
 
-    for kind in ("lines", "hands"):
-        text = "".join(paths(s)[kind].read_text(encoding="utf-8") for s in shards)
-        paths(book)[kind].write_text(text, encoding="utf-8")
+    path = paths(book)["failed"]
+    return json.loads(path.read_text()) if path.exists() else []
 
 
 def search(args, deck: Path, deck_type: str) -> Path:
     """The book of one deck (the --min-gain book if a minimum gain is set)."""
     book = book_path(args.out, deck)
+    expected = {"first": 0, "hands": args.hands, "seed": args.seed}
     if args.shards > 1:
-        return search_sharded(args, deck, deck_type, book)
+        return search_sharded(args, deck, deck_type, book, expected)
     for attempt in range(MAX_TRIES):
-        if search_done(book, args.hands):
+        if search_done(book, expected):
             return chosen(book, args)
         code = run(search_cmd(args, deck, deck_type, book, 0, args.hands, True), args.out / f"{deck.stem}-search.log")
         print(f"search {deck.stem}: attempt {attempt} exit {code}", flush=True)
-        if code == 0:
-            done_marker(book).write_text(str(args.hands))
-    if not search_done(book, args.hands):
+        if accept(code, attempt + 1):
+            mark_done(book, expected, failed_hands(book))
+    if not search_done(book, expected):
         raise SystemExit(f"search {deck.stem} did not finish in {MAX_TRIES} tries")
     return chosen(book, args)
 
 
-def search_sharded(args, deck: Path, deck_type: str, book: Path) -> Path:
-    """`--shards` search processes at once, each restarted with --resume until it finishes; then
-    their lines are merged and the deck's book is built (`--build-only`)."""
-    ranges = shard_ranges(args.hands, args.shards)
-    books = [shard_book(book, i) for i in range(len(ranges))]
-    books[0].parent.mkdir(parents=True, exist_ok=True)
-    if not search_done(book, args.hands):
-        env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
-        tries = [0] * len(ranges)
-        running: dict[int, subprocess.Popen] = {}
+def run_shards(jobs: list[tuple[list[str], Path, Path, dict]], deck: str) -> None:
+    """Runs the shard searches (cmd, log, shard book, expected) at once, each restarted until it is
+    accepted. However this ends (an error, Ctrl-C), no shard process outlives it."""
+    env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+    tries = [0] * len(jobs)
+    running: dict[int, subprocess.Popen] = {}
+    try:
         while True:
-            for i, ((first, hands), shard) in enumerate(zip(ranges, books)):
-                if i in running or done_marker(shard).exists():
+            for i, (cmd, log_path, shard, expected) in enumerate(jobs):
+                if i in running or search_done(shard, expected):
                     continue
                 if tries[i] >= MAX_TRIES:
-                    raise SystemExit(f"search {deck.stem} shard {i} did not finish in {MAX_TRIES} tries")
+                    raise SystemExit(f"search {deck} shard {i} did not finish in {MAX_TRIES} tries")
                 tries[i] += 1
-                log = open(shard.with_suffix(".log"), "a", encoding="utf-8")
-                cmd = search_cmd(args, deck, deck_type, shard, first, hands, False)
-                log.write("$ " + " ".join(cmd) + "\n")
-                log.flush()
-                running[i] = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
-                log.close()
+                with open(log_path, "a", encoding="utf-8") as log:
+                    log.write("$ " + " ".join(cmd) + "\n")
+                    log.flush()
+                    running[i] = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
             if not running:
-                break
+                return
             for i, proc in list(running.items()):
                 code = proc.poll()
                 if code is None:
                     continue
                 del running[i]
-                print(f"search {deck.stem} shard {i}: attempt {tries[i] - 1} exit {code}", flush=True)
-                if code == 0:
-                    done_marker(books[i]).write_text(str(ranges[i][1]))
+                print(f"search {deck} shard {i}: attempt {tries[i] - 1} exit {code}", flush=True)
+                if accept(code, tries[i]):
+                    mark_done(jobs[i][2], jobs[i][3], failed_hands(jobs[i][2]))
             time.sleep(5)
+    finally:
+        for proc in running.values():
+            proc.terminate()
+        for proc in running.values():
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+
+def search_sharded(args, deck: Path, deck_type: str, book: Path, expected: dict) -> Path:
+    """`--shards` search processes at once, each restarted with --resume until it finishes; then
+    their lines are merged and the deck's book is built (`--build-only`)."""
+    ranges = shard_ranges(args.hands, args.shards)
+    books = [shard_book(book, first, n) for first, n in ranges]
+    books[0].parent.mkdir(parents=True, exist_ok=True)
+    if not search_done(book, expected):
+        run_shards([(search_cmd(args, deck, deck_type, shard, first, n, False), shard.with_suffix(".log"), shard,
+                     {"first": first, "hands": n, "seed": args.seed}) for (first, n), shard in zip(ranges, books)],
+                   deck.stem)
         merge_shards(book, books)
         meta = json.loads(books[0].with_name(f"{books[0].stem}-meta.json").read_text())
         code = run([sys.executable, "-m", "ocgforge.turn1_search", "--deck", meta["deck"], "--deck-type", deck_type,
                     "--opponent", meta["opponent"], "--checkpoint", str(args.net), "--build-only", "--score", args.score,
-                    "--out", str(book)]
-                   + (["--min-gain", str(args.min_gain)] if args.min_gain is not None else []),
-                   args.out / f"{deck.stem}-build.log")
+                    "--out", str(book)] + gain_args(args), args.out / f"{deck.stem}-build.log")
         if code != 0:
             raise SystemExit(f"building {book.name} failed")
-        done_marker(book).write_text(str(args.hands))
+        mark_done(book, expected, [h for shard in books for h in failed_hands(shard)])
     return chosen(book, args)
 
 
@@ -170,11 +249,12 @@ def chosen(book: Path, args) -> Path:
 
     gain = gain_path(book)
     meta = gain.with_name(f"{gain.stem}-meta.json")
-    if not gain.exists() or json.loads(meta.read_text()).get("min_gain") != args.min_gain:
+    held = json.loads(meta.read_text()) if meta.exists() else {}
+    if not gain.exists() or held.get("min_gain") != args.min_gain or held.get("min_gain_se") != args.min_gain_se:
         deck_meta = json.loads(book.with_name(f"{book.stem}-meta.json").read_text())
         code = run([sys.executable, "-m", "ocgforge.turn1_search", "--deck", deck_meta["deck"], "--deck-type",
                     deck_meta["deck_type"], "--opponent", deck_meta["opponent"], "--checkpoint", str(args.net),
-                    "--build-only", "--min-gain", str(args.min_gain), "--out", str(book)],
+                    "--build-only", "--score", args.score, *gain_args(args), "--out", str(book)],
                    args.out / f"{book.stem}-build.log")
         if code != 0:
             raise SystemExit(f"building {gain.name} failed")
@@ -242,6 +322,16 @@ def main(argv=None) -> None:
                    help="teach micro-batch (the gradient is the same; smaller fits beside the desktop on the GPU)")
     p.add_argument("--envs", type=int, default=512, help="teach self-play envs")
     p.add_argument("--teach-seed", type=int, default=100, help="seed of teach segment 0 (the control used 100)")
+    p.add_argument("--min-gain-se", type=float, default=None, help="turn1_search --min-gain-se")
+    p.add_argument("--race", action="store_true", help="turn1_search --race (racing, with the --race-* settings)")
+    p.add_argument("--race-k1", type=int, default=8)
+    p.add_argument("--race-k2", type=int, default=16)
+    p.add_argument("--race-se", type=float, default=2.0)
+    p.add_argument("--race-frac", type=float, default=0.75)
+    p.add_argument("--race-margin", type=float, default=0.0)
+    p.add_argument("--race-c", type=float, default=1.0)
+    p.add_argument("--gain-orders", type=int, default=8, help="turn1_search --gain-orders")
+    p.add_argument("--gain-rollouts", type=int, default=1, help="turn1_search --gain-rollouts")
     p.add_argument("--min-gain", type=float, default=0.1,
                    help="imitate only lines beating the net's own line by more than this (mean value); negative: all")
     p.add_argument("--search-only", action="store_true")

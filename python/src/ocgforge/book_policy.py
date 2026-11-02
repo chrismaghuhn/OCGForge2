@@ -116,8 +116,11 @@ def resolve(path: str) -> Path:
     p = Path(path)
     if not p.is_absolute():
         p = rollout.REPO / p
-    if not p.exists():  # built in another checkout: the same deck file of this one
-        p = rollout.REPO / "decks" / p.name
+    if not p.exists():  # built in another checkout: the same deck file of this one (decks/ or the scraped decks)
+        for folder in (rollout.REPO / "decks", rollout.REPO / ".cache" / "yugiohmeta" / "decks"):
+            if (folder / p.name).exists():
+                return folder / p.name
+        return rollout.REPO / "decks" / p.name
     return p
 
 

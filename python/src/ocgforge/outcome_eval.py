@@ -25,7 +25,7 @@ from . import worlds
 
 SCORERS = ("value", "turn2", "mix")
 FIELD = (worlds.LOCATION_MZONE, worlds.LOCATION_SZONE)
-MAX_FORCED = 2000  # single answers in a row at most (a looping position must not hang the search)
+MAX_FORCED = 2000  # single answers per rollout at most (a looping position must not hang the search)
 
 
 @dataclass
@@ -64,10 +64,25 @@ def end_stats(duel) -> dict:
     return {"lost": False, "won": False, "finished": False, "field": ours, "lp": lp[0], "opp_lp": lp[1]}
 
 
+def engine_seed(text: str) -> int:
+    """A stable 63-bit engine seed from a seed string."""
+    return random.Random(f"engine-{text}").getrandbits(63)
+
+
+def clone(duel, seed: int):
+    """`duel.clone(seed)`: the engine reseeded (duels without a seed parameter, e.g. test toys, clone plainly)."""
+    try:
+        return duel.clone(seed)
+    except TypeError:
+        return duel.clone()
+
+
 def play_turn2(duels: list, net, rollouts: int, seeds: list, max_decisions: int = 250) -> list[list[Rollout]]:
     """M = `rollouts` sampled turn 2s from each duel (cloned; `duels` stay untouched). `seeds[i]`
     seeds duel i's rollouts (rollout j: `{seed}-{j}`), so the same scenario gets the same samples for
-    every candidate line. `net` is a `turn1_search.Net` (ask: log-probabilities and seat-0 value;
+    every candidate line: the policy samples and the engine's random state (`clone(seed)`, coin
+    flips, shuffles) are the same for every candidate. A finished duel is not cloned (the engine
+    cannot): its rollouts are its result. `net` is a `turn1_search.Net` (ask: log-probabilities and seat-0 value;
     terminal: seat-0 value of a pending decision or the result). A rollout that reaches
     `max_decisions` sampled decisions stops there and is scored at its pending decision (`capped`).
     Every net call of all rollouts is batched."""
@@ -77,7 +92,7 @@ def play_turn2(duels: list, net, rollouts: int, seeds: list, max_decisions: int 
         for j in range(rollouts):
             r = Rollout(None, random.Random(f"{seed}-{j}"))
             try:
-                r.duel = duel.clone()
+                r.duel = duel if duel.finished else clone(duel, engine_seed(f"{seed}-{j}"))
             except Exception:
                 r.error = True
             row.append(r)
