@@ -223,17 +223,35 @@ def test_iteration_counts_only_saved_teach_rounds(tmp_path):
 
     assert ti.saved_rounds(5, 2, ok=False) == 4 and ti.saved_rounds(5, 2, ok=True) == 5
     book = ti.book_path(tmp_path, Path("decks/elfnote.ydk"))
-    assert book.name == "elfnote-t1.jsonl" and not ti.search_done(book, 10)
+    expected = {"first": 0, "hands": 10, "seed": 1}
+    assert book.name == "elfnote-t1.jsonl" and not ti.search_done(book, expected)
     book.write_text("")
-    ti.done_marker(book).write_text("10")
-    assert ti.search_done(book, 10)
+    ti.mark_done(book, expected, ["t1-x-1-3"])
+    assert ti.search_done(book, expected)
+    assert json.loads(ti.done_marker(book).read_text())["failed"] == ["t1-x-1-3"]
+
+
+def test_a_done_marker_for_other_hands_stops_the_driver(tmp_path):
+    from ocgforge import turn1_iteration as ti
+
+    book = ti.book_path(tmp_path, Path("decks/elfnote.ydk"))
+    book.write_text("")
+    ti.mark_done(book, {"first": 0, "hands": 10, "seed": 1})
+    with pytest.raises(SystemExit):
+        ti.search_done(book, {"first": 0, "hands": 20, "seed": 1})
+    ti.done_marker(book).write_text("10")  # an old marker (hand count only) is stale too
+    with pytest.raises(SystemExit):
+        ti.search_done(book, {"first": 0, "hands": 10, "seed": 1})
+    # shards are named by their hand range: another --shards count never reuses a shard of other hands
+    assert ti.shard_book(book, 0, 5) != ti.shard_book(book, 0, 4)
 
 
 def test_gain_book_keeps_only_lines_that_beat_the_net(tmp_path, monkeypatch):
     records, stats = ts.search_hand(toy_hand(), net(), ts.Settings(beam=4, branch=3), set(), lambda c: False)
     good = records[0]
-    assert ts.gains(good) == pytest.approx(good["search"]["value"] - good["search"]["own_value"]) and ts.gains(good) > 0.1
-    same = {**good, "seed": "t1-toy-0-1", "search": {**good["search"], "own_value": good["search"]["value"] - 0.05}}
+    # the gain is measured on fresh scenarios: the kept line (summon both) vs the own line (end the turn)
+    assert ts.gains(good) == good["search"]["gain"] == pytest.approx(0.2) and good["search"]["gain_n"] == 8
+    same = {**good, "seed": "t1-toy-0-1", "search": {**good["search"], "gain": 0.05}}
     out = tmp_path / "toy-t1.jsonl"
     p = ts.paths(out)
     p["lines"].write_text("".join(json.dumps(r) + "\n" for r in (good, same)), encoding="utf-8")
@@ -253,8 +271,11 @@ def test_traps_file_round_trips_passcodes_and_feeds_the_trap_pool(tmp_path):
     path = tmp_path / "traps.json"
     ts.write_traps(path, rules)
     raw = json.loads(path.read_text(encoding="utf-8"))
-    assert raw == {"10045474": [56651978], "14558127": [42141493, 85976588], "97268402": []}  # passcodes only
-    assert ts.read_traps(path) == rules
+    assert raw == [10045474, 14558127, 97268402]  # the hand traps only: the bot fires at the first chance
+    assert ts.read_traps(path) == sorted(rules)
+    old = tmp_path / "old.json"  # files written before: an object keyed by passcode, choke points ignored
+    old.write_text(json.dumps({"14558127": [42141493], "97268402": []}), encoding="utf-8")
+    assert ts.read_traps(old) == [14558127, 97268402]
     names = {14558127: "Ash Blossom & Joyous Spring", 97268402: "Effect Veiler", 10045474: "Infinite Impermanence"}
     assert ts.trap_pool(ts.read_traps(path), names, 4) == ts.trap_pool(rules, names, 4)
 

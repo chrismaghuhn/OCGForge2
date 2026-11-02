@@ -13,13 +13,15 @@ clones) looks for the line the net itself rates best:
   `answer_rules.forced`, the opponent declines (or is the hand-trap bot of a branch).
 - Honesty: a clone carries the real deck order, so a line that draws, excavates or mills may be
   chosen for what the deck happens to hold. Each hand is therefore played in `--orders` K scenarios
-  (the same hand, other deck orders and opponent hands). The search runs in scenario 0; its best
-  `--candidates` finished lines and the net's own greedy line are then replayed in all K scenarios
-  (our answers only, matched with `worlds.match`; from the first answer that is not offered on, the
-  net plays greedily) and the line with the best MEAN end-of-turn value is kept. A choice made
-  before the deck shows a card is thus judged over K deck orders; answers after it react to cards
-  that are visible by then. Each kept line records `reveal_at`, our first answer after which a card
-  we did not name left the deck (None: the line never looks into the deck).
+  (the same hand, other deck orders and opponent hands) besides the beam's scenario 0. The search
+  runs in scenario 0; its best `--candidates` finished lines and the net's own greedy line are then
+  replayed in scenarios 1..K, which the beam never saw (our answers only, matched with
+  `worlds.match`; from the first answer that is not offered on, the net plays greedily), and the
+  line with the best MEAN score is kept (a line with an engine error in any scenario is out). A
+  choice made before the deck shows a card is thus judged over K deck orders; answers after it react
+  to cards that are visible by then. The book line is the kept line in scenario 0. Each kept line
+  records `reveal_at`, our first answer after which a card we did not name left the deck (None: the
+  line never looks into the deck).
 - Hand traps: for each hand, one interruption branch (the deck's hand traps from the counters data,
   in turn by hand): the opponent holds the trap and fires it at the first chance (`opening_book.
   hand_trap_bot`). The branch replays the kept line until the trap fired, then searches on from
@@ -30,17 +32,21 @@ clones) looks for the line the net itself rates best:
   book `<out>` and `<out>-meta.json` are built by `opening_book.build_book`, so `book_imitation` and
   `teach --book` read it unchanged. Line values for the book stay unrated (`value.held` None): one
   line per hand and branch, so lines only meet at the shared prefix of a hand's base and trap line.
-- `--min-gain G`: a second book `<out stem>-gain.jsonl` holds only the lines whose mean value
-  beats the net's own line (greedy over the same K scenarios; in a branch, its greedy continuation)
-  by more than G. Where the net's own line was kept, imitation teaches nothing new.
-- Resumable: every finished hand is appended to `<out>-hands.jsonl` (stats) right after its lines;
-  `--resume` skips those hands (and drops lines of an unfinished hand).
+- `--min-gain G`: a second book `<out stem>-gain.jsonl` holds only the lines whose gain over the
+  net's own line (greedy; in a branch, its greedy continuation) exceeds G (`--min-gain-se z`: also z
+  standard errors). The gain is measured apart from the grading, in `--gain-orders` further
+  scenarios with fresh seeds, the same way under every scorer: the grading picked the maximum, so
+  its numbers flatter the kept line. Where the net's own line was kept, imitation teaches nothing new.
+- Resumable: every finished hand is appended to `<out>-hands.jsonl` (stats) right after its lines
+  and rollouts; `--resume` skips those hands (drops lines of an unfinished hand and torn lines).
+  Hands that failed make the run exit with FAILED_HANDS (3), listed in `<out>-failed.json`.
 - Net calls of all search threads go through one `Evaluator`, which batches them on the GPU.
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import queue
 import random
@@ -48,7 +54,7 @@ import statistics
 import threading
 import time
 from collections import Counter
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -60,9 +66,10 @@ from . import rollout, worlds
 from .answer_rules import deck_cards, forced
 from .seeds import HAND_SIZE, INTERRUPTERS
 
-FIELD = (worlds.LOCATION_MZONE, worlds.LOCATION_SZONE)
+FIELD = oe.FIELD
 END_TURN = ("idle.7", "battle.3")  # to the End Phase (board_break.END_TURN)
 PASSIVE = ("chain.pass", "yes_no.", "effect_yes_no.")  # never "the same answer again" (combo_check.PASSIVE)
+FAILED_HANDS = 3  # exit code: the run went through, but some hands failed (retry with --resume)
 MAX_AUTO = 400  # answers in a row without a real choice of ours (a looping bot must not hang a search)
 # Hand traps for the branches, first come first: the cards that stop a combo at once before
 # Fuwalos (which only lets the opponent draw; opening_book's ordering picked it far too often).
@@ -113,9 +120,12 @@ class Evaluator:
                 n += len(more[0])
             try:
                 out = self.fn([r for rows, _ in jobs for r in rows])
-            except Exception as error:  # every waiting thread gets the error, the worker lives on
-                for _, future in jobs:
-                    future.set_exception(error)
+            except Exception:  # retry each request on its own: only the bad one fails (its hand)
+                for rows, future in jobs:
+                    try:
+                        future.set_result(self.fn(rows))
+                    except Exception as error:
+                        future.set_exception(error)
             else:
                 i = 0
                 for rows, future in jobs:
@@ -395,12 +405,13 @@ def judge(candidates: list[list[str]], starts: list, net: Net, ctx_of_k, keep: b
 
 
 def position(duel) -> tuple:
-    """A duel's position for sharing rollouts: every card (hidden ones too) with its place, life
-    points, turn, phase and the pending question."""
+    """A duel's position for sharing rollouts: every card (hidden ones too) with its place (in the
+    deck: its order), life points, turn, phase and the pending question."""
     if duel.finished:
         return ("finished", duel.winner)
     snap = duel.snapshot()
-    cards = tuple(sorted((c["controller"], c["location"], c["code"], c["sequence"] if c["location"] in FIELD else 0,
+    ordered = FIELD + (worlds.LOCATION_DECK,)  # the deck's order decides the coming draws
+    cards = tuple(sorted((c["controller"], c["location"], c["code"], c["sequence"] if c["location"] in ordered else 0,
                           c["position"] if c["location"] in FIELD else 0) for c in snap["cards"]))
     return cards, tuple(snap["life_points"]), duel.turn, duel.phase, duel.player, tuple(duel.keys())
 
@@ -437,30 +448,32 @@ def score_turn2(plays: list[list[Play]], net: Net, s: "Settings", tag: str, k_of
             p.duel = None
 
 
-def mean(values) -> float | None:
-    values = list(values)
-    return round(statistics.fmean(values), 4) if values else None
+mean = oe.mean  # rounded mean of the values that are not None (None for none)
 
 
 def pick(plays: list[list[Play]], by: str = "score") -> int | None:
     """The candidate with the best mean score (`by`: "score", the scorer's, or "value", the
-    end-of-turn value) over the scenarios it was scored in without an engine error (scenario 0 must
-    be one; ties: the better score in scenario 0)."""
-    best, best_key = None, None
+    end-of-turn value) over the grading scenarios. A candidate with an engine error or no score in
+    any scenario is left out (a mean over fewer scenarios is not comparable); ties: the earlier
+    candidate (the beam's order)."""
+    best, best_mean = None, None
     for i, row in enumerate(plays):
-        if row[0].error or getattr(row[0], by) is None:
+        if not row or any(p.error or getattr(p, by) is None for p in row):
             continue
-        values = [getattr(p, by) for p in row if not p.error and getattr(p, by) is not None]
-        key = (statistics.fmean(values), getattr(row[0], by))
-        if best_key is None or key > best_key:
-            best, best_key = i, key
+        value = statistics.fmean(getattr(p, by) for p in row)
+        if best_mean is None or value > best_mean:
+            best, best_mean = i, value
     return best
 
 
 def reveal_at(start, keys: list[str]) -> tuple[bool, int | None]:
     """Replays `keys` from a fresh scenario duel: whether they all replay (the book replays them
     so), and the index of our first answer after which a card left our deck that none of our
-    answers named in the deck (a search names its card; a draw, excavation or mill does not)."""
+    answers named in the deck (a search names its card; a draw, excavation or mill does not).
+
+    Known gap: only cards that end up outside the deck count. An excavation that looks at cards
+    and puts them all back (or a reveal of the top card) is not seen, although the line may react
+    to what it showed; telling those apart needs the duel's reveal events."""
     duel = start()
     if duel is None:
         return False, None
@@ -548,15 +561,16 @@ def random_hand(decklist: tuple, run_seed: int, deck: Path, t: int) -> list[int]
     return main[:HAND_SIZE]
 
 
-def read_traps(path: Path) -> dict[int, set[int]]:
-    """Hand-trap rules from a --traps-file: JSON {hand trap passcode: [choke-point passcodes]}."""
+def read_traps(path: Path) -> list[int]:
+    """The deck's hand traps from a --traps-file: a JSON list of passcodes (older files: an object
+    keyed by passcode; its choke points are ignored, the branches' bot fires at the first chance)."""
     raw = json.loads(path.read_text(encoding="utf-8"))
-    return {int(trap): {int(c) for c in chokes} for trap, chokes in raw.items()}
+    return sorted(int(t) for t in raw)
 
 
-def write_traps(path: Path, rules: dict[int, set[int]]) -> None:
-    """The resolved hand-trap rules (passcodes only) as a --traps-file."""
-    path.write_text(json.dumps({str(t): sorted(rules[t]) for t in sorted(rules)}) + "\n", encoding="utf-8")
+def write_traps(path: Path, traps) -> None:
+    """The deck's resolved hand traps (passcodes) as a --traps-file."""
+    path.write_text(json.dumps(sorted(int(t) for t in traps)) + "\n", encoding="utf-8")
 
 
 def trap_pool(rules: dict, card_name: dict, size: int) -> list[int]:
@@ -579,9 +593,11 @@ class Settings:
     t2_cap: int = 250  # sampled decisions per turn-2 rollout at most
     validate: int = 0  # >0: fresh turn-2 rollouts (this many) of the kept, value-kept and own line
     validate_orders: int = 0  # >0: the validation plays this many scenarios (default: the search's K)
-    log_rollouts: bool = False  # keep every rollout (written to <out>-rollouts.jsonl)
+    log_rollouts: bool = True  # keep every rollout (written to <out>-rollouts.jsonl)
     validate_categories: bool = False  # also validate a mid-ranked, a fragile and a big-board candidate
-    validate_chunk: int = 6  # validation scenarios at a time
+    validate_chunk: int = 6  # scenarios scored at a time (turn-2 duels held in memory)
+    gain_orders: int = 8  # further scenarios the kept line's gain over the own line is measured in
+    gain_rollouts: int = 1  # turn-2 rollouts per scenario there
 
 
 def categories(cands: list[dict], positions: list[tuple], best: int, own: int | None) -> dict:
@@ -602,18 +618,55 @@ def categories(cands: list[dict], positions: list[tuple], best: int, own: int | 
     return out
 
 
+def scored(candidates: list[list[str]], starts: list, net: Net, ctx: Ctx, s: Settings, tag: str, k_first: int,
+           rollouts: int | None = None, scorer: str | None = None) -> list[list[Play]]:
+    """Each candidate played in every scenario of `starts` (scenario ids from `k_first`) and scored
+    (`scorer`, default `s.scorer`; turn2/mix with `rollouts` sampled turn 2s, default `s.rollouts`).
+    Turn-2 scoring goes `s.validate_chunk` scenarios at a time: the duels of one chunk are freed
+    before the next (memory)."""
+    scorer = scorer or s.scorer
+    if scorer == "value":
+        return judge(candidates, starts, net, lambda k: ctx)
+    t2 = dataclasses.replace(s, scorer=scorer, rollouts=rollouts or s.rollouts)
+    rows: list[list[Play]] = [[] for _ in candidates]
+    for first in range(0, len(starts), max(1, s.validate_chunk)):
+        plays = judge(candidates, starts[first:first + s.validate_chunk], net, lambda k: ctx, keep=True)
+        score_turn2(plays, net, t2, tag, k_offset=k_first + first)
+        for row, part in zip(rows, plays):
+            row += part
+    return rows
+
+
+def paired_gain(kept: list[Play], own: list[Play]) -> dict:
+    """Mean and standard error of score(kept) - score(own) over the scenarios both were scored in."""
+    diffs = [a.score - b.score for a, b in zip(kept, own)
+             if not a.error and not b.error and a.score is not None and b.score is not None]
+    if not diffs:
+        return {"gain": None, "gain_se": None, "gain_n": 0}
+    se = statistics.stdev(diffs) / len(diffs) ** 0.5 if len(diffs) > 1 else None
+    return {"gain": round(statistics.fmean(diffs), 4), "gain_se": round(se, 4) if se is not None else None,
+            "gain_n": len(diffs)}
+
+
 def search_branch(hand: Hand, trap: int | None, net: Net, s: Settings, center: set, is_extra,
                   base: list[str] | None = None) -> tuple[dict | None, dict, list[str]]:
     """One branch of a hand: the base (trap None) or the interruption by `trap` after the base
-    line `base` (our answers). Returns (line record or None, stats, our answers of the line)."""
+    line `base` (our answers). Returns (line record or None, stats, our answers of the line).
+
+    Scenario 0 is the beam's; the candidates are graded in scenarios 1..K (deck orders the beam
+    never saw), and the kept line's gain over the net's own line is measured once more in
+    `s.gain_orders` further scenarios with fresh seeds (the grading picked the maximum, so its own
+    numbers flatter the kept line). The book line is the kept line replayed in scenario 0."""
     began = time.perf_counter()
     bot = ob.hand_trap_bot(trap, set()) if trap else None
     ctx = Ctx(bot, center, is_extra, s.max_choices)
-    scenarios = [hand.start(k, trap) for k in range(hand.orders)]
+    scenarios = [hand.start(k, trap) for k in range(hand.orders + 1)]
     starts = [start() for _, _, start in scenarios]
     stats = {"trap": trap}
     if any(d is None for d in starts):
         return None, {**stats, "error": "scenario"}, []
+    grade = starts[1:]
+    tag = f"{hand.id}-{trap or 'base'}"
     root = starts[0].clone()
     keys, ours = [], []
     if trap:
@@ -629,17 +682,16 @@ def search_branch(hand: Hand, trap: int | None, net: Net, s: Settings, center: s
             candidates.append(node.ours)
         if len(candidates) >= s.candidates:
             break
-    # The net's own play: greedy in every scenario (after the base line's prefix in a branch).
-    own = judge([ours], starts, net, lambda k: ctx)[0]
+    # The net's own play: greedy in every grading scenario (after the base line's prefix in a branch).
+    own = judge([ours], grade, net, lambda k: ctx)[0]
+    own_line = own[0].ours if not own[0].error else None
     own_index = None
-    if not own[0].error:
-        if tuple(own[0].ours) not in seen:
-            candidates.append(own[0].ours)
-        own_index = candidates.index(own[0].ours)
+    if own_line is not None:
+        if tuple(own_line) not in seen:
+            candidates.append(own_line)
+        own_index = candidates.index(own_line)
     turn2 = s.scorer != "value"
-    plays = judge(candidates, starts, net, lambda k: ctx, keep=turn2)
-    if turn2:
-        score_turn2(plays, net, s, f"{hand.id}-{trap or 'base'}")
+    plays = scored(candidates, grade, net, ctx, s, tag, 1)
     best = pick(plays)
     stats.update(finished=len(lines), candidates=len(candidates), seconds=round(time.perf_counter() - began, 1),
                  own_value=mean(p.value for p in own if not p.error), own_field=mean(p.on_field for p in own if not p.error),
@@ -669,54 +721,62 @@ def search_branch(hand: Hand, trap: int | None, net: Net, s: Settings, center: s
             else None
         if s.validate and best is not None:
             # fresh rollouts (other seeds) of the kept, the value scorer's and the net's own line (and with
-            # `validate_categories` a mid-ranked, a fragile and a big-board candidate): the scores above
-            # chose the line, so they flatter it; these do not
+            # `validate_categories` a mid-ranked, a fragile and a big-board candidate)
             picks = {"kept": best, "value_kept": value_index, "own": own_index}
             if s.validate_categories:
                 picks.update(categories(stats["cands"], [tuple(p.sig for p in row) for row in plays], best, own_index))
             chosen = sorted({i for i in picks.values() if i is not None})
-            orders = s.validate_orders or len(starts)
-            rows = {i: [] for i in chosen}
-            for first in range(0, orders, s.validate_chunk):  # a few scenarios at a time: memory
-                ks = range(first, min(orders, first + s.validate_chunk))
-                checks = [start() for _, _, start in (hand.start(k, trap) for k in ks)] if s.validate_orders \
-                    else [starts[k] for k in ks]
-                if any(d is None for d in checks):
-                    continue
-                again = judge([candidates[i] for i in chosen], checks, net, lambda k: ctx, keep=True)
-                score_turn2(again, net, Settings(scorer="turn2", rollouts=s.validate, t2_cap=s.t2_cap),
-                            f"{hand.id}-{trap or 'base'}-validate", k_offset=first)
-                for i, row in zip(chosen, again):
-                    rows[i] += row
-            fresh = {i: oe.summary_of([p.t2 for p in row if not p.error and p.t2]) for i, row in rows.items()}
-            if s.log_rollouts:  # every single rollout (scenario k, rollout j: the same seeds for every line)
-                stats["validate_raw"] = [{"phase": "validate", "line": name, "cand": i, **r}
-                                         for name, i in picks.items() if i is not None
-                                         for p in rows[i] if not p.error for r in p.raw]
-            stats["validate"] = {name: fresh[i] for name, i in picks.items() if i is not None}
-            stats["validate_picks"] = picks
+            checks = [start() for _, _, start in (hand.start(k, trap) for k in range(s.validate_orders))] \
+                if s.validate_orders else grade
+            k_first = 0 if s.validate_orders else 1
+            if all(d is not None for d in checks):
+                rows = dict(zip(chosen, scored([candidates[i] for i in chosen], checks, net, ctx, s,
+                                               f"{tag}-validate", k_first, s.validate, "turn2")))
+                fresh = {i: oe.summary_of([p.t2 for p in row if not p.error and p.t2]) for i, row in rows.items()}
+                if s.log_rollouts:  # every single rollout (scenario k, rollout j: the same seeds for every line)
+                    stats["validate_raw"] = [{"phase": "validate", "line": name, "cand": i, **r}
+                                             for name, i in picks.items() if i is not None
+                                             for p in rows[i] if not p.error for r in p.raw]
+                stats["validate"] = {name: fresh[i] for name, i in picks.items() if i is not None}
+                stats["validate_picks"] = picks
     if best is None:
         return None, {**stats, "error": "no line"}, []
+    # The gain over the net's own line, on independent scenarios and seeds (the same for value and turn2)
+    if best == own_index:
+        stats.update(gain=0.0, gain_se=None, gain_n=0)
+    elif own_line is not None and s.gain_orders > 0:
+        first = hand.orders + 1
+        fresh = [start() for _, _, start in (hand.start(k, trap) for k in range(first, first + s.gain_orders))]
+        if all(d is not None for d in fresh):
+            kept_rows, own_rows = scored([candidates[best], own_line], fresh, net, ctx, s, f"{tag}-gain", first,
+                                         s.gain_rollouts)
+            stats.update(paired_gain(kept_rows, own_rows))
     row = plays[best]
     script, duel_seed, start = scenarios[0]
-    keys = row[0].keys
+    # the book line: the kept line in the beam's scenario 0 (where its answers were found)
+    line = judge([candidates[best]], [starts[0]], net, lambda k: ctx)[0][0]
+    if line.error:
+        return None, {**stats, "error": "no replay"}, []
+    keys = line.keys
     replays, reveal = reveal_at(start, keys)
     stats.update(value=mean(p.value for p in row if not p.error), field=mean(p.on_field for p in row if not p.error),
                  score=mean(p.score for p in row if not p.error and p.score is not None),
-                 value0=row[0].value, field0=row[0].on_field, pick="own" if best == own_index else "search", beam_value0=lines[0].value if lines else None, diverged=sum(p.diverged for p in row[1:]),
-                 replays=replays, reveal_at=reveal, our_answers=len(row[0].ours))
+                 value0=line.value, field0=line.on_field, pick="own" if best == own_index else "search",
+                 beam_value0=lines[0].value if lines else None, diverged=sum(p.diverged for p in row),
+                 replays=replays, reveal_at=reveal, our_answers=len(line.ours))
     if not replays:
         return None, {**stats, "error": "no replay"}, []
     if trap and not ob.fired(keys, trap):
         return None, {**stats, "fired": False}, []
     record = {"seed": hand.id, "title": f"turn1 {hand.deck.stem} {hand.id}", "source": "turn1", "author": "",
               "origin": "turn1_search", "variant": 0, "trap": trap, "fired": True if trap else None, "line": keys,
-              "steps": 0, "progress": 0, "skipped": 0, "key_cards": 0, "book_end_board": [], "field": row[0].on_field,
-              "end_board": row[0].end_board, "script": script, "duel_seed": duel_seed, "first": True,
+              "steps": 0, "progress": 0, "skipped": 0, "key_cards": 0, "book_end_board": [], "field": line.on_field,
+              "end_board": line.end_board, "script": script, "duel_seed": duel_seed, "first": True,
               "hand": hand.cards, "fillers": [], "opponent": str(hand.opponent_of(0)[0]),
               "value": {"held": None, "left": None, "tries": 0, "unbuildable": 0, "errors": 0},
-              "search": {k: v for k, v in stats.items() if k != "trap"}, "seconds": stats["seconds"]}
-    return record, stats, row[0].ours
+              "search": {k: v for k, v in stats.items() if k not in ("trap", "score_raw", "validate_raw")},
+              "seconds": stats["seconds"]}
+    return record, stats, line.ours
 
 
 def search_hand(hand: Hand, net: Net, s: Settings, center: set, is_extra) -> tuple[list[dict], dict]:
@@ -735,27 +795,48 @@ def search_hand(hand: Hand, net: Net, s: Settings, center: set, is_extra) -> tup
 def paths(out: Path) -> dict[str, Path]:
     stem = out.with_name(out.stem)
     return {name: Path(f"{stem}-{name}.{ext}") for name, ext in
-            (("lines", "jsonl"), ("hands", "jsonl"), ("meta", "json"), ("report", "json"), ("rollouts", "jsonl"))}
+            (("lines", "jsonl"), ("hands", "jsonl"), ("meta", "json"), ("report", "json"), ("rollouts", "jsonl"),
+             ("failed", "json"))}
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    """The records of a JSON-lines file; a line that does not parse (one torn by a crash) is skipped."""
+    out = []
+    for text in path.read_text(encoding="utf-8").splitlines():
+        try:
+            out.append(json.loads(text))
+        except ValueError:
+            continue
+    return out
 
 
 def done_hands(out: Path) -> set[str]:
     """--resume: the hands already finished; lines of other hands (a crash between a hand's lines
-    and its stats) are dropped from the lines file."""
+    and its stats) are dropped from the lines file, and every file is rewritten without torn lines."""
     p = paths(out)
     if not p["hands"].exists():
         return set()
-    done = {json.loads(t)["hand"] for t in p["hands"].read_text(encoding="utf-8").splitlines() if t.strip()}
-    if p["lines"].exists():
-        kept = [t for t in p["lines"].read_text(encoding="utf-8").splitlines() if t.strip() and json.loads(t)["seed"] in done]
-        p["lines"].write_text("".join(t + "\n" for t in kept), encoding="utf-8")
+    hands = read_jsonl(p["hands"])
+    done = {h["hand"] for h in hands}
+    p["hands"].write_text("".join(json.dumps(h) + "\n" for h in hands), encoding="utf-8")
+    for kind, key in (("lines", "seed"), ("rollouts", "hand")):
+        if p[kind].exists():
+            kept = [r for r in read_jsonl(p[kind]) if r.get(key) in done]
+            p[kind].write_text("".join(json.dumps(r) + "\n" for r in kept), encoding="utf-8")
     return done
 
 
 def gains(record: dict) -> float | None:
     """How much better the kept line is than the net's own play: mean end-of-turn value over the K
     scenarios minus that of the net's greedy line (in a branch: its greedy continuation after the
-    same prefix); under a turn-2 scorer the same in its score. None for records without search stats."""
+    same prefix); under a turn-2 scorer the same in its score. None for records without search stats.
+
+    Records with an independent measurement (`gain`: kept minus own line on fresh scenarios and
+    seeds, search_branch) use it. Older records fall back to the grading numbers, which flatter the
+    kept line (it was picked as their maximum)."""
     search = record.get("search") or {}
+    if "gain" in search:
+        return search["gain"]
     if search.get("scorer", "value") != "value":
         if search.get("score") is None or search.get("own_score") is None:
             return None
@@ -773,35 +854,49 @@ def gain_path(out: Path) -> Path:
 def write_book(out: Path, deck: Path, opponent: Path, records: list[dict], meta: dict) -> int:
     """Book `out`, its lines file and meta (with the relevant cards) from `records`; the number of states."""
     p = paths(out)
-    lines = [(r, cc.puzzle_start(deck, Path(r.get("opponent") or opponent), r["script"], r["duel_seed"]))
-             for r in records]
+    from .book_policy import resolve
+
+    lines = [(r, cc.puzzle_start(deck, resolve(r["opponent"]) if r.get("opponent") else opponent, r["script"],
+                                 r["duel_seed"])) for r in records]
     relevant = ob.book_cards(records)
     book, _ = ob.build_book(lines, relevant)
-    if not p["lines"].exists() or [json.loads(t) for t in p["lines"].read_text(encoding="utf-8").splitlines()] != records:
+    if not p["lines"].exists() or read_jsonl(p["lines"]) != records:
         p["lines"].write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
     out.write_text("".join(json.dumps(e) + "\n" for e in book.values()), encoding="utf-8")
     p["meta"].write_text(json.dumps({**meta, "relevant": sorted(relevant)}), encoding="utf-8")
     return len(book)
 
 
-def build(out: Path, deck: Path, opponent: Path, meta: dict, min_gain: float | None = None) -> dict:
+def keeps(record: dict, min_gain: float, min_gain_se: float | None = None) -> bool:
+    """A line for the gain book: its gain beats `min_gain` and, with `min_gain_se` z, also z standard
+    errors of its independent measurement (when it has one)."""
+    g = gains(record)
+    if g is None or g <= min_gain:
+        return False
+    se = (record.get("search") or {}).get("gain_se")
+    return min_gain_se is None or se is None or g > min_gain_se * se
+
+
+def build(out: Path, deck: Path, opponent: Path, meta: dict, min_gain: float | None = None,
+          min_gain_se: float | None = None) -> dict:
     """The book of the lines file (opening_book.build_book) beside `out`, its meta and a report.
     With `min_gain`, also the book of the lines whose value beats the net's own line by more than
     that (`gain_path`): a line the net would play anyway (or nearly as well) teaches it nothing.
     Base and branch lines are filtered alike; a branch line whose base line is dropped keeps the
     base line's answers before the hand trap."""
     p = paths(out)
-    records = [json.loads(t) for t in p["lines"].read_text(encoding="utf-8").splitlines() if t.strip()]
+    records = read_jsonl(p["lines"])
     states = write_book(out, deck, opponent, records, meta)
-    report = summarize([json.loads(t) for t in p["hands"].read_text(encoding="utf-8").splitlines() if t.strip()])
+    report = summarize(read_jsonl(p["hands"]))
     report.update(states=states, lines=len(records))
     if min_gain is not None:
-        kept = [r for r in records if (g := gains(r)) is not None and g > min_gain]
-        report["gain"] = {"min_gain": min_gain, "lines": len(kept),
+        kept = [r for r in records if keeps(r, min_gain, min_gain_se)]
+        report["gain"] = {"min_gain": min_gain, "min_gain_se": min_gain_se, "lines": len(kept),
                           "base": sum(r["trap"] is None for r in kept), "trap": sum(r["trap"] is not None for r in kept),
                           "base_of": sum(r["trap"] is None for r in records),
                           "trap_of": sum(r["trap"] is not None for r in records),
-                          "states": write_book(gain_path(out), deck, opponent, kept, {**meta, "min_gain": min_gain})}
+                          "states": write_book(gain_path(out), deck, opponent, kept,
+                                               {**meta, "min_gain": min_gain, "min_gain_se": min_gain_se})}
     p["report"].write_text(json.dumps(report, indent=1), encoding="utf-8")
     return report
 
@@ -895,7 +990,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--hands", type=int, default=200)
     p.add_argument("--first-hand", type=int, default=0)
-    p.add_argument("--orders", type=int, default=4, help="K: deck orders (scenarios) each candidate line is judged in")
+    p.add_argument("--orders", type=int, default=4,
+                   help="K: deck orders (scenarios) each candidate line is graded in (besides the beam's scenario 0)")
     p.add_argument("--beam", type=int, default=8)
     p.add_argument("--branch", type=int, default=3)
     p.add_argument("--alpha", type=float, default=0.02, help="weight of the log-probability in the beam's rank")
@@ -903,9 +999,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--max-choices", type=int, default=120)
     p.add_argument("--traps", type=int, default=4, help="hand traps the branches rotate through (0: no branches)")
     p.add_argument("--traps-file", type=Path,
-                   help="resolved hand-trap rules (JSON {trap passcode: [choke-point passcodes]}) instead of the "
-                        "counters data")
-    p.add_argument("--write-traps", type=Path, help="write the deck's resolved hand-trap rules there and exit")
+                   help="the deck's hand traps (JSON list of passcodes, from --write-traps) instead of the counters data")
+    p.add_argument("--write-traps", type=Path, help="write the deck's resolved hand traps there and exit")
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--torch-threads", type=int, default=1)
     p.add_argument("--device", default="cuda")
@@ -914,6 +1009,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--min-gain", type=float, default=None,
                    help="also build <out stem>-gain.jsonl from the lines whose mean value beats the net's own line "
                         "by more than this")
+    p.add_argument("--min-gain-se", type=float, default=None,
+                   help="also require the gain to beat this many standard errors of its independent measurement")
+    p.add_argument("--gain-orders", type=int, default=8,
+                   help="further scenarios (fresh seeds) the kept line's gain over the own line is measured in")
+    p.add_argument("--gain-rollouts", type=int, default=1, help="turn-2 rollouts per scenario there")
     p.add_argument("--build-only", action="store_true", help="build book and report from the lines")
     p.add_argument("--out", type=Path, required=True, help="book (JSON lines); lines, hands, meta, report beside it")
     return p.parse_args(argv)
@@ -933,7 +1033,7 @@ def main(argv=None) -> None:
     if args.score != "value" and not args.opponents_file and not args.build_only:
         raise SystemExit("--score turn2/mix needs --opponents-file (an opponent that can play turn 2)")
     if args.build_only:
-        print(json.dumps(build(args.out, args.deck, args.opponent, meta, args.min_gain)), flush=True)
+        print(json.dumps(build(args.out, args.deck, args.opponent, meta, args.min_gain, args.min_gain_se)), flush=True)
         return
     torch.set_num_threads(args.torch_threads)
     table = CardTable.from_cdb()
@@ -965,7 +1065,8 @@ def main(argv=None) -> None:
     net = Net(evaluator, model.card_features.index_map())
     settings = Settings(args.beam, args.branch, args.alpha, args.candidates, args.max_choices, args.score,
                         args.rollouts, args.mix_weight, args.t2_cap, args.validate,
-                        args.validate_orders, args.log_rollouts, args.validate_categories, args.validate_chunk)
+                        args.validate_orders, args.log_rollouts, args.validate_categories, args.validate_chunk,
+                        args.gain_orders, args.gain_rollouts)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     p = paths(args.out)
     done = done_hands(args.out) if args.resume else set()
@@ -982,38 +1083,43 @@ def main(argv=None) -> None:
                               traps[t % len(traps)] if traps else None, args.orders, opponents))
     print(f"{len(hands)} hands to search ({len(done)} done)", flush=True)
     began = time.perf_counter()
-    lock = threading.Lock()
+    failed = []
     with ThreadPoolExecutor(max(1, args.workers)) as pool, open(p["lines"], "a", encoding="utf-8") as lines_out, \
-            open(p["hands"], "a", encoding="utf-8") as hands_out:
-        futures = [pool.submit(search_hand, hand, net, settings, center, is_extra) for hand in hands]
-        for n, future in enumerate(futures):
+            open(p["hands"], "a", encoding="utf-8") as hands_out, \
+            open(p["rollouts"], "a", encoding="utf-8") as rollouts_out:
+        futures = {pool.submit(search_hand, hand, net, settings, center, is_extra): hand for hand in hands}
+        for n, future in enumerate(as_completed(futures)):  # written as they finish
+            hand = futures[future]
             try:
                 records, stats = future.result()
-            except Exception as error:  # one broken hand must not stop the run
-                print(f"{n + 1}/{len(futures)} error {str(error)[:160]}", flush=True)
+            except Exception as error:  # one broken hand must not stop the run; it is retried on --resume
+                failed.append(hand.id)
+                print(f"{n + 1}/{len(futures)} {hand.id} error {str(error)[:160]}", flush=True)
                 continue
-            with lock:
-                for record in records:
-                    record["search"].pop("validate_raw", None)
-                    record["search"].pop("score_raw", None)
-                    lines_out.write(json.dumps(record) + "\n")
-                lines_out.flush()
-                raw = [{"hand": stats["hand"], "branch": branch, **r} for branch in ("base", "trap")
-                       for key in ("score_raw", "validate_raw") for r in (stats.get(branch) or {}).pop(key, [])]
-                if raw:
-                    with open(p["rollouts"], "a", encoding="utf-8") as rollouts_out:
-                        rollouts_out.write("".join(json.dumps(r) + "\n" for r in raw))
-                hands_out.write(json.dumps(stats) + "\n")
-                hands_out.flush()
+            raw = [{"hand": stats["hand"], "branch": branch, **r} for branch in ("base", "trap")
+                   for key in ("score_raw", "validate_raw") for r in (stats.get(branch) or {}).pop(key, [])]
+            # each file in one write: a crash tears at most its last line (read_jsonl skips it); the
+            # hand's stats come last, so a hand counts as done only with its lines and rollouts
+            lines_out.write("".join(json.dumps(record) + "\n" for record in records))
+            lines_out.flush()
+            rollouts_out.write("".join(json.dumps(r) + "\n" for r in raw))
+            rollouts_out.flush()
+            hands_out.write(json.dumps(stats) + "\n")
+            hands_out.flush()
             b = stats["base"]
             score = f"score {b.get('score')} (own {b.get('own_score')}) " if b.get("scorer") else ""
             print(f"{n + 1}/{len(futures)} {stats['hand']} value {b.get('value')} (own {b.get('own_value')}) {score}"
-                  f"field {b.get('field0')} (own {b.get('own_field0')}) pick {b.get('pick')} "
-                  f"trap {card_name.get(hands[n].trap, '-')[:12]} lines {len(records)} {b.get('seconds')}s "
+                  f"gain {b.get('gain')} field {b.get('field0')} (own {b.get('own_field0')}) pick {b.get('pick')} "
+                  f"trap {card_name.get(hand.trap, '-')[:12]} lines {len(records)} {b.get('seconds')}s "
                   f"[{time.perf_counter() - began:.0f}s, {evaluator.rows / max(1, evaluator.calls):.1f} rows/call]",
                   flush=True)
     evaluator.close()
-    print(json.dumps(build(args.out, args.deck, args.opponent, meta, args.min_gain)), flush=True)
+    print(json.dumps(build(args.out, args.deck, args.opponent, meta, args.min_gain, args.min_gain_se)), flush=True)
+    if failed:  # not "done": the driver (or a rerun with --resume) retries these hands
+        p["failed"].write_text(json.dumps(failed) + "\n", encoding="utf-8")
+        print(f"{len(failed)} hands failed: {failed[:10]}", flush=True)
+        raise SystemExit(FAILED_HANDS)
+    p["failed"].unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
