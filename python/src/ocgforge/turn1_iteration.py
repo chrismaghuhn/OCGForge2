@@ -90,6 +90,9 @@ def search_cmd(args, deck: Path, deck_type: str, book: Path, first: int, hands: 
              "--score", args.score, "--rollouts", str(args.rollouts), "--mix-weight", str(args.mix_weight),
              "--t2-cap", str(args.t2_cap), "--validate", str(args.validate), "--gain-orders", str(args.gain_orders),
              "--gain-rollouts", str(args.gain_rollouts), "--resume", "--out", str(book)]
+            + (["--race", "--race-k1", str(args.race_k1), "--race-k2", str(args.race_k2), "--race-se", str(args.race_se),
+                "--race-frac", str(args.race_frac), "--race-margin", str(args.race_margin), "--race-c", str(args.race_c)]
+               if args.race else [])
             + (["--opponents-file", str(args.opponents_file)] if args.opponents_file else [])
             + (gain_args(args) if min_gain else []))
 
@@ -320,6 +323,13 @@ def main(argv=None) -> None:
     p.add_argument("--envs", type=int, default=512, help="teach self-play envs")
     p.add_argument("--teach-seed", type=int, default=100, help="seed of teach segment 0 (the control used 100)")
     p.add_argument("--min-gain-se", type=float, default=None, help="turn1_search --min-gain-se")
+    p.add_argument("--race", action="store_true", help="turn1_search --race (racing, with the --race-* settings)")
+    p.add_argument("--race-k1", type=int, default=8)
+    p.add_argument("--race-k2", type=int, default=16)
+    p.add_argument("--race-se", type=float, default=2.0)
+    p.add_argument("--race-frac", type=float, default=0.75)
+    p.add_argument("--race-margin", type=float, default=0.0)
+    p.add_argument("--race-c", type=float, default=1.0)
     p.add_argument("--gain-orders", type=int, default=8, help="turn1_search --gain-orders")
     p.add_argument("--gain-rollouts", type=int, default=1, help="turn1_search --gain-rollouts")
     p.add_argument("--min-gain", type=float, default=0.1,

@@ -598,6 +598,13 @@ class Settings:
     validate_chunk: int = 6  # scenarios scored at a time (turn-2 duels held in memory)
     gain_orders: int = 8  # further scenarios the kept line's gain over the own line is measured in
     gain_rollouts: int = 1  # turn-2 rollouts per scenario there
+    race: bool = False  # racing instead of K x M grading (see `race`)
+    race_k1: int = 8  # stage-1 scenarios (every candidate)
+    race_k2: int = 16  # scenarios in all for the stage-2 survivors and the own line
+    race_se: float = 2.0  # dropped when the stage-1 best leads by more than this many standard errors
+    race_frac: float = 0.75  # ... or leads in at least this share of the scenarios
+    race_margin: float = 0.0  # ... with a mean lead above this
+    race_c: float = 1.0  # the gain over the own line counts above this many standard errors
 
 
 def categories(cands: list[dict], positions: list[tuple], best: int, own: int | None) -> dict:
@@ -648,6 +655,85 @@ def paired_gain(kept: list[Play], own: list[Play]) -> dict:
             "gain_n": len(diffs)}
 
 
+def complete(row: list[Play]) -> bool:
+    return bool(row) and all(not p.error and p.score is not None for p in row)
+
+
+def diffs(a: list[Play], b: list[Play]) -> list[float]:
+    """Paired scenario differences score(a) - score(b) (both complete rows over the same scenarios)."""
+    return [x.score - y.score for x, y in zip(a, b)]
+
+
+def mean_se(values: list[float]) -> tuple[float, float | None]:
+    m = statistics.fmean(values)
+    return m, (statistics.stdev(values) / len(values) ** 0.5 if len(values) > 1 else None)
+
+
+def race(candidates: list[list[str]], own_index: int | None, hand: Hand, trap: int | None, net: Net, ctx: Ctx,
+         s: Settings, tag: str) -> tuple[list[list[Play]], int | None, dict]:
+    """Racing (`s.race`), all with 1 rollout per scenario, common seeds and engine seeds per scenario:
+    1. every candidate (the own line included) in scenarios 1..K1 (the beam's is 0);
+    2. a candidate is dropped when the stage-1 best beats it clearly: its mean paired difference is
+       above `race_se` standard errors, or at least `race_frac` of the differences are positive and
+       their mean is above `race_margin` (deterministic); the survivors and the own line go on in
+       scenarios K1+1..K2;
+    3. the kept line is the survivor with the best mean over all K2 scenarios; its gain over the own
+       line is measured on the stage-2 scenarios alone (not used to drop anyone), and it counts
+       (`gain_ok`) when above `race_c` standard errors.
+    Returns (rows per candidate: stage 1, plus stage 2 for those that went on; kept index; stats)."""
+    def starts(ks):
+        out = [start() for _, _, start in (hand.start(k, trap) for k in ks)]
+        return None if any(d is None for d in out) else out
+
+    first = starts(range(1, s.race_k1 + 1))
+    second = starts(range(s.race_k1 + 1, s.race_k2 + 1))
+    info = {"k1": s.race_k1, "k2": s.race_k2, "stage1": len(candidates)}
+    if first is None or second is None or not second:
+        return [[] for _ in candidates], None, {**info, "error": "scenario"}
+    rows = scored(candidates, first, net, ctx, s, tag, 1, 1)
+    ok = [i for i, row in enumerate(rows) if complete(row)]
+    if not ok:
+        return rows, None, {**info, "error": "no line"}
+    means = {i: statistics.fmean(p.score for p in rows[i]) for i in ok}
+    lead = max(ok, key=lambda i: (means[i], -i))
+    survivors = [lead]
+    for i in ok:
+        if i == lead:
+            continue
+        d = diffs(rows[lead], rows[i])
+        m, se = mean_se(d)
+        clear = (se is not None and m > s.race_se * se) or \
+            (sum(x > 0 for x in d) >= s.race_frac * len(d) and m > s.race_margin)
+        if not clear:
+            survivors.append(i)
+    go_on = sorted(set(survivors) | ({own_index} if own_index in ok else set()))
+    for i, row in zip(go_on, scored([candidates[i] for i in go_on], second, net, ctx, s, tag, s.race_k1 + 1, 1)):
+        rows[i] = rows[i] + row
+    full = [i for i in survivors if complete(rows[i]) and len(rows[i]) == s.race_k2]
+    if not full:
+        return rows, None, {**info, "stage2": len(survivors), "error": "no line"}
+    total = {i: statistics.fmean(p.score for p in rows[i]) for i in full}
+    best = max(full, key=lambda i: (total[i], -i))
+    info["stage2"] = len(survivors)
+    rivals = [i for i in full if i != best]
+    if rivals:  # the decision among the survivors, over all K2 scenarios
+        second_best = max(rivals, key=lambda i: (total[i], -i))
+        m, se = mean_se(diffs(rows[best], rows[second_best]))
+        info.update(margin=round(m, 4), margin_se=round(se, 4) if se is not None else None,
+                    noise=se is not None and m < s.race_se * se)
+    else:  # nobody survived stage 1 against it
+        others = [i for i in ok if i != best]
+        info.update(margin=round(means[best] - max(means[i] for i in others), 4) if others else None,
+                    margin_se=None, noise=False)
+    if best == own_index:
+        info.update(gain=0.0, gain_se=None, gain_n=0, gain_ok=False)
+    elif own_index is not None and complete(rows[own_index]) and len(rows[own_index]) == s.race_k2:
+        m, se = mean_se(diffs(rows[best][s.race_k1:], rows[own_index][s.race_k1:]))
+        info.update(gain=round(m, 4), gain_se=round(se, 4) if se is not None else None,
+                    gain_n=s.race_k2 - s.race_k1, gain_ok=se is not None and m > s.race_c * se)
+    return rows, best, info
+
+
 def search_branch(hand: Hand, trap: int | None, net: Net, s: Settings, center: set, is_extra,
                   base: list[str] | None = None) -> tuple[dict | None, dict, list[str]]:
     """One branch of a hand: the base (trap None) or the interruption by `trap` after the base
@@ -691,8 +777,13 @@ def search_branch(hand: Hand, trap: int | None, net: Net, s: Settings, center: s
             candidates.append(own_line)
         own_index = candidates.index(own_line)
     turn2 = s.scorer != "value"
-    plays = scored(candidates, grade, net, ctx, s, tag, 1)
-    best = pick(plays)
+    if s.race:
+        plays, best, race_info = race(candidates, own_index, hand, trap, net, ctx, s, tag)
+        stats["race"] = {k: v for k, v in race_info.items() if not k.startswith("gain")}
+        stats.update({k: v for k, v in race_info.items() if k.startswith("gain")})
+    else:
+        plays = scored(candidates, grade, net, ctx, s, tag, 1)
+        best = pick(plays)
     stats.update(finished=len(lines), candidates=len(candidates), seconds=round(time.perf_counter() - began, 1),
                  own_value=mean(p.value for p in own if not p.error), own_field=mean(p.on_field for p in own if not p.error),
                  own_value0=own[0].value, own_field0=own[0].on_field)
@@ -704,7 +795,8 @@ def search_branch(hand: Hand, trap: int | None, net: Net, s: Settings, center: s
                            **{key: mean(p.t2.get(key) for p in r if not p.error and p.t2.get(key) is not None)
                               for key in ("lost", "won", "field3", "lp", "opp_lp", "capped", "decisions")}}
                           for r in plays]
-        value_index = pick(plays, "value")
+        value_index = pick(plays, "value") if not s.race else \
+            pick([row[:s.race_k1] for row in plays], "value")
         same = lambda i, j: None if i is None or j is None else [p.sig for p in plays[i]] == [p.sig for p in plays[j]]  # noqa: E731
         stats.update(scorer=s.scorer, own_index=own_index, best_index=best, value_index=value_index,
                      own_score=stats["cands"][own_index]["score"] if own_index is not None else None,
@@ -742,7 +834,9 @@ def search_branch(hand: Hand, trap: int | None, net: Net, s: Settings, center: s
     if best is None:
         return None, {**stats, "error": "no line"}, []
     # The gain over the net's own line, on independent scenarios and seeds (the same for value and turn2)
-    if best == own_index:
+    if s.race:
+        pass  # measured on the race's stage-2 scenarios
+    elif best == own_index:
         stats.update(gain=0.0, gain_se=None, gain_n=0)
     elif own_line is not None and s.gain_orders > 0:
         first = hand.orders + 1
@@ -873,7 +967,10 @@ def keeps(record: dict, min_gain: float, min_gain_se: float | None = None) -> bo
     g = gains(record)
     if g is None or g <= min_gain:
         return False
-    se = (record.get("search") or {}).get("gain_se")
+    search = record.get("search") or {}
+    if min_gain_se is None and "gain_ok" in search:  # racing decided it on its stage-2 scenarios
+        return bool(search["gain_ok"])
+    se = search.get("gain_se")
     return min_gain_se is None or se is None or g > min_gain_se * se
 
 
@@ -1014,6 +1111,16 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--gain-orders", type=int, default=8,
                    help="further scenarios (fresh seeds) the kept line's gain over the own line is measured in")
     p.add_argument("--gain-rollouts", type=int, default=1, help="turn-2 rollouts per scenario there")
+    p.add_argument("--race", action="store_true",
+                   help="racing instead of --orders x --rollouts: every candidate in --race-k1 scenarios x 1 rollout, "
+                        "the close ones (and the own line) up to --race-k2")
+    p.add_argument("--race-k1", type=int, default=8)
+    p.add_argument("--race-k2", type=int, default=16)
+    p.add_argument("--race-se", type=float, default=2.0, help="stage 1 drops what the best beats by this many SE")
+    p.add_argument("--race-frac", type=float, default=0.75,
+                   help="... or beats in this share of the scenarios with a mean lead above --race-margin")
+    p.add_argument("--race-margin", type=float, default=0.0)
+    p.add_argument("--race-c", type=float, default=1.0, help="the gain over the own line counts above c SE")
     p.add_argument("--build-only", action="store_true", help="build book and report from the lines")
     p.add_argument("--out", type=Path, required=True, help="book (JSON lines); lines, hands, meta, report beside it")
     return p.parse_args(argv)
@@ -1066,7 +1173,8 @@ def main(argv=None) -> None:
     settings = Settings(args.beam, args.branch, args.alpha, args.candidates, args.max_choices, args.score,
                         args.rollouts, args.mix_weight, args.t2_cap, args.validate,
                         args.validate_orders, args.log_rollouts, args.validate_categories, args.validate_chunk,
-                        args.gain_orders, args.gain_rollouts)
+                        args.gain_orders, args.gain_rollouts, args.race, args.race_k1, args.race_k2, args.race_se,
+                        args.race_frac, args.race_margin, args.race_c)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     p = paths(args.out)
     done = done_hands(args.out) if args.resume else set()
@@ -1108,8 +1216,10 @@ def main(argv=None) -> None:
             hands_out.flush()
             b = stats["base"]
             score = f"score {b.get('score')} (own {b.get('own_score')}) " if b.get("scorer") else ""
+            race_note = f"race {b['race'].get('stage2')}/{b['race'].get('stage1')} noise {b['race'].get('noise')} " \
+                if b.get("race") else ""
             print(f"{n + 1}/{len(futures)} {stats['hand']} value {b.get('value')} (own {b.get('own_value')}) {score}"
-                  f"gain {b.get('gain')} field {b.get('field0')} (own {b.get('own_field0')}) pick {b.get('pick')} "
+                  f"gain {b.get('gain')} {race_note}field {b.get('field0')} (own {b.get('own_field0')}) pick {b.get('pick')} "
                   f"trap {card_name.get(hand.trap, '-')[:12]} lines {len(records)} {b.get('seconds')}s "
                   f"[{time.perf_counter() - began:.0f}s, {evaluator.rows / max(1, evaluator.calls):.1f} rows/call]",
                   flush=True)

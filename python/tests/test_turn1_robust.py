@@ -174,3 +174,55 @@ def test_the_gain_is_measured_apart_from_the_grading():
     record = {"search": {"gain": 0.2, "gain_se": 0.15, "score": 0.9, "own_score": 0.1, "scorer": "turn2"}}
     assert ts.gains(record) == 0.2  # not the grading's 0.8
     assert ts.keeps(record, 0.1) and not ts.keeps(record, 0.1, min_gain_se=2.0) and not ts.keeps(record, 0.25)
+
+
+def test_racing_end_to_end_on_the_toy():
+    from test_turn1_search import net as toy_net, toy_hand
+
+    s = ts.Settings(beam=4, branch=3, scorer="turn2", race=True, race_k1=4, race_k2=8)
+    records, stats = ts.search_hand(toy_hand(), toy_net(), s, set(), lambda c: False)
+    b = stats["base"]
+    race = b["race"]
+    assert race["k1"] == 4 and race["k2"] == 8 and race["stage1"] == b["candidates"] >= race["stage2"] >= 1
+    # the sure line (summon both, +0.2 over ending the turn) in every scenario: no noise
+    assert b["gain"] == pytest.approx(0.2) and b["gain_n"] == 4 and b["gain_ok"] is True
+    assert ts.keeps(records[0], 0.1) and not ts.keeps({**records[0], "search": {**b, "gain_ok": False}}, 0.1)
+    assert {r["k"] for r in b["score_raw"]} == set(range(1, 9))  # the long-format log covers both stages
+
+
+class Fixed(ts.Hand):
+    def start(self, k, trap=None):
+        return "", k, lambda: object()
+
+
+def test_racing_drops_the_clearly_beaten_and_measures_the_gain_on_stage_two(monkeypatch):
+    k1, k2 = 8, 16
+    table = {  # candidate -> score in scenario k (1..16)
+        "A": [0.5] * 16,
+        "B": [0.6, 0.4] * 8,  # as good as A on average, noisy: survives
+        "C": [0.2] * 16,  # beaten in every scenario: dropped after stage 1
+        "own": [0.1] * 8 + [0.3] * 8,
+    }
+    calls = []
+
+    def scored(candidates, starts, net, ctx, s, tag, k_first, rollouts=None, scorer=None):
+        calls.append(([c[0] for c in candidates], k_first, len(starts)))
+        rows = []
+        for c in candidates:
+            row = []
+            for i in range(len(starts)):
+                p = ts.Play([], [], None, [])
+                p.score = p.value = table[c[0]][k_first + i - 1]
+                row.append(p)
+            rows.append(row)
+        return rows
+    monkeypatch.setattr(ts, "scored", scored)
+    hand = Fixed("h", Path("x.ydk"), "X", Path("o.ydk"), ([], []), [], [], None, 4)
+    s = ts.Settings(race=True, race_k1=k1, race_k2=k2)
+    rows, best, info = ts.race([["A"], ["B"], ["C"], ["own"]], 3, hand, None, None, None, s, "t")
+    assert calls == [(["A", "B", "C", "own"], 1, 8), (["A", "B", "own"], 9, 8)]  # C dropped, own goes on
+    assert info["stage1"] == 4 and info["stage2"] == 2 and len(rows[2]) == k1 and len(rows[0]) == k2
+    assert best == 0  # A and B tie on the mean: the earlier
+    assert info["noise"] is True and info["margin"] == pytest.approx(0.0)
+    # the gain over the own line on the stage-2 scenarios only (own scores 0.3 there, not its 0.1 of stage 1)
+    assert info["gain"] == pytest.approx(0.2) and info["gain_n"] == 8 and info["gain_ok"] is True
