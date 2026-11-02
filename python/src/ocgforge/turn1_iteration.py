@@ -183,7 +183,7 @@ def chosen(book: Path, args) -> Path:
 
 def teach(args, books: list[Path]) -> None:
     """teach --book `books` (none: the control, plain distillation) into <out>/student (<out>/ctrl)."""
-    out = args.out / ("student" if books else "ctrl")
+    out = args.out / (args.teach_dir or ("student" if books else "ctrl"))
     out.mkdir(parents=True, exist_ok=True)
     state_path = out / "driver.json"
     state = json.loads(state_path.read_text()) if state_path.exists() else {"done": 0, "segment": 0}
@@ -245,6 +245,9 @@ def main(argv=None) -> None:
     p.add_argument("--min-gain", type=float, default=0.1,
                    help="imitate only lines beating the net's own line by more than this (mean value); negative: all")
     p.add_argument("--search-only", action="store_true")
+    p.add_argument("--book-files", type=Path, nargs="+",
+                   help="teach with these books (built elsewhere, e.g. merged search runs) instead of searching")
+    p.add_argument("--teach-dir", help="teach into <out>/<this> (default: student, or ctrl with --control)")
     p.add_argument("--control", action="store_true",
                    help="the control instead: the same teach rounds and seeds without a book, into <out>/ctrl")
     args = p.parse_args(argv)
@@ -253,6 +256,9 @@ def main(argv=None) -> None:
         args.min_gain = None
     if args.control:
         teach(args, [])
+        return
+    if args.book_files:
+        teach(args, [p.resolve() for p in args.book_files])
         return
     books = []
     for spec in args.books:
