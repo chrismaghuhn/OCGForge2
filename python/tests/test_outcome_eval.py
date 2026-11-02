@@ -238,4 +238,17 @@ def test_validation_can_log_every_rollout_in_its_own_scenarios():
     assert lines == {"kept", "value_kept", "own"}
     kept = [r for r in raw if r["line"] == "kept"]
     assert sorted({r["k"] for r in kept}) == list(range(6)) and sorted({r["j"] for r in kept}) == [0, 1, 2]
-    assert len(kept) == 18 and all({"score", "lost", "won"} <= set(r) for r in kept)
+    assert len(kept) == 18 and all({"score", "lost", "won", "early", "seed"} <= set(r) for r in kept)
+    own = {(r["k"], r["j"]): r["seed"] for r in raw if r["line"] == "own"}
+    assert all(own[(r["k"], r["j"])] == r["seed"] for r in kept)  # common random numbers: same seed per (k, j)
+    assert stats["base"]["score_raw"] and {r["phase"] for r in stats["base"]["score_raw"]} == {"score"}
+
+
+def test_categories_pick_other_positions():
+    cands = [{"score": 0.5, "lost": 0.0, "field": 4}, {"score": 0.4, "lost": 0.3, "field": 3},
+             {"score": 0.3, "lost": 0.0, "field": 6}, {"score": 0.2, "lost": 0.0, "field": 2},
+             {"score": 0.5, "lost": 0.0, "field": 4}]
+    positions = [("a",), ("b",), ("c",), ("d",), ("a",)]
+    out = ts.categories(cands, positions, best=0, own=3)
+    assert out == {"mid": 2, "fragile": 1, "big": 2}
+    assert ts.categories(cands[:1], positions[:1], best=0, own=0) == {"mid": None, "fragile": None, "big": None}

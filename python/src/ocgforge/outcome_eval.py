@@ -56,11 +56,12 @@ def end_stats(duel) -> dict:
     """What turn 2 left: lost/won in turn 2, our field cards, both life points."""
     if duel.finished:
         lost, won = duel.winner == 1, duel.winner == 0
-        return {"lost": lost, "won": won, "field": 0, "lp": 0 if lost else None, "opp_lp": 0 if won else None}
+        return {"lost": lost, "won": won, "finished": True, "field": 0, "lp": 0 if lost else None,
+                "opp_lp": 0 if won else None}
     snap = duel.snapshot()
     ours = sum(c["controller"] == 0 and c["location"] in FIELD for c in snap["cards"])
     lp = list(snap["life_points"])
-    return {"lost": False, "won": False, "field": ours, "lp": lp[0], "opp_lp": lp[1]}
+    return {"lost": False, "won": False, "finished": False, "field": ours, "lp": lp[0], "opp_lp": lp[1]}
 
 
 def play_turn2(duels: list, net, rollouts: int, seeds: list, max_decisions: int = 250) -> list[list[Rollout]]:

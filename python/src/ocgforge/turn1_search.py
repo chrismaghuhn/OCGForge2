@@ -405,12 +405,13 @@ def position(duel) -> tuple:
     return cards, tuple(snap["life_points"]), duel.turn, duel.phase, duel.player, tuple(duel.keys())
 
 
-def score_turn2(plays: list[list[Play]], net: Net, s: "Settings", tag: str) -> None:
+def score_turn2(plays: list[list[Play]], net: Net, s: "Settings", tag: str, k_offset: int = 0) -> None:
     """The turn-2 scorer (`s.scorer` turn2 or mix): every play kept at the end of turn 1 (judge
     with keep) gets M = `s.rollouts` sampled turn 2s (outcome_eval.play_turn2, all plays in one
     lockstep), its outcome stats (`t2`) and its score. Rollouts of scenario k use the same seeds for
     every candidate; candidates that reach the same position in a scenario (`position`: lines that
-    differ only in the order of answers) share its rollouts. Frees the duels."""
+    differ only in the order of answers) share its rollouts. Column k of `plays` is scenario
+    k + `k_offset` (its seeds). Frees the duels."""
     flat = [(k, p) for row in plays for k, p in enumerate(row) if not p.error and p.duel is not None]
     if s.scorer != "value" and flat:
         groups: dict = {}
@@ -421,10 +422,12 @@ def score_turn2(plays: list[list[Play]], net: Net, s: "Settings", tag: str) -> N
                 p.sig = ("unique", id(p))
             groups.setdefault((k, p.sig), []).append(p)
         firsts = [(key[0], members[0]) for key, members in groups.items()]
-        outs = oe.play_turn2([p.duel for _, p in firsts], net, s.rollouts, [f"{tag}-k{k}" for k, _ in firsts], s.t2_cap)
-        for members, rollouts in zip(groups.values(), outs):
+        outs = oe.play_turn2([p.duel for _, p in firsts], net, s.rollouts, [f"{tag}-k{k + k_offset}" for k, _ in firsts], s.t2_cap)
+        for (k, _), members, rollouts in zip(firsts, groups.values(), outs):
             t2 = oe.summary(rollouts)
-            raw = [{"j": j, "score": r.value, "lost": r.stats.get("lost"), "won": r.stats.get("won"),
+            # one row per rollout (long format); early: the duel was decided (+-1), else a value estimate
+            raw = [{"k": k + k_offset, "j": j, "seed": f"{tag}-k{k + k_offset}-{j}", "score": r.value,
+                    "early": bool(r.stats.get("finished")), "lost": r.stats.get("lost"), "won": r.stats.get("won"),
                     "capped": r.capped} for j, r in enumerate(rollouts) if not r.error and r.value is not None]
             for p in members:
                 p.t2, p.raw = t2, raw
@@ -576,7 +579,27 @@ class Settings:
     t2_cap: int = 250  # sampled decisions per turn-2 rollout at most
     validate: int = 0  # >0: fresh turn-2 rollouts (this many) of the kept, value-kept and own line
     validate_orders: int = 0  # >0: the validation plays this many scenarios (default: the search's K)
-    log_rollouts: bool = False  # keep every validation rollout (written to <out>-rollouts.jsonl)
+    log_rollouts: bool = False  # keep every rollout (written to <out>-rollouts.jsonl)
+    validate_categories: bool = False  # also validate a mid-ranked, a fragile and a big-board candidate
+    validate_chunk: int = 6  # validation scenarios at a time
+
+
+def categories(cands: list[dict], positions: list[tuple], best: int, own: int | None) -> dict:
+    """Further lines to validate against the own line, each a position other than the kept and the
+    own line's: "mid" (the middle of the others by score), "fragile" (the others' highest turn-2 loss
+    rate, if any loses) and "big" (the others' biggest field after turn 1, if bigger than the kept)."""
+    taken = {positions[best]} | ({positions[own]} if own is not None else set())
+    others, seen = [], set(taken)
+    for i in sorted(range(len(cands)), key=lambda i: -(cands[i]["score"] if cands[i]["score"] is not None else -9)):
+        if positions[i] not in seen and cands[i]["score"] is not None:
+            seen.add(positions[i])
+            others.append(i)
+    out = {"mid": others[len(others) // 2] if others else None}
+    fragile = max(others, key=lambda i: cands[i].get("lost") or 0, default=None)
+    out["fragile"] = fragile if fragile is not None and (cands[fragile].get("lost") or 0) > 0 else None
+    big = max(others, key=lambda i: cands[i].get("field") or 0, default=None)
+    out["big"] = big if big is not None and (cands[big].get("field") or 0) > (cands[best].get("field") or 0) else None
+    return out
 
 
 def search_branch(hand: Hand, trap: int | None, net: Net, s: Settings, center: set, is_extra,
@@ -636,27 +659,42 @@ def search_branch(hand: Hand, trap: int | None, net: Net, s: Settings, center: s
                      # the same positions after turn 1 in every scenario: the lines differ in order only
                      same_as_value=same(best, value_index), same_as_own=same(best, own_index),
                      value_same_as_own=same(value_index, own_index))
+        if s.log_rollouts:  # the scoring rollouts in long format: candidate i, scenario k, rollout j
+            stats["score_raw"] = [{"phase": "score", "cand": i, "line": "kept" if i == best else "own" if i == own_index
+                                   else f"c{i}", **r} for i, row in enumerate(plays) for p in row if not p.error
+                                  for r in p.raw]
+        scores = [c["score"] for c in stats["cands"]]
+        others = [x for i, x in enumerate(scores) if i != best and x is not None and x != scores[best]]
+        stats["margin"] = round(scores[best] - max(others), 4) if best is not None and others and scores[best] is not None \
+            else None
         if s.validate and best is not None:
-            # fresh rollouts (other seeds) of the kept, the value scorer's and the net's own line:
-            # the scores above chose the line, so they flatter it; these do not
+            # fresh rollouts (other seeds) of the kept, the value scorer's and the net's own line (and with
+            # `validate_categories` a mid-ranked, a fragile and a big-board candidate): the scores above
+            # chose the line, so they flatter it; these do not
             picks = {"kept": best, "value_kept": value_index, "own": own_index}
+            if s.validate_categories:
+                picks.update(categories(stats["cands"], [tuple(p.sig for p in row) for row in plays], best, own_index))
             chosen = sorted({i for i in picks.values() if i is not None})
-            checks = starts
-            if s.validate_orders:  # m scenarios of their own (the first K are the search's deck orders)
-                checks = [start() for _, _, start in (hand.start(k, trap) for k in range(s.validate_orders))]
-                checks = [d for d in checks if d is not None]
-            again = judge([candidates[i] for i in chosen], checks, net, lambda k: ctx, keep=True)
-            score_turn2(again, net, Settings(scorer="turn2", rollouts=s.validate, t2_cap=s.t2_cap),
-                        f"{hand.id}-{trap or 'base'}-validate")
-            fresh = {i: oe.summary_of([p.t2 for p in row if not p.error and p.t2]) for i, row in zip(chosen, again)}
+            orders = s.validate_orders or len(starts)
+            rows = {i: [] for i in chosen}
+            for first in range(0, orders, s.validate_chunk):  # a few scenarios at a time: memory
+                ks = range(first, min(orders, first + s.validate_chunk))
+                checks = [start() for _, _, start in (hand.start(k, trap) for k in ks)] if s.validate_orders \
+                    else [starts[k] for k in ks]
+                if any(d is None for d in checks):
+                    continue
+                again = judge([candidates[i] for i in chosen], checks, net, lambda k: ctx, keep=True)
+                score_turn2(again, net, Settings(scorer="turn2", rollouts=s.validate, t2_cap=s.t2_cap),
+                            f"{hand.id}-{trap or 'base'}-validate", k_offset=first)
+                for i, row in zip(chosen, again):
+                    rows[i] += row
+            fresh = {i: oe.summary_of([p.t2 for p in row if not p.error and p.t2]) for i, row in rows.items()}
             if s.log_rollouts:  # every single rollout (scenario k, rollout j: the same seeds for every line)
-                stats["validate_raw"] = [{"line": name, "k": k, **r}
+                stats["validate_raw"] = [{"phase": "validate", "line": name, "cand": i, **r}
                                          for name, i in picks.items() if i is not None
-                                         for k, p in enumerate(again[chosen.index(i)]) if not p.error for r in p.raw]
-            scores = [c["score"] for c in stats["cands"]]
-            others = [x for i, x in enumerate(scores) if i != best and x is not None and x != scores[best]]
-            stats["margin"] = round(scores[best] - max(others), 4) if others and scores[best] is not None else None
+                                         for p in rows[i] if not p.error for r in p.raw]
             stats["validate"] = {name: fresh[i] for name, i in picks.items() if i is not None}
+            stats["validate_picks"] = picks
     if best is None:
         return None, {**stats, "error": "no line"}, []
     row = plays[best]
@@ -848,8 +886,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--validate", type=int, default=0,
                    help="fresh turn-2 rollouts per scenario of the kept, value-kept and own line (unbiased check)")
     p.add_argument("--validate-orders", type=int, default=0, help="scenarios of the validation (0: the search's K)")
-    p.add_argument("--log-rollouts", action="store_true",
-                   help="write every validation rollout to <out stem>-rollouts.jsonl (hand, line, k, j, score, lost, won)")
+    p.add_argument("--log-rollouts", action=argparse.BooleanOptionalAction, default=True,
+                   help="write every turn-2 rollout (scoring and validation) to <out stem>-rollouts.jsonl, one row each: "
+                        "hand, branch, phase, line, candidate, scenario k, rollout j, seed, score, early (decided), lost, won")
+    p.add_argument("--validate-categories", action="store_true",
+                   help="also validate a mid-ranked, a fragile and a big-board candidate against the own line")
+    p.add_argument("--validate-chunk", type=int, default=6, help="validation scenarios at a time (memory)")
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--hands", type=int, default=200)
     p.add_argument("--first-hand", type=int, default=0)
@@ -923,7 +965,7 @@ def main(argv=None) -> None:
     net = Net(evaluator, model.card_features.index_map())
     settings = Settings(args.beam, args.branch, args.alpha, args.candidates, args.max_choices, args.score,
                         args.rollouts, args.mix_weight, args.t2_cap, args.validate,
-                        args.validate_orders, args.log_rollouts)
+                        args.validate_orders, args.log_rollouts, args.validate_categories, args.validate_chunk)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     p = paths(args.out)
     done = done_hands(args.out) if args.resume else set()
@@ -953,10 +995,11 @@ def main(argv=None) -> None:
             with lock:
                 for record in records:
                     record["search"].pop("validate_raw", None)
+                    record["search"].pop("score_raw", None)
                     lines_out.write(json.dumps(record) + "\n")
                 lines_out.flush()
                 raw = [{"hand": stats["hand"], "branch": branch, **r} for branch in ("base", "trap")
-                       for r in (stats.get(branch) or {}).pop("validate_raw", [])]
+                       for key in ("score_raw", "validate_raw") for r in (stats.get(branch) or {}).pop(key, [])]
                 if raw:
                     with open(p["rollouts"], "a", encoding="utf-8") as rollouts_out:
                         rollouts_out.write("".join(json.dumps(r) + "\n" for r in raw))
