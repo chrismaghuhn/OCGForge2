@@ -542,6 +542,17 @@ def random_hand(decklist: tuple, run_seed: int, deck: Path, t: int) -> list[int]
     return main[:HAND_SIZE]
 
 
+def read_traps(path: Path) -> dict[int, set[int]]:
+    """Hand-trap rules from a --traps-file: JSON {hand trap passcode: [choke-point passcodes]}."""
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    return {int(trap): {int(c) for c in chokes} for trap, chokes in raw.items()}
+
+
+def write_traps(path: Path, rules: dict[int, set[int]]) -> None:
+    """The resolved hand-trap rules (passcodes only) as a --traps-file."""
+    path.write_text(json.dumps({str(t): sorted(rules[t]) for t in sorted(rules)}) + "\n", encoding="utf-8")
+
+
 def trap_pool(rules: dict, card_name: dict, size: int) -> list[int]:
     """The hand traps of the branches: the deck's (counters data), in TRAP_ORDER, at most `size`."""
     rank = {name: i for i, name in enumerate(TRAP_ORDER)}
@@ -830,6 +841,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--candidates", type=int, default=4, help="best beam lines judged over the K orders")
     p.add_argument("--max-choices", type=int, default=120)
     p.add_argument("--traps", type=int, default=4, help="hand traps the branches rotate through (0: no branches)")
+    p.add_argument("--traps-file", type=Path,
+                   help="resolved hand-trap rules (JSON {trap passcode: [choke-point passcodes]}) instead of the "
+                        "counters data")
+    p.add_argument("--write-traps", type=Path, help="write the deck's resolved hand-trap rules there and exit")
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--torch-threads", type=int, default=1)
     p.add_argument("--device", default="cuda")
@@ -873,8 +888,15 @@ def main(argv=None) -> None:
             if line.strip() and not line.startswith("#"):
                 path = (rollout.REPO / line.strip()).resolve()
                 opponents.append((path, *worlds.read_decklist(path)))
-    resolve = sd.resolver(cb.name_index(table), set(decklist[0]) | set(decklist[1]), card_name)
-    rules = {t: v for t, v in sd.interruptions(args.deck_type, resolve).items() if card_name.get(t) in INTERRUPTERS}
+    if args.traps_file:
+        rules = read_traps(args.traps_file)
+    else:
+        resolve = sd.resolver(cb.name_index(table), set(decklist[0]) | set(decklist[1]), card_name)
+        rules = {t: v for t, v in sd.interruptions(args.deck_type, resolve).items()
+                 if card_name.get(t) in INTERRUPTERS}
+    if args.write_traps:
+        write_traps(args.write_traps, rules)
+        return
     traps = trap_pool(rules, card_name, args.traps)
     print(f"hand traps: {[card_name[t] for t in traps]}", flush=True)
     model = load_checkpoint(args.checkpoint, args.device, dropout=0.0)

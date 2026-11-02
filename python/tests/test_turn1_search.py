@@ -246,3 +246,20 @@ def test_gain_book_keeps_only_lines_that_beat_the_net(tmp_path, monkeypatch):
     assert gain.name == "toy-t1-gain.jsonl" and kept == ["t1-toy-0-0"]
     assert json.loads(ts.paths(gain)["meta"].read_text())["min_gain"] == 0.1
     assert len(gain.read_text().splitlines()) == report["gain"]["states"] > 0
+
+
+def test_traps_file_round_trips_passcodes_and_feeds_the_trap_pool(tmp_path):
+    rules = {14558127: {85976588, 42141493}, 97268402: set(), 10045474: {56651978}}
+    path = tmp_path / "traps.json"
+    ts.write_traps(path, rules)
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert raw == {"10045474": [56651978], "14558127": [42141493, 85976588], "97268402": []}  # passcodes only
+    assert ts.read_traps(path) == rules
+    names = {14558127: "Ash Blossom & Joyous Spring", 97268402: "Effect Veiler", 10045474: "Infinite Impermanence"}
+    assert ts.trap_pool(ts.read_traps(path), names, 4) == ts.trap_pool(rules, names, 4)
+
+
+def test_traps_file_is_an_option():
+    args = ts.parse_args(["--deck", "d.ydk", "--deck-type", "X", "--checkpoint", "c", "--out", "o.jsonl",
+                          "--traps-file", "t.json"])
+    assert args.traps_file == Path("t.json") and args.write_traps is None
