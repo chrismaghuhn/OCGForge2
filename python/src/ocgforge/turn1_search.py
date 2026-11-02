@@ -673,7 +673,8 @@ def race(candidates: list[list[str]], own_index: int | None, hand: Hand, trap: i
          s: Settings, tag: str) -> tuple[list[list[Play]], int | None, dict]:
     """Racing (`s.race`), all with 1 rollout per scenario, common seeds and engine seeds per scenario:
     1. every candidate (the own line included) in scenarios 1..K1 (the beam's is 0);
-    2. a candidate is dropped when the stage-1 best beats it clearly: its mean paired difference is
+    2. a candidate is dropped when it reaches the stage-1 best's positions in every scenario (the same
+       line in another order), or when the stage-1 best beats it clearly: its mean paired difference is
        above `race_se` standard errors, or at least `race_frac` of the differences are positive and
        their mean is above `race_margin` (deterministic); the survivors and the own line go on in
        scenarios K1+1..K2;
@@ -700,6 +701,8 @@ def race(candidates: list[list[str]], own_index: int | None, hand: Hand, trap: i
     for i in ok:
         if i == lead:
             continue
+        if all(x.sig is not None and x.sig == y.sig for x, y in zip(rows[lead], rows[i])):
+            continue  # the same positions as the lead (answers in another order): nothing to race
         d = diffs(rows[lead], rows[i])
         m, se = mean_se(d)
         clear = (se is not None and m > s.race_se * se) or \
@@ -1019,6 +1022,14 @@ def summarize(hands: list[dict]) -> dict:
             "reveals": mean(r["reveal_at"] is not None for r in kept),
             "diverged": mean(r["diverged"] for r in kept), "finished": mean(r["finished"] for r in kept),
             "seconds": mean(r["seconds"] for r in kept)}
+        raced = [r for r in kept if r.get("race")]
+        if raced:  # racing: how many lines went on, how often the choice was within the noise, gains that count
+            out[branch]["race"] = {"stage1": mean(r["race"].get("stage1") for r in raced),
+                                   "stage2": mean(r["race"].get("stage2") for r in raced),
+                                   "noise": mean(r["race"].get("noise") for r in raced),
+                                   "margin": mean(r["race"].get("margin") for r in raced),
+                                   "gain": mean(r.get("gain") for r in raced),
+                                   "gain_ok": mean(r.get("gain_ok") for r in raced)}
         scored = [r for r in kept if r.get("cands") and r.get("value_index") is not None]
         if scored:
             out[branch]["scorer"] = compare(scored)
