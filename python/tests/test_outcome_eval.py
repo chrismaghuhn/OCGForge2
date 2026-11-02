@@ -226,3 +226,16 @@ def test_validation_rescores_the_kept_lines_with_fresh_rollouts():
     assert set(check) == {"kept", "value_kept", "own"} and check["kept"]["t2"] == pytest.approx(stats["base"]["score"])
     out = ts.compare([stats["base"]])
     assert out["validate"]["kept"]["t2"] == pytest.approx(check["kept"]["t2"]) and out["validate_diff"] is None
+
+
+def test_validation_can_log_every_rollout_in_its_own_scenarios():
+    from test_turn1_search import net as toy_t1_net, toy_hand
+
+    s = ts.Settings(beam=4, branch=3, scorer="turn2", validate=3, validate_orders=6, log_rollouts=True)
+    _, stats = ts.search_hand(toy_hand(), toy_t1_net(), s, set(), lambda c: False)
+    raw = stats["base"]["validate_raw"]
+    lines = {r["line"] for r in raw}
+    assert lines == {"kept", "value_kept", "own"}
+    kept = [r for r in raw if r["line"] == "kept"]
+    assert sorted({r["k"] for r in kept}) == list(range(6)) and sorted({r["j"] for r in kept}) == [0, 1, 2]
+    assert len(kept) == 18 and all({"score", "lost", "won"} <= set(r) for r in kept)

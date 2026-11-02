@@ -323,6 +323,7 @@ class Play:
     score: float | None = None  # what `pick` ranks by: the value, or the scorer's (outcome_eval)
     t2: dict = field(default_factory=dict)  # turn-2 outcome stats (outcome_eval.summary)
     sig: object = None  # the position at the end of turn 1 (`position`; set by score_turn2)
+    raw: list = field(default_factory=list)  # every rollout of this play: j, score, lost, won (score_turn2)
 
 
 def play_out(plays: list[Play], net: Net, ctx_of, keep: bool = False) -> None:
@@ -423,8 +424,10 @@ def score_turn2(plays: list[list[Play]], net: Net, s: "Settings", tag: str) -> N
         outs = oe.play_turn2([p.duel for _, p in firsts], net, s.rollouts, [f"{tag}-k{k}" for k, _ in firsts], s.t2_cap)
         for members, rollouts in zip(groups.values(), outs):
             t2 = oe.summary(rollouts)
+            raw = [{"j": j, "score": r.value, "lost": r.stats.get("lost"), "won": r.stats.get("won"),
+                    "capped": r.capped} for j, r in enumerate(rollouts) if not r.error and r.value is not None]
             for p in members:
-                p.t2 = t2
+                p.t2, p.raw = t2, raw
                 p.score = oe.combine(s.scorer, p.value, t2["t2"], s.mix_weight)
     for row in plays:
         for p in row:
@@ -572,6 +575,8 @@ class Settings:
     mix_weight: float = 0.5  # mix: weight of the end-of-turn-1 value
     t2_cap: int = 250  # sampled decisions per turn-2 rollout at most
     validate: int = 0  # >0: fresh turn-2 rollouts (this many) of the kept, value-kept and own line
+    validate_orders: int = 0  # >0: the validation plays this many scenarios (default: the search's K)
+    log_rollouts: bool = False  # keep every validation rollout (written to <out>-rollouts.jsonl)
 
 
 def search_branch(hand: Hand, trap: int | None, net: Net, s: Settings, center: set, is_extra,
@@ -636,10 +641,21 @@ def search_branch(hand: Hand, trap: int | None, net: Net, s: Settings, center: s
             # the scores above chose the line, so they flatter it; these do not
             picks = {"kept": best, "value_kept": value_index, "own": own_index}
             chosen = sorted({i for i in picks.values() if i is not None})
-            again = judge([candidates[i] for i in chosen], starts, net, lambda k: ctx, keep=True)
+            checks = starts
+            if s.validate_orders:  # m scenarios of their own (the first K are the search's deck orders)
+                checks = [start() for _, _, start in (hand.start(k, trap) for k in range(s.validate_orders))]
+                checks = [d for d in checks if d is not None]
+            again = judge([candidates[i] for i in chosen], checks, net, lambda k: ctx, keep=True)
             score_turn2(again, net, Settings(scorer="turn2", rollouts=s.validate, t2_cap=s.t2_cap),
                         f"{hand.id}-{trap or 'base'}-validate")
             fresh = {i: oe.summary_of([p.t2 for p in row if not p.error and p.t2]) for i, row in zip(chosen, again)}
+            if s.log_rollouts:  # every single rollout (scenario k, rollout j: the same seeds for every line)
+                stats["validate_raw"] = [{"line": name, "k": k, **r}
+                                         for name, i in picks.items() if i is not None
+                                         for k, p in enumerate(again[chosen.index(i)]) if not p.error for r in p.raw]
+            scores = [c["score"] for c in stats["cands"]]
+            others = [x for i, x in enumerate(scores) if i != best and x is not None and x != scores[best]]
+            stats["margin"] = round(scores[best] - max(others), 4) if others and scores[best] is not None else None
             stats["validate"] = {name: fresh[i] for name, i in picks.items() if i is not None}
     if best is None:
         return None, {**stats, "error": "no line"}, []
@@ -681,7 +697,7 @@ def search_hand(hand: Hand, net: Net, s: Settings, center: set, is_extra) -> tup
 def paths(out: Path) -> dict[str, Path]:
     stem = out.with_name(out.stem)
     return {name: Path(f"{stem}-{name}.{ext}") for name, ext in
-            (("lines", "jsonl"), ("hands", "jsonl"), ("meta", "json"), ("report", "json"))}
+            (("lines", "jsonl"), ("hands", "jsonl"), ("meta", "json"), ("report", "json"), ("rollouts", "jsonl"))}
 
 
 def done_hands(out: Path) -> set[str]:
@@ -831,6 +847,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--t2-cap", type=int, default=250, help="sampled decisions per turn-2 rollout at most")
     p.add_argument("--validate", type=int, default=0,
                    help="fresh turn-2 rollouts per scenario of the kept, value-kept and own line (unbiased check)")
+    p.add_argument("--validate-orders", type=int, default=0, help="scenarios of the validation (0: the search's K)")
+    p.add_argument("--log-rollouts", action="store_true",
+                   help="write every validation rollout to <out stem>-rollouts.jsonl (hand, line, k, j, score, lost, won)")
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--hands", type=int, default=200)
     p.add_argument("--first-hand", type=int, default=0)
@@ -903,12 +922,13 @@ def main(argv=None) -> None:
     evaluator = Evaluator(model_fn(model, args.device))
     net = Net(evaluator, model.card_features.index_map())
     settings = Settings(args.beam, args.branch, args.alpha, args.candidates, args.max_choices, args.score,
-                        args.rollouts, args.mix_weight, args.t2_cap, args.validate)
+                        args.rollouts, args.mix_weight, args.t2_cap, args.validate,
+                        args.validate_orders, args.log_rollouts)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     p = paths(args.out)
     done = done_hands(args.out) if args.resume else set()
     if not args.resume:
-        for path in (p["lines"], p["hands"]):
+        for path in (p["lines"], p["hands"], p["rollouts"]):
             path.write_text("", encoding="utf-8")
     p["meta"].write_text(json.dumps(meta), encoding="utf-8")
     hands = []
@@ -932,8 +952,14 @@ def main(argv=None) -> None:
                 continue
             with lock:
                 for record in records:
+                    record["search"].pop("validate_raw", None)
                     lines_out.write(json.dumps(record) + "\n")
                 lines_out.flush()
+                raw = [{"hand": stats["hand"], "branch": branch, **r} for branch in ("base", "trap")
+                       for r in (stats.get(branch) or {}).pop("validate_raw", [])]
+                if raw:
+                    with open(p["rollouts"], "a", encoding="utf-8") as rollouts_out:
+                        rollouts_out.write("".join(json.dumps(r) + "\n" for r in raw))
                 hands_out.write(json.dumps(stats) + "\n")
                 hands_out.flush()
             b = stats["base"]
